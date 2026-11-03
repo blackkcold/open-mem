@@ -1,0 +1,24 @@
+{
+  "name": "@open-mem/plugin",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev:api": "tsx src/cli.ts serve --data ../tmp/dev-data --port 47821",
+    "demo": "tsx src/cli.ts demo --data ../tmp/demo-data --port 47821",
+    "audit": "tsx src/cli.ts audit --data ../tmp/dev-data",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.1.4",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

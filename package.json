@@ -1,0 +1,21 @@
+{
+  "name": "open-mem",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode memory autopilot: two-lane consolidation, local review console, shadow memory map.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/blackkcold/open-mem.git"
+  },
+  "scripts": {
+    "install:all": "npm --prefix plugin install && npm --prefix console install",
+    "build": "npm --prefix plugin run build && npm --prefix console run build",
+    "test": "npm --prefix plugin test",
+    "typecheck": "npm --prefix plugin run typecheck && npm --prefix console run typecheck",
+    "dev:api": "npm --prefix plugin run dev:api",
+    "dev:console": "npm --prefix console run dev",
+    "demo": "npm --prefix plugin run demo"
+  }
+}
