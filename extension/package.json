@@ -1,0 +1,35 @@
+{
+  "name": "openmem-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenMem review console inside OpenChamber: queue, memory map, audit, health and settings.",
+  "license": "MIT",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.6.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "openmem",
+        "name": "OpenMem",
+        "icon": "brain",
+        "entry": "panel/index.html"
+      },
+      "page": {
+        "entry": "page/index.html",
+        "title": "OpenMem 控制台"
+      },
+      "statusSection": {
+        "entry": "status/index.html",
+        "title": "OpenMem",
+        "height": 88
+      },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host"
+      }
+    }
+  }
+}

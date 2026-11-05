@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, formatPercent } from "../api";
+import { confirmAction } from "../extension/confirm";
 import type { MapData, MapNode, Metrics } from "../types";
 
 interface Props {
@@ -40,7 +41,12 @@ export function MapView({ refreshKey, onChanged }: Props) {
   const selected = data?.nodes.find((node) => node.id === selectedId) ?? null;
 
   async function markFalsePositive(node: MapNode) {
-    const ok = window.confirm("Mark this shadow decision as a false positive?");
+    const ok = await confirmAction({
+      title: "标记为误报？",
+      message: "这条 shadow 决策会被标记为误报，并更新指标。",
+      confirmLabel: "标记",
+      danger: true,
+    });
     if (!ok) return;
     setError("");
     setMessage("");
@@ -89,7 +95,7 @@ export function MapView({ refreshKey, onChanged }: Props) {
           {visible.length === 0 ? (
             <div className="empty">No nodes for this filter.</div>
           ) : (
-            <svg className="map-svg" viewBox={`0 0 ${WIDTH} ${HEIGHT}`} role="img" aria-label="Memory point cloud">
+            <svg className="map-svg" viewBox={`0 0 ${WIDTH} ${HEIGHT}`} role="group" aria-label="记忆地图，可使用 Tab 选择记忆点">
               {showEdges
                 ? (data?.edges ?? []).map((edge) => {
                     if (!visibleIds.has(edge.source) || !visibleIds.has(edge.target)) return null;
@@ -123,6 +129,10 @@ export function MapView({ refreshKey, onChanged }: Props) {
                   stroke={node.id === selectedId ? "var(--text)" : "var(--panel)"}
                   strokeWidth={node.id === selectedId ? 2 : 1}
                   onClick={() => setSelectedId(node.id)}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`${node.title} · ${node.status}`}
+                  onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelectedId(node.id); } }}
                   style={{ cursor: "pointer" }}
                 >
                   <title>{`${node.title} · ${node.status}`}</title>

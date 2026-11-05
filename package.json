@@ -1,6 +1,6 @@
 {
   "name": "open-mem",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "OpenCode memory autopilot: two-lane consolidation, local review console, shadow memory map.",
@@ -12,9 +12,15 @@
   "scripts": {
     "install:all": "npm --prefix plugin install && npm --prefix console install",
     "build": "npm --prefix plugin run build && npm --prefix console run build",
+    "build:extension": "npm --prefix console run build:extension",
+    "package:extension": "npm --prefix console run package:extension",
     "test": "npm --prefix plugin test",
-    "typecheck": "npm --prefix plugin run typecheck && npm --prefix console run typecheck",
+    "test:extension": "node extension/test/service.test.mjs",
+    "typecheck": "npm --prefix plugin run typecheck && npm --prefix console run typecheck && npm run typecheck:extension",
+    "typecheck:extension": "npm --prefix console exec -- tsc -p ./extension/tsconfig.service.json --noEmit",
+    "verify": "npm test && npm run typecheck && npm run build && npm run build:extension && npm run test:extension && git diff --check",
     "dev:api": "npm --prefix plugin run dev:api",
+    "dev:ux": "npm --prefix plugin run ux:smoke",
     "dev:console": "npm --prefix console run dev",
     "demo": "npm --prefix plugin run demo"
   }

@@ -1,10 +1,40 @@
 import { describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Store } from "../src/store.js";
 
 describe("Store", () => {
+  it("refuses to rewrite items when a JSONL row is corrupt", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-store-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const raw = '{"id":"valid"}\n{broken\n';
+      await writeFile(store.itemsPath, raw, "utf8");
+      await expect(store.updateItem("valid", { text: "new" })).rejects.toThrow();
+      expect(await readFile(store.itemsPath, "utf8")).toBe(raw);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+  it("preserves a corrupt queue instead of overwriting it on update", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-store-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const corrupt = "{invalid json";
+      await writeFile(store.queuePath, corrupt, "utf8");
+      await expect(store.upsertQueue({
+        id: "q1", title: "test", text: "test", kind: "rule", scope: "global",
+        status: "queue", source: {}, createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(), reason: "test",
+      })).rejects.toThrow();
+      expect(await readFile(store.queuePath, "utf8")).toBe(corrupt);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
   it("creates the data layout and round-trips auto memory", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-store-"));
     try {
@@ -48,6 +78,29 @@ describe("Store", () => {
       expect((await store.listQueue())[0].title).toBe("[R] updated");
       await store.removeQueue("q1");
       expect(await store.listQueue()).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes review slots across Store instances", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-store-"));
+    try {
+      const first = new Store(dir);
+      const second = new Store(dir);
+      await first.init();
+      await second.init();
+      const at = Date.now();
+      const results = await Promise.all(
+        Array.from({ length: 10 }, (_, index) =>
+          (index % 2 === 0 ? first : second).takeReviewSlot(
+            at + index,
+            2,
+            60 * 60 * 1000,
+          ),
+        ),
+      );
+      expect(results.filter((entry) => entry.ok)).toHaveLength(2);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

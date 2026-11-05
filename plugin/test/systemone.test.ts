@@ -74,6 +74,41 @@ describe("SystemOneClient", () => {
     expect(result.latencyMs).toBeGreaterThanOrEqual(0);
   });
 
+  it("keeps the merge target when the action is reject_duplicate", async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        questions: Record<string, { instructions?: string }>;
+      };
+      expect(body.questions.merge_target?.instructions).toMatch(/reject_duplicate/);
+      return new Response(
+        JSON.stringify({
+          model: "clef:27b-cloud",
+          answers: {
+            kind: { type: "choice", choice: "rule", confidence: 0.9 },
+            safety: { type: "noul", noul: 0.1 },
+            strict_limit: { type: "noul", noul: 0.1 },
+            duplicate: { type: "noul", noul: 0.96 },
+            safe_auto: { type: "noul", noul: 0.4 },
+            conflict: { type: "noul", noul: 0.1 },
+            merge_action: { type: "choice", choice: "reject_duplicate", confidence: 0.95 },
+            merge_target: { type: "choice", choice: "n1", confidence: 0.95 },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new SystemOneClient({
+      endpoint: "https://ollama.com/v1/systemone",
+      model: "clef:27b-cloud",
+      apiKey: "test-key",
+      timeoutMs: 5_000,
+    });
+    const result = await client.classify(input);
+    expect(result.mergeAction).toBe("reject_duplicate");
+    expect(result.mergeTargetId).toBe("n1");
+  });
+
   it("omits merge_target when there are no neighbors", async () => {
     let questionKeys: string[] = [];
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {

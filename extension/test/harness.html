@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>OpenMem extension harness</title>
+    <style>
+      :root { color-scheme: light dark; }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: flex;
+        flex-direction: column;
+        background: #d9d9d2;
+        color: #1b1b18;
+        font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex: none;
+        height: 46px;
+        padding: 0 12px;
+        border-bottom: 1px solid rgba(0,0,0,.12);
+        background: rgba(255,255,255,.72);
+        backdrop-filter: blur(10px);
+      }
+      .bar strong { font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+      .bar a, .bar button {
+        border: 1px solid rgba(0,0,0,.16);
+        border-radius: 7px;
+        background: transparent;
+        color: inherit;
+        padding: 5px 9px;
+        font: inherit;
+        text-decoration: none;
+        cursor: pointer;
+      }
+      .bar a[aria-current="true"] { background: #1b1b18; color: #fff; border-color: #1b1b18; }
+      .bar .spacer { flex: 1; }
+      .bar .hint { color: #6d6d63; font-size: 11px; }
+      .stage {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        overflow: auto;
+        padding: 24px;
+      }
+      .stage.page { padding: 0; align-items: stretch; }
+      .stage.status { align-items: center; }
+      .frame-wrap {
+        position: relative;
+        overflow: hidden;
+        border-radius: 12px;
+        background: var(--stage-bg, #f4f4ef);
+        box-shadow: 0 18px 60px rgba(0,0,0,.16), 0 0 0 1px rgba(0,0,0,.08);
+      }
+      .stage.page .frame-wrap { width: 100%; border-radius: 0; box-shadow: none; }
+      .stage.panel .frame-wrap { width: 320px; height: 720px; }
+      .stage.status .frame-wrap { width: 380px; height: 88px; }
+      iframe { display: block; width: 100%; height: 100%; border: 0; background: transparent; }
+      .stage.page iframe { height: 100vh; }
+      .toast {
+        position: fixed;
+        right: 16px;
+        bottom: 16px;
+        max-width: 380px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: #1b1b18;
+        color: #fff;
+        font-size: 11px;
+        opacity: 0;
+        transform: translateY(4px);
+        transition: opacity 140ms ease, transform 140ms ease;
+        pointer-events: none;
+      }
+      .toast.show { opacity: 1; transform: none; }
+    </style>
+  </head>
+  <body>
+    <header class="bar" id="bar">
+      <strong>OpenMem harness</strong>
+      <a data-surface="page" href="?surface=page&amp;theme=light">Page</a>
+      <a data-surface="panel" href="?surface=panel&amp;theme=light">Panel</a>
+      <a data-surface="status" href="?surface=status&amp;theme=light">Status</a>
+      <span class="spacer"></span>
+      <a id="theme" href="#">Dark</a>
+      <button id="reload" type="button">Reload frame</button>
+      <span class="hint" id="hint"></span>
+    </header>
+    <main class="stage" id="stage">
+      <div class="frame-wrap" id="wrap">
+        <iframe id="frame" sandbox="allow-scripts" title="OpenMem preview"></iframe>
+      </div>
+    </main>
+    <div class="toast" id="toast"></div>
+    <script>
+      const params = new URLSearchParams(location.search);
+      const surface = ["page", "panel", "status"].includes(params.get("surface"))
+        ? params.get("surface")
+        : "page";
+      const themeMode = params.get("theme") === "dark" ? "dark" : "light";
+      const showChrome = params.get("chrome") !== "0";
+
+      const stage = document.getElementById("stage");
+      const wrap = document.getElementById("wrap");
+      const frame = document.getElementById("frame");
+      const hint = document.getElementById("hint");
+      const toast = document.getElementById("toast");
+
+      stage.classList.add(surface);
+      document.getElementById("bar").style.display = showChrome ? "" : "none";
+      if (!showChrome) {
+        document.body.style.background = themeMode === "dark" ? "#141413" : "#f4f4ef";
+        stage.style.padding = "0";
+      }
+
+      for (const link of document.querySelectorAll("[data-surface]")) {
+        if (link.dataset.surface === surface) link.setAttribute("aria-current", "true");
+      }
+      const themeLink = document.getElementById("theme");
+      themeLink.textContent = themeMode === "dark" ? "Light" : "Dark";
+      themeLink.href = `?surface=${surface}&theme=${themeMode === "dark" ? "light" : "dark"}`;
+
+      const commonFont = '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif';
+      const commonMono = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+      const light = {
+        background: "#f4f4ef", elevated: "#ffffff", foreground: "#1b1b18",
+        muted: "#6d6d63", subtle: "#e8e8e0", border: "#d8d8cf",
+        hover: "#ecece5", selection: "#dce8e1", focus: "#2f5d50",
+        primary: "#2f5d50", mutedSurface: "#ecece5", elevatedForeground: "#1b1b18",
+        active: "#e3e3da", selectionForeground: "#1b1b18", primaryForeground: "#ffffff",
+        primaryText: "#2f5d50", successText: "#2e7d4f", warningText: "#9a5b00",
+        errorText: "#b42318", infoText: "#2b6cb0", success: "#2e7d4f",
+        warning: "#9a5b00", error: "#b42318", info: "#2b6cb0",
+        font: commonFont, mono: commonMono, radius: "10px",
+      };
+      const dark = {
+        background: "#141413", elevated: "#1d1d1b", foreground: "#ecece6",
+        muted: "#9a9a90", subtle: "#262622", border: "#37372f",
+        hover: "#2b2b26", selection: "#1e332b", focus: "#7fc2aa",
+        primary: "#7fc2aa", mutedSurface: "#262622", elevatedForeground: "#ecece6",
+        active: "#2f2f2a", selectionForeground: "#ecece6", primaryForeground: "#10231c",
+        primaryText: "#7fc2aa", successText: "#7fd39a", warningText: "#ffc46b",
+        errorText: "#ff8a80", infoText: "#8ab8f0", success: "#7fd39a",
+        warning: "#ffc46b", error: "#ff8a80", info: "#8ab8f0",
+        font: commonFont, mono: commonMono, radius: "10px",
+      };
+
+      const tokens = themeMode === "dark" ? dark : light;
+      wrap.style.setProperty("--stage-bg", tokens.background);
+      stage.style.background = themeMode === "dark" ? "#0f0f0e" : "#d9d9d2";
+
+      function readyPayload() {
+        return {
+          theme: { mode: themeMode, tokens },
+          locale: "zh-CN",
+          directory: "/Users/11169285/Documents/Opencode project/open-mem",
+          session: null,
+          surface,
+          connection: { connected: true, account: "local" },
+          settings: {},
+          item: null,
+          features: { deviceStorage: true, statusControls: true, popovers: true },
+        };
+      }
+
+      function send(payload) {
+        frame.contentWindow?.postMessage(
+          { channel: "openchamber.sdk", v: 1, ...payload },
+          "*",
+        );
+      }
+
+      function showToast(message) {
+        toast.textContent = message;
+        toast.classList.add("show");
+        window.clearTimeout(showToast.timer);
+        showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 2600);
+      }
+
+      window.addEventListener("message", async (event) => {
+        if (event.source !== frame.contentWindow) return;
+        const message = event.data;
+        if (!message || message.channel !== "openchamber.sdk" || message.v !== 1) return;
+
+        if (message.type === "hello") {
+          send({ type: "ready", payload: readyPayload() });
+          return;
+        }
+
+        if (message.type === "service-request") {
+          const { id, payload } = message;
+          try {
+            const url = new URL("/service" + payload.path, location.origin);
+            for (const [key, value] of Object.entries(payload.query ?? {})) {
+              url.searchParams.set(key, String(value));
+            }
+            const response = await fetch(url, {
+              method: payload.method,
+              headers: payload.body ? { "content-type": "application/json" } : undefined,
+              body: payload.body,
+            });
+            const body = await response.text();
+            send({ type: "result", id, ok: true, payload: { status: response.status, body } });
+          } catch (error) {
+            send({ type: "result", id, ok: false, error: String(error), code: "REQUEST_FAILED" });
+          }
+          return;
+        }
+
+        if (message.type === "resize") {
+          if (surface === "status") frame.style.height = `${message.payload.height}px`;
+          return;
+        }
+
+        if (message.type === "toast") {
+          showToast(message.payload?.message ?? "toast");
+        }
+
+        if (message.id) {
+          send({ type: "result", id: message.id, ok: true, payload: {} });
+        }
+      });
+
+      document.getElementById("reload").addEventListener("click", () => {
+        frame.src = `/${surface}/?reload=${Date.now()}`;
+      });
+
+      frame.src = `/${surface}/`;
+      hint.textContent = `${surface} · ${themeMode}`;
+    </script>
+  </body>
+</html>

@@ -7,6 +7,9 @@ import type {
   Strictness,
 } from "./types.js";
 
+import { modelHeaders } from "./util/endpoint.js";
+import { redactText } from "./redact.js";
+
 const KIND_VALUES: ItemKind[] = ["fact", "preference", "rule", "reference", "skill"];
 const MERGE_VALUES: MergeAction[] = [
   "create",
@@ -45,11 +48,9 @@ export class SystemOneClient {
     try {
       response = await fetch(this.options.endpoint, {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${this.options.apiKey}`,
-        },
-        body: JSON.stringify(request),
+        headers: modelHeaders(this.options.endpoint, this.options.apiKey),
+        redirect: "error",
+        body: redactText(JSON.stringify(request), { paths: false }).text,
         signal: AbortSignal.timeout(this.options.timeoutMs),
       });
     } catch (error: unknown) {
@@ -165,7 +166,7 @@ function buildRequest(model: string, input: DecisionInput): Record<string, unkno
     questions.merge_target = {
       type: "choice",
       instructions:
-        "If merge_action is merge_into or replace, choose the target neighbor. Otherwise choose none.",
+        "If merge_action is merge_into, replace, or reject_duplicate, choose the target neighbor. Otherwise choose none.",
       criteria: targetCriteria,
     };
   }
@@ -294,7 +295,14 @@ function parseResponse(
     ],
     source: "systemone",
     mergeAction,
-    mergeTargetId: mergeAction === "merge_into" || mergeAction === "replace" ? mergeTargetId : undefined,
+    // reject_duplicate also needs its target: consolidation uses it to drop
+    // the duplicate before it reaches the queue.
+    mergeTargetId:
+      mergeAction === "merge_into" ||
+      mergeAction === "replace" ||
+      mergeAction === "reject_duplicate"
+        ? mergeTargetId
+        : undefined,
     conflict: clamp01(conflict),
     safety: clamp01(safety),
     strictLimit: clamp01(strictLimit),

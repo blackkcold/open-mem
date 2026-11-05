@@ -13,23 +13,24 @@ export interface CompactionResult {
   memory: number;
   rules: number;
   reason?: string;
+  journalID?: string;
 }
 
 export async function runCompaction(
   store: Store,
   config: AutoMemConfig,
+  options: { dryRun?: boolean } = {},
 ): Promise<CompactionResult> {
   const items = await store.listItems();
+  const snapshot = structuredClone(items);
   const activeBefore = items.filter((item) => item.status !== "archived");
   const itemsBefore = activeBefore.length;
 
-  await store.pruneReservations(10 * 60 * 1000);
-  await store.rotateUsage("decision");
-  await store.rotateUsage("rewrite");
-
   const groups = new Map<string, Item[]>();
   for (const item of activeBefore) {
-    const key = `${item.scope}:${item.kind}`;
+    if (item.kind === "rule" || item.manual || item.status === "promoted") continue;
+    if (item.scope === "project" && !item.projectKey) continue;
+    const key = JSON.stringify([item.scope, item.scope === "project" ? item.projectKey : null, item.kind]);
     const group = groups.get(key);
     if (group) group.push(item);
     else groups.set(key, [item]);
@@ -79,7 +80,19 @@ export async function runCompaction(
     if (index !== -1) next[index] = canonical;
   }
 
-  if (merged > 0) await store.replaceItems(next);
+  if (options.dryRun) {
+    return { ok: true, merged, archived, itemsBefore,
+      itemsAfter: next.filter((item) => item.status !== "archived").length,
+      memory: activeBefore.filter((item) => item.kind !== "rule" && item.kind !== "skill").length,
+      rules: activeBefore.filter((item) => item.kind === "rule").length };
+  }
+  const journalID = merged > 0 ? await store.applyItemChanges(snapshot, next) : undefined;
+  await store.pruneReservations(10 * 60 * 1000);
+  await store.pruneShadow(config.caps.shadow);
+  await store.pruneHooks(config.caps.hooks);
+  await store.pruneReviews(config.caps.reviews);
+  await store.rotateUsage("decision");
+  await store.rotateUsage("rewrite");
   const view = await rebuildAutoFiles(store);
   const itemsAfter = next.filter((item) => item.status !== "archived").length;
   await store.setStat("lastCompactAt", Date.now());
@@ -90,6 +103,7 @@ export async function runCompaction(
     archived,
     itemsBefore,
     itemsAfter,
+    journalID,
   });
 
   return {
@@ -100,6 +114,7 @@ export async function runCompaction(
     itemsAfter,
     memory: view.memory,
     rules: view.rules,
+    journalID,
   };
 }
 

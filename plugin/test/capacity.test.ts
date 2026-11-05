@@ -38,6 +38,33 @@ function queue(id: string): QueueItem {
 }
 
 describe("capacity governor", () => {
+  it("bounds shadow history while preserving recent false-positive samples", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-cap-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      for (let i = 0; i < 4; i++) await store.appendShadow({ id: `s${i}`, title: "test", candidate: "test", kind: "fact", scope: "global", wouldWriteTo: "AUTO_MEMORY", wouldApply: 0, priority: 0, source: {}, createdAt: now, falsePositive: i === 0 }, 2);
+      expect((await store.listShadow()).map((entry) => entry.id)).toEqual(["s0", "s3"]);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it("does not let observation history block candidate admission", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-cap-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.appendShadow({ id: "s", title: "test", candidate: "test", kind: "fact", scope: "global", wouldWriteTo: "AUTO_MEMORY", wouldApply: 0, priority: 0, source: {}, createdAt: now });
+      expect((await admitQueueItem(store, mergeConfig({ caps: { shadow: 1 } }))).ok).toBe(true);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it("allows approval to drain a full queue", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-cap-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.upsertQueue(queue("q1"));
+      expect((await admitNewItem(store, mergeConfig({ caps: { queue: 1 } }), "fact")).ok).toBe(true);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
   it("blocks when the total item cap is reached", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-cap-"));
     try {

@@ -1,6 +1,6 @@
 {
   "name": "@open-mem/plugin",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -12,7 +12,8 @@
     "dev:api": "tsx src/cli.ts serve --data ../tmp/dev-data --port 47821",
     "demo": "tsx src/cli.ts demo --data ../tmp/demo-data --port 47821",
     "audit": "tsx src/cli.ts audit --data ../tmp/dev-data",
-    "test": "vitest run"
+    "test": "vitest run",
+    "ux:smoke": "tsx ../scripts/ux-smoke.ts"
   },
   "devDependencies": {
     "@opencode/plugin": "^2.1.4",

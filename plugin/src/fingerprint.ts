@@ -5,6 +5,12 @@ import type {
   ShadowRecord,
 } from "./types.js";
 import { bigrams, compact, jaccard } from "./linter.js";
+import { sha16 } from "./util/text.js";
+
+/** Material content only: provenance-only touches do not stale a suggestion. */
+export function itemContentVersion(item: Item): string {
+  return sha16(JSON.stringify([item.title, item.text, item.kind, item.scope, item.projectKey, item.status]));
+}
 
 export interface FingerprintEntry {
   id: string;
@@ -12,6 +18,7 @@ export interface FingerprintEntry {
   text: string;
   kind: Item["kind"];
   scope: Item["scope"];
+  projectKey?: string;
   status: string;
 }
 
@@ -92,6 +99,7 @@ export function entriesFor(
         text: item.text,
         kind: item.kind,
         scope: item.scope,
+        projectKey: item.projectKey,
         status: item.status,
       })),
     ...queue.map((item) => ({
@@ -100,6 +108,7 @@ export function entriesFor(
       text: item.text,
       kind: item.kind,
       scope: item.scope,
+      projectKey: item.projectKey,
       status: "queue",
     })),
     ...shadow.map((record) => ({
@@ -108,6 +117,7 @@ export function entriesFor(
       text: record.candidate,
       kind: record.kind,
       scope: record.scope,
+      projectKey: record.projectKey,
       status: record.falsePositive ? "false_positive" : "shadow",
     })),
   ];

@@ -2,8 +2,10 @@ import type { Item } from "./types.js";
 import type { Store } from "./store.js";
 
 /**
- * AUTO_MEMORY.md and AUTO_RULES.md are generated views. items.jsonl is the
- * source of truth, so compaction can rewrite the files without losing entries.
+ * AUTO_MEMORY.md and AUTO_RULES.md are AUDIT-ONLY views. They intentionally
+ * include every scope so a human can inspect all active items; buildContext()
+ * injects only global + the current projectKey. items.jsonl is the source of
+ * truth, so compaction can rewrite these files without losing entries.
  */
 export async function rebuildAutoFiles(
   store: Store,
@@ -25,11 +27,14 @@ function render(header: string, items: Item[]): string {
   const lines = [
     header,
     "",
+    "<!-- AUDIT VIEW ONLY — not injected. buildContext reads items.jsonl and filters by projectKey. -->",
     "<!-- Generated from items.jsonl. Curated AGENTS.md and memory/*.md win. -->",
     "",
   ];
   for (const item of sortItems(items)) {
-    lines.push(`<!-- id: ${item.id} · ${item.scope} · ${item.kind} -->`);
+    lines.push(
+      `<!-- id: ${item.id} · scope: ${item.scope} · project: ${item.projectKey ?? "-"} · kind: ${item.kind} -->`,
+    );
     lines.push(`- ${item.text}`);
     lines.push("");
   }
@@ -40,6 +45,8 @@ function sortItems(items: Item[]): Item[] {
   return [...items].sort((left, right) => {
     const byScope = left.scope.localeCompare(right.scope);
     if (byScope !== 0) return byScope;
+    const byProject = (left.projectKey ?? "").localeCompare(right.projectKey ?? "");
+    if (byProject !== 0) return byProject;
     const byKind = left.kind.localeCompare(right.kind);
     if (byKind !== 0) return byKind;
     const byPriority = (right.priority ?? 0) - (left.priority ?? 0);

@@ -26,9 +26,12 @@ interface MockState {
   disposed: number;
 }
 
-async function* eventStream(): AsyncGenerator<{ type: string; sessionID?: string; [key: string]: unknown }> {
-  yield { type: "session.created", sessionID: "s1" };
-  yield { type: "session.idle", sessionID: "s1" };
+async function* eventStream(): AsyncGenerator<{ type: string; sessionID?: string; data?: unknown; [key: string]: unknown }> {
+  // V2 delivers the payload under `data`; session.idle is ephemeral and not
+  // delivered to ctx.event.subscribe, so turn completion arrives as
+  // session.execution.succeeded.
+  yield { type: "session.created", data: { sessionID: "s1" } };
+  yield { type: "session.execution.succeeded", data: { sessionID: "s1" } };
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
 
@@ -114,12 +117,91 @@ async function waitFor<T>(fn: () => Promise<T | undefined>, timeout = 3_000): Pr
   throw new Error("waitFor timed out");
 }
 
+/** Plugin writes can outlive dispose by a tick; retry the removal. */
+async function removeDir(dir: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+}
+
 describe("plugin setup with mock OpenCode context", () => {
+  it("lets the owning workspace process an event seen first by another workspace", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-plugin-"));
+    const disposers: Array<() => Promise<void>> = [];
+    try {
+      const a = createMockContext([{ id: "m1", type: "user", text: "记住这个项目采用 pnpm 安装依赖" }]);
+      const b = createMockContext([{ id: "m1", type: "user", text: "记住这个项目采用 pnpm 安装依赖" }]);
+      a.ctx.location = { directory: "/workspace/A" };
+      b.ctx.location = { directory: "/workspace/B" };
+      const subscribe = async function* () {
+        yield { id: "created", type: "session.created", location: { directory: "/workspace/B" }, data: { sessionID: "owner-session" } };
+        yield { id: "finished", type: "session.execution.succeeded", location: { directory: "/workspace/B" }, data: { sessionID: "owner-session" } };
+      };
+      a.ctx.event = { subscribe };
+      b.ctx.event = { subscribe };
+      disposers.push(await setupPlugin(a.ctx, { dataDir: dir, console: false }));
+      disposers.push(await setupPlugin(b.ctx, { dataDir: dir, console: false }));
+      const store = new Store(dir);
+      const hooks = await waitFor(async () => {
+        const hooks = await store.listHooks();
+        return hooks.length ? hooks : undefined;
+      });
+      expect(hooks[0].project).toBe("/workspace/B");
+    } finally { for (const dispose of disposers) await dispose(); await removeDir(dir); }
+  });
+  it("reconnects after an event stream failure", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-plugin-"));
+    let dispose: (() => Promise<void>) | undefined;
+    try {
+      const { ctx } = createMockContext([]);
+      let subscriptions = 0;
+      ctx.event = { subscribe: async function* () { subscriptions++; if (subscriptions === 1) throw new Error("synthetic stream failure"); yield { type: "session.created", data: { sessionID: "reconnected" } }; } };
+      dispose = await setupPlugin(ctx, { dataDir: dir, console: false });
+      await waitFor(async () => (await new Store(dir).readState()).sessions.reconnected);
+      expect(subscriptions).toBeGreaterThan(1);
+    } finally { await dispose?.(); await removeDir(dir); }
+  });
+  it("backfills parent metadata when the creation event omitted it", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-plugin-"));
+    let dispose: (() => Promise<void>) | undefined;
+    try {
+      const { ctx } = createMockContext([{ id: "m1", type: "user", text: "每次回复先给结论" }]);
+      if (ctx.session) ctx.session.get = async () => ({ parentID: "parent" });
+      dispose = await setupPlugin(ctx, { dataDir: dir, console: false });
+      const store = new Store(dir);
+      await waitFor(async () => (await store.readState()).sessions.s1?.parentSessionID);
+      expect(await store.listHooks()).toEqual([]);
+    } finally { await dispose?.(); await removeDir(dir); }
+  });
+  it("keeps agent tool approvals out of the user decision lane", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-plugin-"));
+    let dispose: (() => Promise<void>) | undefined;
+    try {
+      const { ctx, state } = createMockContext([]);
+      ctx.event = undefined;
+      const store = new Store(dir);
+      await store.init();
+      dispose = await setupPlugin(ctx, { dataDir: dir, console: false });
+      const at = new Date().toISOString();
+      await store.upsertQueue({ id: "q_tool", title: "偏好", text: "回复先给结论", kind: "preference", scope: "global", status: "queue", source: {}, createdAt: at, updatedAt: at, reason: "test" });
+      await state.tool?.execute({ action: "decide", id: "q_tool", decision: "approve" }, {});
+      expect(await store.listQueue()).toHaveLength(1);
+      expect(await store.listItems()).toEqual([]);
+    } finally {
+      await dispose?.();
+      await removeDir(dir);
+    }
+  });
   it("registers tool/commands, injects context, and routes session.idle to the queue", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-plugin-"));
     try {
       const messages: SessionMessage[] = [
-        { id: "m1", type: "user", text: "不要用 nohup 启动 dev server" },
+        { id: "m1", type: "user", text: "回复必须使用 Markdown 格式" },
       ];
       const { ctx, state } = createMockContext(messages);
       const store = new Store(dir);
@@ -134,12 +216,17 @@ describe("plugin setup with mock OpenCode context", () => {
         "memory-audit",
         "memory-console",
         "memory-review",
+        "memory-review-session",
       ]);
 
       await waitFor(async () => ((await store.listQueue()).length > 0 ? true : undefined));
-      const queue = await store.listQueue();
+      const queue = await waitFor(async () => {
+        const items = await store.listQueue();
+        return items[0]?.suggestion ? items : undefined;
+      });
       expect(queue.length).toBe(1);
       expect(queue[0].kind).toBe("rule");
+      expect(queue[0].suggestionState).toBe("ready");
       expect(queue[0].reason).toMatch(/high risk|Jev|decision/);
       expect(state.contextCalls).toBeGreaterThan(0);
       expect(state.entries.some((entry) => entry.key === "plugin.memory-autopilot")).toBe(true);
@@ -149,7 +236,7 @@ describe("plugin setup with mock OpenCode context", () => {
       const status = await tool.execute({ action: "status" }, { sessionID: "s1" });
       expect(status.content).toContain("queue");
       const review = await tool.execute({ action: "review" }, { sessionID: "s1" });
-      expect(review.content).toContain("nohup");
+      expect(review.content).toContain("Markdown");
       const audit = await tool.execute({ action: "audit" }, { sessionID: "s1" });
       expect(audit.content).toContain("findings");
       const consoleURL = await tool.execute({ action: "console_url" }, { sessionID: "s1" });
@@ -177,7 +264,7 @@ describe("plugin setup with mock OpenCode context", () => {
       await cleanup();
       expect(state.disposed).toBeGreaterThan(0);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await removeDir(dir);
     }
   }, 10_000);
 });

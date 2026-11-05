@@ -1,11 +1,27 @@
 import { useEffect, useState } from "react";
-import { api, formatAge, formatPercent } from "../api";
-import type { HealthScore, MergeJournal, UsageSummary } from "../types";
+import { api, formatAge, formatPercent, formatReviewAge } from "../api";
+import { confirmAction } from "../extension/confirm";
+import type { Health, HealthScore, MergeJournal, UsageSummary } from "../types";
 
 interface Props {
   refreshKey: number;
   onChanged: () => void;
 }
+
+interface HistoryEntry { at: string; action: string; itemID?: string; queueID?: string; journalID?: string; recoveryID?: string; target?: string }
+interface RetentionPreview {
+  id: string;
+  policy: { days: number; minRecords: number; sessionDays: number };
+  deleteFiles: string[];
+  archiveSessions: string[];
+  pruneItems: number;
+  pruneMerges: number;
+  pruneHistory: number;
+  reclaimableBytes: number;
+  protectedCount: number;
+}
+
+const HISTORY_LABEL: Record<string, string> = { approve: "批准记忆", deny: "拒绝候选", promote: "提升范围", promote_session_note: "保留会话笔记", compact: "压缩", curator: "自动整理", edit: "编辑", defer: "延后", resume: "取消延后", undo_maintenance: "撤销整理", undo_merge: "撤销合并", restore_queue_action: "恢复候选", create_skill_draft: "生成流程草稿", dismiss_note: "忽略笔记", restore_note: "恢复笔记", capture_blocked: "容量待处理", capture_rejected: "敏感信息拦截" };
 
 const BREAKDOWN_LABELS: Array<[keyof HealthScore["breakdown"], string]> = [
   ["capacity", "容量"],
@@ -21,11 +37,14 @@ const BREAKDOWN_LABELS: Array<[keyof HealthScore["breakdown"], string]> = [
 
 export function HealthPage({ refreshKey, onChanged }: Props) {
   const [health, setHealth] = useState<HealthScore>();
+  const [healthInfo, setHealthInfo] = useState<Health>();
   const [usage, setUsage] = useState<UsageSummary>();
   const [journal, setJournal] = useState<MergeJournal[]>([]);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [retention, setRetention] = useState<RetentionPreview>();
 
   useEffect(() => {
     void load();
@@ -33,14 +52,18 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
 
   async function load() {
     try {
-      const [nextHealth, nextUsage, nextJournal] = await Promise.all([
+      const [nextHealth, nextUsage, nextJournal, nextInfo, nextHistory] = await Promise.all([
         api<HealthScore>("/api/health-score"),
         api<UsageSummary>("/api/usage"),
         api<{ items: MergeJournal[] }>("/api/journal"),
+        api<Health>("/api/health"),
+        api<{ items: HistoryEntry[] }>("/api/changelog?limit=50"),
       ]);
       setHealth(nextHealth);
       setUsage(nextUsage);
       setJournal(nextJournal.items);
+      setHealthInfo(nextInfo);
+      setHistory(nextHistory.items);
       setError("");
     } catch (caught: unknown) {
       setError(errorMessage(caught));
@@ -52,12 +75,15 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
     setMessage("");
     setError("");
     try {
+      const preview = await api<{ merged: number; archived: number }>("/api/compact/preview");
+      const ok = await confirmAction({ title: "压缩与整理历史？", message: `预计合并 ${preview.merged} 条、归档 ${preview.archived} 条；不会更改规则或人工批准的记忆。历史记录会按容量保留，记忆合并会先备份并可撤销。`, confirmLabel: "确认整理" });
+      if (!ok) return;
       const result = await api<{
         merged: number;
         archived: number;
         itemsBefore: number;
         itemsAfter: number;
-      }>("/api/compact", { method: "POST" });
+      }>("/api/compact", { method: "POST", body: JSON.stringify({ confirmedByUser: true }) });
       setMessage(
         `压缩完成：合并 ${result.merged} 条，归档 ${result.archived} 条，${result.itemsBefore} → ${result.itemsAfter} 条。`,
       );
@@ -69,8 +95,59 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
     }
   }
 
+  async function previewHistory() {
+    setBusy(true);
+    setError("");
+    try { setRetention(await api<RetentionPreview>("/api/retention/preview")); }
+    catch (caught) { setError(errorMessage(caught)); }
+    finally { setBusy(false); }
+  }
+
+  async function cleanHistory() {
+    if (!retention) return;
+    const rows = retention.pruneItems + retention.pruneMerges + retention.pruneHistory;
+    if (!await confirmAction({ title: "清理预览中的过期历史？", message: `将删除 ${retention.deleteFiles.length} 个历史文件、${rows} 条过期记录，冷归档 ${retention.archiveSessions.length} 个会话状态。活跃记忆和队列不变；删除的过期历史不再提供恢复。数据变化会要求重新预览。`, confirmLabel: "确认清理这些历史", danger: true })) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api("/api/retention/apply", { method: "POST", body: JSON.stringify({ previewID: retention.id, confirmedByUser: true }) });
+      setRetention(undefined);
+      setMessage("历史清理完成；旧会话续聊仍可读取冷归档状态。");
+      onChanged();
+    } catch (caught) { setError(errorMessage(caught)); setRetention(undefined); }
+    finally { setBusy(false); }
+  }
+
+  async function undoMaintenance(id: string) {
+    if (!await confirmAction({ title: "撤销这次整理？", message: "只恢复本次整理改动的记忆，不覆盖之后新增的条目。如条目已被编辑，将提示冲突。", confirmLabel: "撤销" })) return;
+    setBusy(true);
+    try {
+      await api(`/api/maintenance/${encodeURIComponent(id)}/undo`, { method: "POST" });
+      setMessage("已撤销整理");
+      onChanged();
+    } catch (caught) { setError(errorMessage(caught)); }
+    finally { setBusy(false); }
+  }
+
+  async function restoreAction(id: string) {
+    if (!await confirmAction({ title: "恢复到审批队列？", message: "本次操作产生的记忆会归档，原候选恢复到队列供重新决定。若条目已被修改，将提示冲突。", confirmLabel: "恢复" })) return;
+    setBusy(true);
+    try {
+      await api(`/api/recovery/${encodeURIComponent(id)}/restore`, { method: "POST" });
+      setMessage("已恢复到审批队列");
+      onChanged();
+    } catch (caught) { setError(errorMessage(caught)); }
+    finally { setBusy(false); }
+  }
+
   async function undo(entry: MergeJournal) {
-    if (!window.confirm("撤销这次合并？目标条目会恢复，候选会回到队列。")) return;
+    const ok = await confirmAction({
+      title: "撤销这次合并？",
+      message: "目标条目会恢复，候选会回到队列。",
+      confirmLabel: "撤销",
+      danger: true,
+    });
+    if (!ok) return;
     setBusy(true);
     setMessage("");
     setError("");
@@ -88,6 +165,8 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
   const grade = health?.grade ?? "warn";
   const gradeLabel =
     grade === "good" ? "健康" : grade === "ok" ? "可用" : grade === "warn" ? "注意" : "需处理";
+  const reviewFailureRate =
+    usage && usage.reviewCalls > 0 ? usage.reviewFailures / usage.reviewCalls : 0;
 
   return (
     <div className="health">
@@ -98,8 +177,61 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
         <div className="kpi"><span>建议采纳率</span><b className="good">{formatPercent(health?.details.suggestionAcceptance ?? 1)}</b></div>
       </div>
 
-      {message ? <div className="banner ok">{message}</div> : null}
-      {error ? <div className="banner error">{error}</div> : null}
+      {message ? <div className="banner ok" role="status">{message}</div> : null}
+      {error ? <div className="banner error" role="alert">{error}</div> : null}
+
+      {healthInfo?.review ? (
+        <section className="panel" style={{ marginBottom: 12 }}>
+          <div className="panel-head">
+            <h2>Session Review</h2>
+            <span className={`badge ${healthInfo.review.enabled ? "success" : "warning"}`}>
+              {healthInfo.review.enabled ? "开启" : "关闭"}
+            </span>
+            <span className="meta">
+              {healthInfo.review.model.id}
+              {healthInfo.review.model.variant ? `#${healthInfo.review.model.variant}` : ""}
+            </span>
+          </div>
+          <div
+            className="detail-body"
+            style={{ flexDirection: "row", flexWrap: "wrap", gap: 16, alignItems: "center" }}
+          >
+            {healthInfo.review.runtime ? (
+              <>
+                <span className="muted small">
+                  已排期 {healthInfo.review.runtime.scheduled ?? 0}
+                </span>
+                <span className="muted small">
+                  运行中 {healthInfo.review.runtime.running ?? 0}
+                </span>
+                <span className="muted small">
+                  近一小时 {healthInfo.review.runtime.runsLastHour ?? 0} /{" "}
+                  {healthInfo.review.maxPerHour}
+                </span>
+                <span className="muted small">
+                  上次{" "}
+                  {healthInfo.review.runtime.lastRunAt
+                    ? formatReviewAge(healthInfo.review.runtime.lastRunAt)
+                    : "—"}
+                </span>
+                {healthInfo.review.runtime.openUntil ? (
+                  <span className="badge warning">熔断中</span>
+                ) : null}
+                {healthInfo.review.runtime.lastError ? (
+                  <span
+                    className="sev-error small"
+                    title={healthInfo.review.runtime.lastError}
+                  >
+                    {healthInfo.review.runtime.lastError}
+                  </span>
+                ) : null}
+              </>
+            ) : (
+              <span className="muted small">运行时不可用（CLI demo 无后台调度）</span>
+            )}
+          </div>
+        </section>
+      ) : null}
 
       <div className="health-layout">
         <section className="panel">
@@ -174,12 +306,50 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
                 </b>
               </div>
             </div>
+            <div className="usage-row">
+              <div>
+                <span className="muted small">Session Review</span>
+                <b>{usage?.reviewCalls ?? 0} 次</b>
+              </div>
+              <div>
+                <span className="muted small">tokens</span>
+                <b>{usage?.reviewTokens ?? 0}</b>
+              </div>
+              <div>
+                <span className="muted small">失败</span>
+                <b className={reviewFailureRate > 0.2 ? "sev-error" : ""}>
+                  {formatPercent(reviewFailureRate)}
+                </b>
+              </div>
+            </div>
             <p className="muted small" style={{ margin: 0 }}>
               降级 = 模型不可用/超限/输出不合格时走 heuristic 或模板合并；不会阻塞队列。
             </p>
           </div>
         </section>
       </div>
+
+      <section className="panel" style={{ marginTop: 12 }} aria-label="历史保留与清理">
+        <div className="panel-head"><h2>历史保留与清理</h2><span className="spacer" /><button className="btn" disabled={busy} onClick={() => void previewHistory()}>预览历史清理</button></div>
+        <div className="detail-body">
+          <p className="muted small">恢复记录至少保留 90 天及每类最近 20 次；90 天不活跃的会话状态可冷归档，续聊会保留原游标与固定上下文。不会后台自动删除。</p>
+          {retention ? <div role="status">
+            <p>预计清理 {retention.deleteFiles.length} 个文件、{retention.pruneItems + retention.pruneMerges + retention.pruneHistory} 条记录，释放约 {(retention.reclaimableBytes / 1024).toFixed(1)} KB；冷归档 {retention.archiveSessions.length} 个会话状态。</p>
+            <p className="muted small">保守保护 {retention.protectedCount} 份记录；保护窗口内或时间不明的历史不会为满足容量强行删除。冷归档只减少活跃状态，不等于释放同等磁盘空间。</p>
+            {retention.deleteFiles.length ? <details><summary>查看待清理文件名</summary><ul>{retention.deleteFiles.slice(0, 50).map((file) => <li key={file}><code>{file}</code></li>)}</ul>{retention.deleteFiles.length > 50 ? <p>另有 {retention.deleteFiles.length - 50} 个文件</p> : null}</details> : null}
+            <div className="actions"><button className="btn danger" disabled={busy || !(retention.deleteFiles.length + retention.archiveSessions.length + retention.pruneItems + retention.pruneMerges + retention.pruneHistory)} onClick={() => void cleanHistory()}>确认清理预览项</button><button className="btn" disabled={busy} onClick={() => setRetention(undefined)}>取消预览</button></div>
+          </div> : null}
+        </div>
+      </section>
+
+      <section className="panel" style={{ marginTop: 12 }} aria-label="操作历史">
+        <div className="panel-head"><h2>操作历史</h2><span className="meta">最近 50 条 · 不含私密原文</span></div>
+        {history.length ? <div className="table-wrap"><table><thead><tr><th>时间</th><th>操作</th><th>对象</th><th>恢复</th></tr></thead><tbody>
+          {history.map((entry, index) => <tr key={`${entry.at}-${index}`}><td>{formatAge(entry.at)}</td><td>{HISTORY_LABEL[entry.action] ?? (entry.action === "retention" ? "历史清理" : entry.action)}</td><td className="muted">{entry.itemID ?? entry.queueID ?? "—"}</td><td>
+            {entry.recoveryID && entry.action !== "restore_queue_action" && !history.some((other) => other.action === "restore_queue_action" && other.recoveryID === entry.recoveryID) ? <button className="btn" disabled={busy} onClick={() => void restoreAction(entry.recoveryID!)}>恢复候选</button> : ["compact", "curator"].includes(entry.action) && entry.journalID && !history.some((other) => other.action === "undo_maintenance" && other.journalID === entry.journalID) ? <button className="btn" disabled={busy} onClick={() => void undoMaintenance(entry.journalID!)}>撤销整理</button> : "—"}
+          </td></tr>)}
+        </tbody></table></div> : <div className="empty">暂无操作记录。</div>}
+      </section>
 
       <section className="panel" style={{ marginTop: 12 }}>
         <div className="panel-head"><h2>最近合并</h2><span className="meta">24h 内可撤销</span></div>

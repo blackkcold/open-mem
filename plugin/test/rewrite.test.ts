@@ -106,6 +106,38 @@ describe("rewrite validator", () => {
 });
 
 describe("System Two client", () => {
+  it("passes the model variant through generate.text", async () => {
+    let seen: { providerID: string; id: string; variant?: string } | undefined;
+    const ctx = {
+      generate: {
+        text: async (request: {
+          model: { providerID: string; id: string; variant?: string };
+        }) => {
+          seen = request.model;
+          return JSON.stringify(validOutput);
+        },
+      },
+    };
+    const client = new SystemTwoClient({
+      ctx,
+      config: {
+        ...DEFAULT_CONFIG.rewrite,
+        model: {
+          providerID: "ollama-cloud",
+          id: "deepseek-v4.1-flash:1017",
+          variant: "high",
+        },
+      },
+    });
+    const output = await client.rewrite(input);
+    expect(seen).toEqual({
+      providerID: "ollama-cloud",
+      id: "deepseek-v4.1-flash:1017",
+      variant: "high",
+    });
+    expect(output.model?.variant).toBe("high");
+  });
+
   it("parses the JSON contract through generate.text", async () => {
     const ctx = {
       generate: {
@@ -146,6 +178,19 @@ describe("RewriteService", () => {
     }
   });
 
+  it("shares a request budget between service instances", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-rewrite-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const config = mergeConfig({ rewrite: { transport: "opencode", enabled: true, maxCallsPerHour: 1 } });
+      let calls = 0;
+      const ctx = { generate: { text: async () => { calls++; return JSON.stringify(validOutput); } } };
+      await new RewriteService({ store, config, ctx }).suggest(input);
+      await new RewriteService({ store: new Store(dir), config, ctx }).suggest({ ...input, candidate: { ...input.candidate, text: "另一个候选" } });
+      expect(calls).toBe(1);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
   it("caches a successful rewrite", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-rewrite-"));
     try {

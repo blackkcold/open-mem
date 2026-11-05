@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Store } from "../src/store.js";
+import { authorizedFetch as fetch } from "./http-client.js";
 import { DEFAULT_CONFIG, mergeConfig } from "../src/config.js";
 import { startServer, type ServerHandle } from "../src/server.js";
 import { buildSuggestion } from "../src/suggestion.js";
@@ -199,7 +200,7 @@ describe("suggestion and health API", () => {
   });
 
   it("compacts, hides the token, and patches rewrite settings", async () => {
-    const compact = await fetch(api("/api/compact"), { method: "POST" });
+    const compact = await fetch(api("/api/compact"), { method: "POST", body: JSON.stringify({ confirmedByUser: true }) });
     expect(compact.status).toBe(200);
 
     const configResponse = await fetch(api("/api/config"));
