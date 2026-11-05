@@ -51,9 +51,50 @@ export interface Suggestion {
   rationale: string;
   confidence: number;
   source: "systemtwo" | "composer" | "human";
-  model?: { providerID: string; id: string };
+  model?: { providerID: string; id: string; variant?: string };
   validation: { ok: boolean; errors: string[]; warnings: string[] };
   createdAt: string;
+}
+
+export type ReviewType = "fact" | "preference" | "rule" | "decision" | "learning" | "skill";
+
+export interface ReviewEvidence {
+  messageID: string;
+  quote: string;
+  kind: "user" | "tool";
+}
+
+export interface ReviewSessionNote {
+  status?: "promoted" | "dismissed";
+  promotedItemID?: string;
+  type: ReviewType;
+  text: string;
+  evidence: ReviewEvidence[];
+  taskOnly?: boolean;
+  createdAt: string;
+}
+
+export interface ReviewRecord {
+  id: string;
+  sessionID: string;
+  projectKey?: string;
+  status: "scheduled" | "running" | "ready" | "failed" | "skipped";
+  createdAt: string;
+  fromMessageID?: string;
+  toMessageID?: string;
+  inputHash?: string;
+  chars?: number;
+  candidates: number;
+  queued?: number;
+  dropped: number;
+  durationMs?: number;
+  model?: string;
+  usage?: { inputTokens: number; outputTokens: number };
+  error?: string;
+  note?: string;
+  summary?: string[];
+  openQuestions?: string[];
+  sessionNotes?: ReviewSessionNote[];
 }
 
 export interface QueueItem {
@@ -63,6 +104,7 @@ export interface QueueItem {
   kind: string;
   scope: string;
   project?: string;
+  projectKey?: string;
   status: string;
   source: SourceRef;
   createdAt: string;
@@ -81,6 +123,66 @@ export interface QueueItem {
   suggestion?: Suggestion;
   suggestionState?: "pending" | "ready" | "failed";
   suggestionError?: string;
+  turnID?: string;
+  hookID?: string;
+  origin?: "turn" | "session-review";
+  reviewType?: ReviewType;
+  evidence?: ReviewEvidence[];
+  reviewID?: string;
+}
+
+export type HookStatus =
+  | "pending"
+  | "blocked"
+  | "processing"
+  | "auto"
+  | "shadow"
+  | "queue"
+  | "ignored"
+  | "failed";
+
+export interface HookRecord {
+  id: string;
+  key: string;
+  sessionID: string;
+  turnID: string;
+  messageID: string;
+  text: string;
+  title: string;
+  trigger: string;
+  scope: string;
+  project?: string;
+  source: SourceRef;
+  createdAt: string;
+  updatedAt: string;
+  status: HookStatus;
+  attempts: number;
+  decision?: DecisionResult;
+  queueID?: string;
+  itemID?: string;
+  shadowID?: string;
+  error?: string;
+  origin?: "turn" | "session-review";
+  reviewType?: ReviewType;
+  evidence?: ReviewEvidence[];
+  reviewID?: string;
+  reviewConfidence?: number;
+}
+
+export interface TurnSummary {
+  sessionID: string | null;
+  turnID: string | null;
+  createdAt: string | null;
+  counts: {
+    captured: number;
+    pending: number;
+    auto: number;
+    shadow: number;
+    queue: number;
+    ignored: number;
+    failed: number;
+  };
+  hooks: HookRecord[];
 }
 
 export interface SkillDraft {
@@ -171,13 +273,36 @@ export interface Config {
   rewrite: {
     enabled: boolean;
     transport: "opencode" | "ollama";
-    model: { providerID: string; id: string };
+    model: { providerID: string; id: string; variant?: string };
     endpoint: string;
     timeoutMs: number;
     maxCallsPerHour: number;
     repairAttempts: number;
     eager: boolean;
     cacheTtlHours: number;
+  };
+  review: {
+    enabled: boolean;
+    idleMs: number;
+    minNewUserMessages: number;
+    checkpointMessages: number;
+    maxInputChars: number;
+    maxUserCharsPerMessage: number;
+    maxCandidates: number;
+    minConfidence: number;
+    maxPerHour: number;
+    transcript: "user" | "user+tools";
+    redact: boolean;
+    timeoutMs: number;
+    repairAttempts: number;
+    cacheTtlHours: number;
+    model: { providerID: string; id: string; variant?: string };
+    maxDeferrals: number;
+  };
+  digest: {
+    maxEntries: number;
+    maxBytes: number;
+    maxChars: number;
   };
   thresholds: {
     memoryMaxChars: number;
@@ -195,6 +320,8 @@ export interface Config {
     skillDrafts: number;
     itemsTotal: number;
     suggestions: number;
+    hooks?: number;
+    reviews?: number;
     diskBytes: number;
   };
 }
@@ -213,7 +340,25 @@ export interface Health {
   rewrite: {
     enabled: boolean;
     transport: string;
-    model: { providerID: string; id: string };
+    model: { providerID: string; id: string; variant?: string };
+  };
+  review?: {
+    enabled: boolean;
+    model: { providerID: string; id: string; variant?: string };
+    idleMs: number;
+    transcript: string;
+    maxPerHour: number;
+    runtime: {
+      scheduled?: number;
+      running?: number;
+      runsLastHour?: number;
+      paused?: boolean;
+      lastRunAt?: string;
+      lastError?: string;
+      failures?: number;
+      openUntil?: number;
+      cached?: number;
+    } | null;
   };
 }
 
@@ -253,6 +398,9 @@ export interface UsageSummary {
   decisionTokens: number;
   rewriteCalls: number;
   rewriteTokens: number;
+  reviewCalls: number;
+  reviewTokens: number;
+  reviewFailures: number;
   decisionFallbackRate: number;
   rewriteFallbackRate: number;
   since: string;

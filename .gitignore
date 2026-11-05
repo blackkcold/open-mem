@@ -15,6 +15,12 @@ console-token
 *console-token*
 *.pem
 *.key
+extension/data-dir.txt
+# Extension sources and HTML entries are tracked; generated bundles are rebuilt.
+extension/page/main.js
+extension/panel/main.js
+extension/status/main.js
+extension/service/main.js
 
 # editor / test artifacts
 .playwright-mcp/

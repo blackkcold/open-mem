@@ -1,0 +1,34 @@
+html[data-oc-theme],
+html[data-oc-theme] body {
+  background: transparent;
+}
+
+html[data-oc-theme] .app {
+  min-height: 100vh;
+}
+
+html[data-oc-theme] .sidebar {
+  background: var(--oc-elevated, var(--panel));
+}
+
+html[data-oc-theme] .topbar {
+  background: color-mix(in srgb, var(--oc-bg, var(--bg)) 86%, transparent);
+  backdrop-filter: blur(10px);
+}
+
+html[data-oc-theme] .content {
+  padding-top: 18px;
+}
+
+html[data-oc-theme] .panel {
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--oc-fg) 4%, transparent);
+}
+
+html[data-oc-theme] .kpi,
+html[data-oc-theme] .panel {
+  background: var(--oc-elevated, var(--panel));
+}
+
+html[data-oc-theme] .token-gate {
+  display: none;
+}

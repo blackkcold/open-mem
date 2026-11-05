@@ -1,10 +1,12 @@
 import { compact } from "../linter.js";
+import { modelHeaders } from "../util/endpoint.js";
+import { redactText } from "../redact.js";
 import type { RewriteConfig } from "../types.js";
 import type { RewriteInput, RewriteOutput } from "./types.js";
 
 interface GenerateApiLike {
   text?: (input: {
-    model: { providerID: string; id: string };
+    model: { providerID: string; id: string; variant?: string };
     prompt: string;
   }) => Promise<unknown>;
 }
@@ -37,11 +39,13 @@ export class SystemTwoClient {
       ctx?: RewriteContext;
       config: RewriteConfig;
       key?: string;
+      beforeRequest?: () => Promise<void>;
     },
   ) {}
 
   async rewrite(input: RewriteInput, repair?: RewriteRepair): Promise<RewriteOutput> {
-    const prompt = buildPrompt(input, repair);
+    await this.options.beforeRequest?.();
+    const prompt = redactText(buildPrompt(input, repair), { paths: false }).text;
     const started = Date.now();
     if (this.options.config.transport === "opencode") {
       return this.viaOpenCode(prompt, input, started);
@@ -84,18 +88,21 @@ export class SystemTwoClient {
     started: number,
   ): Promise<RewriteOutput> {
     const endpoint = this.options.config.endpoint.replace(/\/+$/, "");
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (this.options.key) headers.authorization = `Bearer ${this.options.key}`;
+    const headers = modelHeaders(endpoint, this.options.key);
     let response: Response;
     try {
       response = await fetch(`${endpoint}/api/chat`, {
         method: "POST",
+        redirect: "error",
         headers,
         body: JSON.stringify({
           model: this.options.config.model.id,
           messages: [{ role: "user", content: prompt }],
           stream: false,
           format: "json",
+          ...(this.options.config.model.variant
+            ? { think: this.options.config.model.variant }
+            : {}),
           options: { temperature: 0.2 },
         }),
         signal: AbortSignal.timeout(this.options.config.timeoutMs),
@@ -180,7 +187,7 @@ export function buildPrompt(input: RewriteInput, repair?: RewriteRepair): string
 
 function parseOutput(
   raw: string,
-  model: { providerID: string; id: string },
+  model: { providerID: string; id: string; variant?: string },
   latencyMs: number,
   fallbackAction: "merge" | "replace",
 ): RewriteOutput {

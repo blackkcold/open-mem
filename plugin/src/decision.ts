@@ -226,17 +226,16 @@ export class DecisionService implements DecisionProvider {
   async classify(input: DecisionInput): Promise<DecisionResult> {
     const client = this.options.client;
     if (!client) return this.heuristic.classify(input);
-    if (!this.allow()) {
+    const key = cacheKey(input, this.options.config.decision.model);
+    const cached = await this.readCache(key);
+    if (cached) return { ...cached, cached: true };
+    if (!this.allow() || !await this.options.store.takeModelSlot("decision", this.options.config.decision.maxCallsPerHour)) {
       const fallback = await this.heuristic.classify(input);
       return {
         ...fallback,
         reasons: [...fallback.reasons, "System One 限流/熔断，已降级"],
       };
     }
-
-    const key = cacheKey(input, this.options.config.decision.model);
-    const cached = await this.readCache(key);
-    if (cached) return { ...cached, cached: true };
 
     const started = Date.now();
     try {
@@ -309,6 +308,7 @@ export class DecisionService implements DecisionProvider {
   }
 
   private async writeCache(key: string, value: DecisionResult): Promise<void> {
+    await this.options.store.transaction(async () => {
     const cache = await this.options.store.readCacheFile<Record<string, CachedDecision>>(
       this.options.store.decisionCachePath,
       {},
@@ -324,6 +324,7 @@ export class DecisionService implements DecisionProvider {
       this.options.store.decisionCachePath,
       Object.fromEntries(entries),
     );
+    });
   }
 
   private async log(record: Parameters<Store["appendUsage"]>[0]): Promise<void> {

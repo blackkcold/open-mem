@@ -43,7 +43,6 @@ export async function capacityStatus(
   const ratios = [
     active.length / Math.max(1, config.caps.itemsTotal),
     queue.length / Math.max(1, config.caps.queue),
-    shadow.length / Math.max(1, config.caps.shadow),
     drafts.length / Math.max(1, config.caps.skillDrafts),
     diskBytes / Math.max(1, config.caps.diskBytes),
   ];
@@ -104,7 +103,7 @@ export async function admitQueueItem(
   config: AutoMemConfig,
 ): Promise<{ ok: boolean; reason?: string }> {
   const status = await capacityStatus(store, config);
-  if (status.level === "block") {
+  if (status.counts.diskBytes >= config.caps.diskBytes) {
     return { ok: false, reason: "数据目录已满，拒绝新候选" };
   }
   if (status.counts.queue >= config.caps.queue) {
@@ -122,7 +121,7 @@ export async function admitNewItem(
   kind: ItemKind,
 ): Promise<{ ok: boolean; reason?: string }> {
   const status = await capacityStatus(store, config);
-  if (status.level === "block") {
+  if (status.counts.diskBytes >= config.caps.diskBytes) {
     return { ok: false, reason: "数据目录已满，写入被拒绝" };
   }
   if (status.counts.items >= config.caps.itemsTotal) {

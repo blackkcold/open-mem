@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, formatAge } from "../api";
+import { confirmAction } from "../extension/confirm";
 import type { SkillDraft } from "../types";
 
 interface Props {
@@ -52,9 +53,11 @@ export function SkillsPage({ refreshKey, onChanged }: Props) {
   async function act(action: "approve" | "reject" | "request_changes") {
     if (!selectedId) return;
     if (action === "approve") {
-      const ok = window.confirm(
-        "Approve this skill draft? It will be written to outbox/skills, not installed into OpenCode.",
-      );
+      const ok = await confirmAction({
+        title: "批准 Skill 草稿？",
+        message: "会写入 outbox/skills，不会自动安装到 OpenCode。",
+        confirmLabel: "批准",
+      });
       if (!ok) return;
     }
     if (action === "request_changes" && !notes.trim()) {
@@ -201,13 +204,18 @@ export function SkillsPage({ refreshKey, onChanged }: Props) {
                 </button>
                 <button
                   className="btn"
-                  onClick={() => {
-                    void navigator.clipboard?.writeText(detail.path);
-                    setMessage("Path copied");
+                  onClick={async () => {
+                    try {
+                      if (!navigator.clipboard) throw new Error("当前环境不支持剪贴板，请选择上方路径手动复制");
+                      await navigator.clipboard.writeText(detail.path);
+                      setMessage("路径已复制");
+                    } catch {
+                      setError("无法写入剪贴板，请选择路径手动复制");
+                    }
                   }}
                   type="button"
                 >
-                  Copy path
+                  复制路径
                 </button>
               </div>
               <p className="muted" style={{ margin: 0, fontSize: "0.66rem", lineHeight: 1.45 }}>

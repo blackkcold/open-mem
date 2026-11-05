@@ -17,7 +17,7 @@ export interface RewriteOutput {
   dropped: Array<{ text: string; reason: string }>;
   rationale: string;
   source: "systemtwo" | "composer";
-  model?: { providerID: string; id: string };
+  model?: { providerID: string; id: string; variant?: string };
   usage?: { inputTokens: number; outputTokens: number };
   latencyMs: number;
   raw?: string;

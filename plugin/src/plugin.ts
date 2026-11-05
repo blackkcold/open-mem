@@ -1,10 +1,14 @@
 import os from "node:os";
 import path from "node:path";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type {
   AutoMemConfig,
   AutopilotContext,
   DecisionConfig,
+  Item,
   RewriteConfig,
+  Scope,
   SessionMessage,
   SkillInput,
   Suggestion,
@@ -12,7 +16,8 @@ import type {
 import { mergeConfig, type ConfigPatch } from "./config.js";
 import { Store, newId } from "./store.js";
 import { createDecisionProvider, resolveOllamaKey } from "./decision.js";
-import { bullets, runConsolidation } from "./consolidate.js";
+import { runConsolidation } from "./consolidate.js";
+import { SessionReader } from "./session/reader.js";
 import { runAudit } from "./audit.js";
 import { applyQueueDecision } from "./actions.js";
 import { createSkillDraft } from "./skill.js";
@@ -22,6 +27,17 @@ import { createRewriteService } from "./rewrite/index.js";
 import { buildSuggestion } from "./suggestion.js";
 import { maybeCompact } from "./compact.js";
 import { collectNeighbors, entriesFor } from "./fingerprint.js";
+import { sha16 } from "./util/text.js";
+import { runCurator } from "./memory/curator.js";
+import { DigestCache } from "./digest/cache.js";
+import {
+  collectReviewKnownTitles,
+  ReviewInputBuilder,
+} from "./review/input.js";
+import { ReviewOrchestrator } from "./review/orchestrator.js";
+import { ReviewProvider } from "./review/provider.js";
+import { acceptReviewCandidates } from "./review/accept.js";
+import { validateReviewCandidates } from "./review/validate.js";
 
 export interface PluginOptions {
   dataDir?: string;
@@ -36,7 +52,7 @@ export interface PluginOptions {
   decisionModel?: { providerID: string; id: string };
   decision?: Partial<DecisionConfig>;
   rewrite?: Partial<Omit<RewriteConfig, "model">> & {
-    model?: { providerID?: string; id?: string };
+    model?: { providerID?: string; id?: string; variant?: string };
   };
   thresholds?: Partial<AutoMemConfig["thresholds"]>;
   caps?: Partial<AutoMemConfig["caps"]>;
@@ -71,6 +87,7 @@ export interface PluginContext {
   };
   session?: {
     context(input: { sessionID: string }): Promise<unknown>;
+    get?(input: { sessionID: string }): Promise<unknown>;
     prompt(input: { sessionID: string; text: string; delivery?: string }): Promise<unknown>;
     hook?(
       name: "context",
@@ -103,6 +120,125 @@ export interface PluginContext {
 
 const contextCache = new Map<string, string>();
 
+interface ReviewRuntime {
+  stats?: () => Record<string, unknown>;
+  run?: (sessionID: string) => Promise<unknown>;
+  onConfig?: (next: AutoMemConfig) => void;
+}
+
+function reviewRuntimeRegistry(): Map<string, Set<ReviewRuntime>> {
+  const holder = globalThis as {
+    __openMemReviewRuntimes?: Map<string, Set<ReviewRuntime>>;
+  };
+  holder.__openMemReviewRuntimes ??= new Map();
+  return holder.__openMemReviewRuntimes;
+}
+
+function registerReviewRuntime(dataDir: string, runtime: ReviewRuntime): void {
+  const registry = reviewRuntimeRegistry();
+  const set = registry.get(dataDir) ?? new Set<ReviewRuntime>();
+  set.add(runtime);
+  registry.set(dataDir, set);
+}
+
+function unregisterReviewRuntime(dataDir: string, runtime: ReviewRuntime): void {
+  const registry = reviewRuntimeRegistry();
+  const set = registry.get(dataDir);
+  if (!set) return;
+  set.delete(runtime);
+  if (set.size === 0) registry.delete(dataDir);
+}
+
+/** The host can load several instances for one data dir; aggregate them. */
+function reviewStatsFor(dataDir: string): Record<string, unknown> {
+  const set = reviewRuntimeRegistry().get(dataDir);
+  if (!set || set.size === 0) return {};
+  let scheduled = 0;
+  let running = 0;
+  let runsLastHour = 0;
+  let paused = false;
+  let failures = 0;
+  let cached = 0;
+  let lastRunAt: string | undefined;
+  let lastError: string | undefined;
+  let openUntil: number | undefined;
+  let nextReviewAt: string | undefined;
+  for (const runtime of set) {
+    const stats = runtime.stats?.();
+    if (!stats) continue;
+    scheduled = Math.max(scheduled, Number(stats.scheduled ?? 0));
+    running = Math.max(running, Number(stats.running ?? 0));
+    runsLastHour = Math.max(runsLastHour, Number(stats.runsLastHour ?? 0));
+    paused = paused || Boolean(stats.paused);
+    failures = Math.max(failures, Number(stats.failures ?? 0));
+    cached = Math.max(cached, Number(stats.cached ?? 0));
+    const runAt = typeof stats.lastRunAt === "string" ? stats.lastRunAt : undefined;
+    if (runAt && (!lastRunAt || runAt > lastRunAt)) lastRunAt = runAt;
+    if (!lastError && typeof stats.lastError === "string") lastError = stats.lastError;
+    if (
+      typeof stats.openUntil === "number" &&
+      (!openUntil || stats.openUntil > openUntil)
+    ) {
+      openUntil = stats.openUntil;
+    }
+    const next = typeof stats.nextReviewAt === "string" ? stats.nextReviewAt : undefined;
+    if (next && (!nextReviewAt || next < nextReviewAt)) nextReviewAt = next;
+  }
+  return {
+    scheduled,
+    running,
+    runsLastHour,
+    paused,
+    failures,
+    cached,
+    lastRunAt,
+    lastError,
+    openUntil,
+    nextReviewAt,
+  };
+}
+
+async function requestReviewFor(
+  dataDir: string,
+  sessionID: string,
+): Promise<unknown> {
+  const set = reviewRuntimeRegistry().get(dataDir);
+  if (!set) return undefined;
+  for (const runtime of set) {
+    if (!runtime.run) continue;
+    const record = await runtime.run(sessionID).catch(() => undefined);
+    if (record) return record;
+  }
+  return undefined;
+}
+
+function notifyReviewConfigFor(dataDir: string, next: AutoMemConfig): void {
+  const set = reviewRuntimeRegistry().get(dataDir);
+  if (!set) return;
+  for (const runtime of set) runtime.onConfig?.(next);
+}
+
+function consoleRefs(): Map<string, number> {
+  const holder = globalThis as { __openMemConsoleRefs?: Map<string, number> };
+  holder.__openMemConsoleRefs ??= new Map();
+  return holder.__openMemConsoleRefs;
+}
+
+/**
+ * The console build ships next to the plugin in this repo. Resolve it from the
+ * module location so installation does not depend on the host's cwd, whether
+ * the loader picks `dist/index.js` or the package root re-export.
+ */
+function bundledConsoleDir(): string | undefined {
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(moduleDir, "..", "..", "console", "dist"),
+    path.resolve(moduleDir, "..", "console", "dist"),
+    path.resolve(moduleDir, "console", "dist"),
+  ];
+  return candidates.find((dir) => existsSync(path.join(dir, "index.html")));
+}
+
 export async function setupPlugin(
   ctx: PluginContext,
   explicitOptions?: PluginOptions,
@@ -114,6 +250,15 @@ export async function setupPlugin(
     path.join(os.homedir(), ".config", "opencode", "memory", "autopilot");
   const store = new Store(dataDir);
   await store.init();
+  // A process that died mid-rewrite leaves "pending" behind. The console
+  // deliberately does not auto-generate for pending rows, so reset stale
+  // markers before serving any UI.
+  await resetStaleSuggestions(store).catch(() => undefined);
+
+  const reader = new SessionReader(
+    async (sessionID) => (ctx.session ? ctx.session.context({ sessionID }) : []),
+    { maxSessions: 8, maxMessages: 400 },
+  );
 
   const stored = await store.readConfig();
   const patch: ConfigPatch = {
@@ -131,6 +276,12 @@ export async function setupPlugin(
   const config = mergeConfig(stored, patch);
   config.dataDir = dataDir;
   const token = config.token ?? (await store.ensureToken());
+
+  // Deterministic maintenance only: no model call, 24h gate and reservation
+  // claim protect multi-instance/Desktop + CLI starts.
+  void runCurator(store, config).catch((error: unknown) => {
+    console.error("[memory-autopilot] curator failed", safeError(error));
+  });
 
   const keyInfo = await resolveOllamaKey(config.decision.apiKeyEnv);
   const decision = createDecisionProvider({ config, store, key: keyInfo.key });
@@ -169,43 +320,66 @@ export async function setupPlugin(
     return buildSuggestion({ store, config, rewrite, broadcast: server?.broadcast }, item, resolved, target);
   };
 
-  const server =
-    config.console === false
-      ? undefined
-      : await ensureConsoleServer({
-          store,
-          config,
-          token,
-          consoleDir: options.consoleDir,
-          decisionKeySource: keyInfo.source,
-          suggest,
-        });
+  const reviewRuntime: ReviewRuntime = {};
 
+  let server: ServerHandle | undefined;
+  let consoleAcquired = false;
+  if (config.console !== false) {
+    try {
+      server = await ensureConsoleServer({
+        store,
+        config,
+        token,
+        consoleDir: options.consoleDir ?? bundledConsoleDir(),
+        decisionKeySource: keyInfo.source,
+        suggest,
+        reviewStats: () => reviewStatsFor(dataDir),
+        onReviewRequest: (sessionID: string) => requestReviewFor(dataDir, sessionID),
+        onConfigChange: (next: AutoMemConfig) => notifyReviewConfigFor(dataDir, next),
+      });
+      consoleAcquired = true;
+    } catch (error: unknown) {
+      // A busy port or missing console build must not stop memory capture.
+      console.error(
+        "[memory-autopilot] console server failed to start",
+        safeError(error),
+      );
+    }
+  }
+
+  const project = ctx.location?.project?.canonical ?? ctx.location?.directory;
+  const projectKey = project ? sha16(project) : undefined;
   const deps = {
     store,
     decision,
     config,
     readMessages: async (sessionID: string): Promise<SessionMessage[]> => {
       if (!ctx.session) return [];
-      return normalizeSessionMessages(await ctx.session.context({ sessionID }));
+      return reader.read(sessionID);
     },
-    project: ctx.location?.project?.canonical ?? ctx.location?.directory,
+    project,
+    projectKey,
     broadcast: server?.broadcast,
     onQueueItem: (item: import("./types.js").QueueItem, result: import("./types.js").DecisionResult, target?: import("./types.js").Item) => {
       const needsRewrite =
         result.mergeAction === "merge_into" || result.mergeAction === "replace";
-      if (!needsRewrite || !config.rewrite.enabled) return;
-      if (!config.rewrite.eager) return;
+      // Deterministic suggestions (create / keep_both / reject_duplicate, and
+      // every rewrite-disabled case) are built immediately and cost no model
+      // call. Only an enabled, eager merge waits on System Two.
+      const buildNow = !needsRewrite || !config.rewrite.enabled;
+      if (!buildNow && !config.rewrite.eager) return;
       suggestionChain = suggestionChain
         .then(async () => {
           const current = (await store.listQueue()).find((entry) => entry.id === item.id);
           if (!current) return;
-          await store.upsertQueue({
-            ...current,
-            suggestionState: "pending",
-            suggestionError: undefined,
-          });
-          server?.broadcast("queue.updated", { id: item.id, suggestionState: "pending" });
+          if (!buildNow) {
+            await store.upsertQueue({
+              ...current,
+              suggestionState: "pending",
+              suggestionError: undefined,
+            });
+            server?.broadcast("queue.updated", { id: item.id, suggestionState: "pending" });
+          }
           const items = await store.listItems();
           const targetItem =
             target ??
@@ -237,28 +411,185 @@ export async function setupPlugin(
     },
   };
 
+  let consolidationChain: Promise<void> = Promise.resolve();
+  /** One consolidation writer across turn and review paths. */
+  const consolidate = (sessionID: string, label: string): Promise<void> => {
+    consolidationChain = consolidationChain
+      .then(async () => {
+        await runConsolidation(sessionID, deps);
+        await maybeCompact(store, config);
+      })
+      .catch((error: unknown) => {
+        console.error(`[memory-autopilot] ${label} failed`, safeError(error));
+      });
+    return consolidationChain;
+  };
+
+  const digestCache = new DigestCache(store, {
+    maxEntries: config.digest.maxEntries,
+    maxBytes: config.digest.maxBytes,
+  });
+  await digestCache.load();
+  const reviewBuilder = new ReviewInputBuilder({ config, digestCache });
+  const reviewProvider = new ReviewProvider({
+    store,
+    config,
+    key: keyInfo.key,
+    log: (message, error) =>
+      console.error(`[memory-autopilot] ${message}`, safeError(error ?? "")),
+  });
+  const logReview = (message: string, error?: unknown) =>
+    console.error(`[memory-autopilot] ${message}`, error === undefined ? "" : safeError(error));
+  const reviewOrchestrator = new ReviewOrchestrator({
+    store,
+    config,
+    reader,
+    buildInput: (sessionID, messages, from, knownTitles) =>
+      reviewBuilder.build(sessionID, messages, from, knownTitles),
+    knownTitles: () => collectReviewKnownTitles(store, 30, projectKey),
+    runModel: (input) => reviewProvider.review(input),
+    validate: (input, candidates) => validateReviewCandidates(candidates, input, config),
+    onAccepted: async (input, result, reviewID) => {
+      const accepted = await acceptReviewCandidates(input, result, reviewID, {
+        store,
+        config,
+        project: deps.project,
+        projectKey: deps.projectKey,
+      });
+      await digestCache.flush();
+      if (result.candidates.length > 0) {
+        await consolidate(input.sessionID, "review consolidation");
+      }
+      return accepted;
+    },
+    broadcast: server?.broadcast,
+    log: logReview,
+  });
+
+  reviewRuntime.stats = () => ({
+    ...reviewProvider.stats(),
+    ...reviewOrchestrator.stats(),
+  });
+  reviewRuntime.run = async (sessionID) => {
+    const state = await store.readSession(sessionID);
+    if (!state || state.contextProjectKey !== projectKey) return undefined;
+    return reviewOrchestrator.runNow(sessionID, "manual");
+  };
+  reviewRuntime.onConfig = (next) => {
+    Object.assign(config.review, next.review);
+    Object.assign(config.digest, next.digest);
+    Object.assign(config.thresholds, next.thresholds);
+    Object.assign(config.caps, next.caps);
+    config.shadow = next.shadow;
+    config.autoMemory = next.autoMemory;
+    config.autoRules = next.autoRules;
+    if (!config.review.enabled) reviewOrchestrator.pause();
+    else reviewOrchestrator.resume();
+  };
+
   const controller = new AbortController();
+  let eventJob: Promise<void> | undefined;
+
   if (ctx.event) {
     const api = ctx.event;
-    void (async () => {
+    // V2: `session.idle` is ephemeral and is not delivered to ctx.event.subscribe;
+    // durable `session.execution.*` events mark turn completion. `session.idle`
+    // stays in the list for older hosts.
+    eventJob = (async () => {
+      let backoff = 250;
+      while (!controller.signal.aborted) {
       try {
         for await (const event of api.subscribe({
-          types: ["session.idle", "session.created"],
+          types: [
+            "session.idle",
+            "session.created",
+            "session.execution.succeeded",
+            "session.execution.failed",
+            "session.execution.interrupted",
+          ],
           signal: controller.signal,
         })) {
+          if (controller.signal.aborted) break;
+          const owner = ctx.location?.directory;
+          const eventDirectory =
+            isRecord(event.location) && typeof event.location.directory === "string"
+              ? event.location.directory : undefined;
+          if (owner && eventDirectory && eventDirectory !== owner) continue;
+          backoff = 250;
+          // Several plugin instances can share one data dir (workspaces, hot
+          // reload). Process each event exactly once across them.
+          const eventID =
+            typeof event.id === "string" ? event.id : undefined;
+          if (eventID) {
+            const holder = globalThis as Record<string, unknown>;
+            const key = `__openMemSeenEvents:${dataDir}`;
+            const seen =
+              (holder[key] as Map<string, number> | undefined) ??
+              new Map<string, number>();
+            holder[key] = seen;
+            if (seen.has(eventID)) continue;
+            seen.set(eventID, Date.now());
+            if (seen.size > 2000) {
+              const cutoff = Date.now() - 10 * 60_000;
+              for (const [id, at] of seen) {
+                if (at < cutoff) seen.delete(id);
+              }
+            }
+          }
+
+          // The host can load one instance per workspace. Only the instance
+          // whose directory owns the session may process its events.
           const sessionID = eventSessionID(event);
           if (!sessionID) continue;
-          if (event.type === "session.idle") {
-            await runConsolidation(sessionID, deps).catch((error: unknown) => {
-              console.error("[memory-autopilot] consolidation failed", safeError(error));
-            });
-            await maybeCompact(store, config).catch((error: unknown) => {
-              console.error("[memory-autopilot] compaction failed", safeError(error));
+          const turnFinished =
+            event.type === "session.idle" ||
+            event.type === "session.execution.succeeded" ||
+            event.type === "session.execution.failed" ||
+            event.type === "session.execution.interrupted";
+          if (event.type === "session.created") {
+            const data = isRecord(event.data) ? event.data : undefined;
+            if (data) {
+              const parentSessionID = readParentID(data);
+              const agent = readAgent(data);
+              await store
+                .updateSession(sessionID, {
+                  ...(parentSessionID ? { parentSessionID, parentChecked: true } : {}),
+                  ...(agent ? { agent } : {}),
+                })
+                .catch((error: unknown) => {
+                  console.error(
+                    "[memory-autopilot] session meta failed",
+                    safeError(error),
+                  );
+                });
+            }
+            await refreshContext(ctx, store, config, sessionID, projectKey).catch((error: unknown) => {
+              console.error("[memory-autopilot] context refresh failed", safeError(error));
             });
           }
-          if (event.type === "session.created") {
-            await refreshContext(ctx, store, config, sessionID).catch((error: unknown) => {
-              console.error("[memory-autopilot] context refresh failed", safeError(error));
+          if (turnFinished) {
+            // Subagent sessions are not user memory sources. Older sessions may
+            // not have a session.created record, so backfill from session.get.
+            let sessionState = await store.readSession(sessionID);
+            if (!sessionState?.parentChecked && ctx.session?.get) {
+              const info = await ctx.session
+                .get({ sessionID })
+                .catch(() => undefined);
+              const parentSessionID = readParentID(info);
+              const agent = readAgent(info);
+              await store
+                .updateSession(sessionID, {
+                  parentSessionID,
+                  agent,
+                  parentChecked: info !== undefined,
+                })
+                .catch(() => undefined);
+              sessionState = { ...sessionState, parentSessionID, agent, parentChecked: info !== undefined };
+            }
+            if (sessionState?.parentSessionID) continue;
+            await consolidate(sessionID, "consolidation");
+            await reviewOrchestrator.schedule(sessionID).catch((error: unknown) => {
+              console.error("[memory-autopilot] review scheduling failed", safeError(error));
             });
           }
         }
@@ -267,24 +598,30 @@ export async function setupPlugin(
           console.error("[memory-autopilot] event stream failed", safeError(error));
         }
       }
+      if (controller.signal.aborted) break;
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          clearTimeout(timer);
+          controller.signal.removeEventListener("abort", finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, backoff);
+        controller.signal.addEventListener("abort", finish, { once: true });
+      });
+      backoff = Math.min(backoff * 2, 30_000);
+      }
     })();
   }
 
   const contextRegistration = ctx.session?.hook
     ? await ctx.session.hook("context", async (event) => {
-        const block = await buildContext(store, config);
-        const text = renderContext(block);
         const entry = ctx.session?.instructions?.entry;
         if (entry && event.sessionID) {
-          if (contextCache.get(event.sessionID) === text) return;
-          await entry.put({
-            sessionID: event.sessionID,
-            key: "plugin.memory-autopilot",
-            value: block,
-          });
-          contextCache.set(event.sessionID, text);
+          await refreshContext(ctx, store, config, event.sessionID, projectKey);
           return;
         }
+        const block = await buildContext(store, config, projectKey);
+        const text = renderContext(block);
         if (Array.isArray(event.system)) event.system.push({ type: "text", text });
       })
     : undefined;
@@ -303,6 +640,7 @@ export async function setupPlugin(
                 enum: [
                   "status",
                   "review",
+                  "review_session",
                   "audit",
                   "decide",
                   "suggest",
@@ -359,6 +697,19 @@ export async function setupPlugin(
             if (request.action === "review") {
               return { content: JSON.stringify(sortQueue(await store.listQueue()), null, 2) };
             }
+            if (request.action === "review_session") {
+              if (!context.sessionID) {
+                return { content: "review_session needs an active session." };
+              }
+              const record = await reviewOrchestrator.runNow(context.sessionID, "manual");
+              return {
+                content: JSON.stringify(
+                  record ?? { status: "skipped", reason: "no new material or hourly cap" },
+                  null,
+                  2,
+                ),
+              };
+            }
             if (request.action === "audit") {
               const report = await runAudit(store, config);
               return { content: JSON.stringify(report, null, 2) };
@@ -371,6 +722,9 @@ export async function setupPlugin(
             if (request.action === "decide") {
               if (!request.id || !request.decision) {
                 return { content: "decide requires id and decision." };
+              }
+              if (["approve", "apply_suggestion", "promote"].includes(request.decision)) {
+                return { content: "正式写入、合并与提升需要用户在控制台确认；请展示候选供用户处理。" };
               }
               const result = await applyQueueDecision(store, config, request.id, {
                 action: request.decision,
@@ -396,7 +750,7 @@ export async function setupPlugin(
               return { content: JSON.stringify(draft, null, 2) };
             }
             if (request.action === "console_url") {
-              return { content: server?.url ?? "Console is disabled." };
+              return { content: server?.createConnectURL() ?? "Console is disabled." };
             }
             return { content: "Unknown action." };
           },
@@ -421,6 +775,19 @@ export async function setupPlugin(
           },
         });
         editor.add({
+          name: "memory-review-session",
+          description: "Review the current session and queue durable memory candidates for approval.",
+          execute: async ({ sessionID }: { sessionID: string }) => {
+            const record = await reviewOrchestrator.runNow(sessionID, "manual");
+            await prompt(
+              sessionID,
+              record
+                ? `Session review ${record.status}: ${record.candidates} candidate(s) queued. Call memory_autopilot with action=review to show them.`
+                : "Session review skipped: no new material, unchanged transcript, or hourly cap reached.",
+            );
+          },
+        });
+        editor.add({
           name: "memory-audit",
           description: "Run a memory and skill audit and summarize findings.",
           execute: async ({ sessionID }: { sessionID: string }) => {
@@ -436,33 +803,46 @@ export async function setupPlugin(
           execute: async ({ sessionID }: { sessionID: string }) => {
             await prompt(
               sessionID,
-              `The OpenMem console is at ${server?.url ?? "(disabled)"}. Open it in the browser; the token is in the URL.`,
+              `OpenMem 控制台：${server?.createConnectURL() ?? "(disabled)"}。这是 60 秒内有效的一次性连接链接，不含长期 Token。`,
             );
           },
         });
       })
     : undefined;
 
+  registerReviewRuntime(dataDir, reviewRuntime);
+
+  const recoveryJob = reviewOrchestrator.recover().catch((error: unknown) => {
+    console.error("[memory-autopilot] review recovery failed", safeError(error));
+  });
+
   return async () => {
     controller.abort();
+    await eventJob?.catch(() => undefined);
+    await recoveryJob;
+    await reviewOrchestrator.dispose();
+    unregisterReviewRuntime(dataDir, reviewRuntime);
+    await consolidationChain.catch(() => undefined);
     await suggestionChain.catch(() => undefined);
     await contextRegistration?.dispose();
     await toolsRegistration?.dispose();
     await commandsRegistration?.dispose();
-    if (server) {
-      await server.close().catch(() => undefined);
-      clearConsoleServer(dataDir, config.port ?? 0);
+    if (consoleAcquired) {
+      await releaseConsoleServer(dataDir, config.port ?? 0).catch(() => undefined);
     }
   };
 }
 
-async function ensureConsoleServer(options: {
+export async function ensureConsoleServer(options: {
   store: Store;
   config: AutoMemConfig;
   token: string;
   consoleDir?: string;
   decisionKeySource: "env" | "auth" | "missing";
   suggest: (id: string) => Promise<Suggestion | undefined>;
+  reviewStats?: () => Record<string, unknown>;
+  onReviewRequest?: (sessionID: string) => Promise<unknown>;
+  onConfigChange?: (config: AutoMemConfig) => void;
 }): Promise<ServerHandle> {
   type GlobalWithConsoles = typeof globalThis & {
     __openMemConsoles?: Map<string, Promise<ServerHandle>>;
@@ -471,8 +851,14 @@ async function ensureConsoleServer(options: {
   const map = globalState.__openMemConsoles ?? new Map<string, Promise<ServerHandle>>();
   globalState.__openMemConsoles = map;
   const key = `${options.store.dataDir}:${options.config.port ?? 0}`;
+  const acquire = (target: Promise<ServerHandle>): Promise<ServerHandle> =>
+    target.then((handle) => {
+      const refs = consoleRefs();
+      refs.set(key, (refs.get(key) ?? 0) + 1);
+      return handle;
+    });
   const existing = map.get(key);
-  if (existing) return existing;
+  if (existing) return acquire(existing);
   const promise = startServer({
     store: options.store,
     config: options.config,
@@ -481,62 +867,119 @@ async function ensureConsoleServer(options: {
     consoleDir: options.consoleDir,
     decisionKeySource: options.decisionKeySource,
     suggest: options.suggest,
+    reviewStats: options.reviewStats,
+    onReviewRequest: options.onReviewRequest,
+    onConfigChange: options.onConfigChange,
   }).catch((error: unknown) => {
     map.delete(key);
     throw error;
   });
   map.set(key, promise);
-  return promise;
+  return acquire(promise);
 }
 
-function clearConsoleServer(dataDir: string, port: number): void {
+/**
+ * The console server is shared by every plugin instance for one data dir.
+ * Only the last release closes it; a hot-reloaded instance must not kill the
+ * console used by its siblings.
+ */
+export async function releaseConsoleServer(dataDir: string, port: number): Promise<void> {
+  const key = `${dataDir}:${port}`;
+  const refs = consoleRefs();
+  const current = refs.get(key) ?? 0;
+  if (current > 1) {
+    refs.set(key, current - 1);
+    return;
+  }
+  refs.delete(key);
   type GlobalWithConsoles = typeof globalThis & {
     __openMemConsoles?: Map<string, Promise<ServerHandle>>;
   };
   const map = (globalThis as GlobalWithConsoles).__openMemConsoles;
-  map?.delete(`${dataDir}:${port}`);
+  const promise = map?.get(key);
+  map?.delete(key);
+  if (!promise) return;
+  const handle = await promise.catch(() => undefined);
+  await handle?.close().catch(() => undefined);
 }
 
-async function refreshContext(
+export async function refreshContext(
   ctx: PluginContext,
   store: Store,
   config: AutoMemConfig,
   sessionID: string,
+  projectKey?: string,
 ): Promise<void> {
   const entry = ctx.session?.instructions?.entry;
   if (!entry) return;
-  const block = await buildContext(store, config);
+  const pinned = await store.readSession(sessionID);
+  const block =
+    pinned?.contextBlock && pinned.contextProjectKey === projectKey
+      ? pinned.contextBlock
+      : await buildContext(store, config, projectKey);
   const text = renderContext(block);
   if (contextCache.get(sessionID) === text) return;
   await entry.put({ sessionID, key: "plugin.memory-autopilot", value: block });
   contextCache.set(sessionID, text);
+  if (!pinned?.contextBlock || pinned.contextProjectKey !== projectKey) {
+    await store.updateSession(sessionID, {
+      contextBlock: block,
+      contextHash: sha16(text),
+      contextProjectKey: projectKey,
+    });
+  }
 }
 
-async function buildContext(
+/**
+ * Build the frozen prefix from active items, never from the queue or review
+ * state. Project items are visible only in their owning project.
+ */
+export async function buildContext(
   store: Store,
   config: AutoMemConfig,
+  projectKey?: string,
 ): Promise<AutopilotContext> {
-  const [memory, rules, queue, audit] = await Promise.all([
-    store.readAutoMemory(),
-    store.readAutoRules(),
-    store.listQueue(),
-    store.readAudit(),
-  ]);
-  const auditSummary =
-    audit.summary.error + audit.summary.warning > 0
-      ? `${audit.summary.error} error, ${audit.summary.warning} warning`
-      : undefined;
+  const active = (await store.listItems()).filter(
+    (item) => item.status === "auto" || item.status === "promoted",
+  );
+  const visible = active.filter(
+    (item) =>
+      item.scope === "global" ||
+      (item.scope === "project" &&
+        projectKey !== undefined &&
+        item.projectKey === projectKey),
+  );
+  const sorted = [...visible].sort((left, right) => {
+    const byScope = scopeRank(left.scope) - scopeRank(right.scope);
+    if (byScope !== 0) return byScope;
+    const byCreated = left.createdAt.localeCompare(right.createdAt);
+    if (byCreated !== 0) return byCreated;
+    return left.id.localeCompare(right.id);
+  });
+  const clean = (item: Item): string => item.text.replace(/\s+/g, " ").trim();
+  const select = (items: Item[], max: number): string[] => {
+    const global = items.filter((item) => item.scope === "global");
+    const project = items.filter((item) => item.scope === "project");
+    const globalSlots = Math.min(global.length, project.length ? Math.ceil(max / 2) : max);
+    const selectedProject = project.slice(-(max - globalSlots));
+    const selectedGlobal = global.slice(-(max - selectedProject.length));
+    return [...selectedGlobal, ...selectedProject].map(clean).filter(Boolean);
+  };
   return {
     version: 1,
-    autoMemory: bullets(memory).slice(-10),
-    autoRules: bullets(rules).slice(-8),
-    queueCount: queue.length,
-    auditSummary,
+    autoMemory: select(sorted.filter((item) => item.kind !== "rule" && item.kind !== "skill"), 10),
+    autoRules: select(sorted.filter((item) => item.kind === "rule"), 8),
     shadow: config.shadow,
   };
 }
 
-function renderContext(block: AutopilotContext): string {
+function scopeRank(scope: Scope): number {
+  if (scope === "global") return 0;
+  if (scope === "project") return 1;
+  return 2;
+}
+
+export function renderContext(block: AutopilotContext): string {
   const lines = [
     "## AUTOPILOT",
     "Provisional memory from the OpenMem plugin. Curated AGENTS.md and memory/*.md win over these entries.",
@@ -553,73 +996,40 @@ function renderContext(block: AutopilotContext): string {
   }
   lines.push(
     "",
-    `Pending review: ${block.queueCount}. Shadow mode: ${block.shadow ? "on" : "off"}.`,
-  );
-  if (block.auditSummary) lines.push(`Audit: ${block.auditSummary}.`);
-  lines.push(
-    "Use `memory_autopilot` with action=review for details; do not treat auto rules as curated policy.",
+    `Shadow mode: ${block.shadow ? "on" : "off"}.`,
+    "Live counts: call `memory_autopilot` with action=status. Do not treat auto rules as curated policy.",
   );
   return lines.join("\n");
 }
 
-function normalizeSessionMessages(raw: unknown): SessionMessage[] {
-  if (!Array.isArray(raw)) return [];
-  const messages: SessionMessage[] = [];
-  for (const entry of raw) {
-    if (!isRecord(entry)) continue;
-    const info = isRecord(entry.info) ? entry.info : entry;
-    const parts = Array.isArray(entry.parts)
-      ? entry.parts
-      : Array.isArray(info.parts)
-        ? info.parts
-        : Array.isArray(entry.content)
-          ? entry.content
-          : Array.isArray(info.content)
-            ? info.content
-            : [];
-    const text = parts
-      .map((part) => (isRecord(part) && typeof part.text === "string" ? part.text : ""))
-      .filter(Boolean)
-      .join("\n");
-    const role =
-      typeof info.role === "string"
-        ? info.role
-        : typeof entry.role === "string"
-          ? entry.role
-          : info.type === "user"
-            ? "user"
-            : info.type === "assistant"
-              ? "assistant"
-              : undefined;
-    const id =
-      typeof info.id === "string"
-        ? info.id
-        : typeof entry.id === "string"
-          ? entry.id
-          : undefined;
-    if (text.length > 0) {
-      messages.push({
-        id,
-        role,
-        type: role,
-        text,
-        parts: parts.filter(isRecord).map((part) => ({
-          type: typeof part.type === "string" ? part.type : "text",
-          text: typeof part.text === "string" ? part.text : undefined,
-        })),
-      });
-    } else if (typeof entry.text === "string") {
-      messages.push({ id, role, type: role, text: entry.text });
-    }
-  }
-  return messages;
-}
-
 function eventSessionID(event: OpenCodeEvent): string | undefined {
   if (typeof event.sessionID === "string") return event.sessionID;
+  // V2 events carry the payload under `data` (session.idle / session.created).
+  if (isRecord(event.data)) {
+    if (typeof event.data.sessionID === "string") return event.data.sessionID;
+    if (isRecord(event.data.info) && typeof event.data.info.id === "string") {
+      return event.data.info.id;
+    }
+  }
   if (isRecord(event.properties) && typeof event.properties.sessionID === "string") {
     return event.properties.sessionID;
   }
+  return undefined;
+}
+
+/** V2 and legacy envelopes expose parent/agent under different keys. */
+function readParentID(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  if (typeof value.parentID === "string") return value.parentID;
+  if (typeof value.parent_id === "string") return value.parent_id;
+  if (isRecord(value.info)) return readParentID(value.info);
+  return undefined;
+}
+
+function readAgent(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  if (typeof value.agent === "string") return value.agent;
+  if (isRecord(value.info)) return readAgent(value.info);
   return undefined;
 }
 
@@ -656,11 +1066,14 @@ function parseOptions(value: unknown): PluginOptions {
     if (typeof value.rewrite.endpoint === "string") rewrite.endpoint = value.rewrite.endpoint;
     if (typeof value.rewrite.eager === "boolean") rewrite.eager = value.rewrite.eager;
     if (isRecord(value.rewrite.model)) {
-      const model: { providerID?: string; id?: string } = {};
+      const model: { providerID?: string; id?: string; variant?: string } = {};
       if (typeof value.rewrite.model.providerID === "string") {
         model.providerID = value.rewrite.model.providerID;
       }
       if (typeof value.rewrite.model.id === "string") model.id = value.rewrite.model.id;
+      if (typeof value.rewrite.model.variant === "string") {
+        model.variant = value.rewrite.model.variant;
+      }
       rewrite.model = model;
     }
     for (const key of ["timeoutMs", "maxCallsPerHour", "repairAttempts", "cacheTtlHours"] as const) {
@@ -743,6 +1156,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function safeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Reset "pending" markers left behind by a process that died mid-rewrite.
+ * Pending is an in-flight state, never a placeholder for "not generated".
+ */
+export async function resetStaleSuggestions(
+  store: Store,
+  maxAgeMs = 5 * 60_000,
+  now = Date.now(),
+): Promise<number> {
+  const queue = await store.listQueue();
+  let reset = 0;
+  for (const item of queue) {
+    if (item.suggestionState !== "pending") continue;
+    const updated = Date.parse(item.updatedAt);
+    if (Number.isFinite(updated) && now - updated < maxAgeMs) continue;
+    await store.upsertQueue({
+      ...item,
+      suggestionState: undefined,
+      suggestionError: undefined,
+    });
+    reset += 1;
+  }
+  return reset;
 }
 
 export { newId };

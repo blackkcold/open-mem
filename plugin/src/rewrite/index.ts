@@ -29,6 +29,11 @@ export class RewriteService {
       ctx: options.ctx,
       config: options.config.rewrite,
       key: options.key,
+      beforeRequest: async () => {
+        if (!await options.store.takeModelSlot("rewrite", options.config.rewrite.maxCallsPerHour)) {
+          throw new Error("改写请求预算已用尽，请稍后重试");
+        }
+      },
     });
   }
 
@@ -36,13 +41,10 @@ export class RewriteService {
     if (!this.options.config.rewrite.enabled) {
       return composerWith(input, "System Two 未启用");
     }
-    if (!this.allow()) {
-      return composerWith(input, "System Two 限流/熔断，已使用模板合并");
-    }
-
     const key = cacheKey(input, this.options.config.rewrite.model.id);
     const cached = await this.readCache(key);
     if (cached) return { ...cached, source: "systemtwo" };
+    if (!this.allow()) return composerWith(input, "System Two 限流/熔断，已使用模板合并");
 
     const started = Date.now();
     try {
@@ -109,6 +111,7 @@ export class RewriteService {
   }
 
   private async writeCache(key: string, value: RewriteOutput): Promise<void> {
+    await this.options.store.transaction(async () => {
     const cache = await this.options.store.readCacheFile<Record<string, CacheEntry>>(
       this.options.store.rewriteCachePath,
       {},
@@ -124,6 +127,7 @@ export class RewriteService {
       this.options.store.rewriteCachePath,
       Object.fromEntries(entries),
     );
+    });
   }
 
   private async log(

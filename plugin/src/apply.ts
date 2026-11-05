@@ -9,6 +9,7 @@ import { newId, type Store } from "./store.js";
 import { compact, lintText } from "./linter.js";
 import { admitNewItem } from "./capacity.js";
 import { rebuildAutoFiles } from "./rebuild.js";
+import { itemContentVersion } from "./fingerprint.js";
 
 export interface ApplyEdits {
   title?: string;
@@ -33,9 +34,24 @@ export async function applySuggestion(
   queueID: string,
   edits?: ApplyEdits,
 ): Promise<ApplyResult> {
+  return store.transaction(() => applySuggestionUnlocked(store, config, queueID, edits));
+}
+
+async function applySuggestionUnlocked(
+  store: Store,
+  config: AutoMemConfig,
+  queueID: string,
+  edits?: ApplyEdits,
+): Promise<ApplyResult> {
   const queue = await store.listQueue();
   const item = queue.find((entry) => entry.id === queueID);
   if (!item) return { ok: false, error: "队列条目不存在" };
+  if (item.scope === "session") {
+    return {
+      ok: false,
+      error: "session 条目只能通过 promote 提升到 project/global",
+    };
+  }
   const suggestion = item.suggestion;
   if (!suggestion) return { ok: false, error: "还没有合并建议，请先生成" };
   if (item.kind === "skill") {
@@ -60,8 +76,22 @@ export async function applySuggestion(
   const target = suggestion.targetId
     ? (await store.listItems()).find((entry) => entry.id === suggestion.targetId)
     : undefined;
+  if ((action === "merge_into" || action === "replace") && (item.kind === "rule" || target?.kind === "rule")) {
+    return { ok: false, error: "规则不能合并或替换，请保留独立规则供用户检查" };
+  }
   if ((action === "merge_into" || action === "replace") && !target) {
     return { ok: false, error: "合并目标已不存在，请重新生成建议" };
+  }
+  if (target && ["merge_into", "replace", "reject_duplicate"].includes(action) &&
+      (!suggestion.targetVersion || suggestion.targetVersion !== itemContentVersion(target))) {
+    return { ok: false, error: "目标内容已变更或建议版本过旧，请重新生成建议" };
+  }
+  if (
+    target && (action === "merge_into" || action === "replace" || action === "reject_duplicate") &&
+    (target.scope !== item.scope ||
+      (item.scope === "project" && (!item.projectKey || target.projectKey !== item.projectKey)))
+  ) {
+    return { ok: false, error: "目标不属于相同范围或项目，请重新生成建议" };
   }
   if ((action === "create" || action === "keep_both") && target?.id === item.id) {
     return { ok: false, error: "合并目标不能是候选自身" };
@@ -103,11 +133,12 @@ export async function applySuggestion(
       title,
       text,
       status: target.status === "promoted" ? "promoted" : "auto",
+      manual: true,
       seenCount: (target.seenCount ?? 1) + 1,
       lastSeenAt: now,
       sources: [...(target.sources ?? [target.source]), item.source].slice(-20),
       aliases: [...(target.aliases ?? []), item.text].slice(-10),
-    });
+    }, target);
     if (!updatedTarget) return { ok: false, error: "更新目标失败" };
   } else if (action === "reject_duplicate") {
     created = {
@@ -117,6 +148,7 @@ export async function applySuggestion(
       kind: item.kind,
       scope: item.scope,
       project: item.project,
+      projectKey: item.projectKey,
       status: "archived",
       source: item.source,
       createdAt: now,
@@ -139,7 +171,9 @@ export async function applySuggestion(
       kind: item.kind,
       scope: item.scope,
       project: item.project,
+      projectKey: item.projectKey,
       status: "auto",
+      manual: true,
       source: item.source,
       createdAt: now,
       updatedAt: now,
@@ -156,7 +190,7 @@ export async function applySuggestion(
 
   await store.removeQueue(item.id);
   await store.updateJournal(journal.id, {
-    after: { itemID: created?.id, targetText: updatedTarget?.text },
+    after: { itemID: created?.id, targetText: updatedTarget?.text, target: updatedTarget, item: created },
   });
   await store.incrementStat(
     action === "reject_duplicate" ? "suggestionRejected" : "suggestionApplied",
@@ -182,44 +216,16 @@ export async function undoMerge(
   store: Store,
   journalID: string,
 ): Promise<ApplyResult> {
-  const entries = await store.listJournal();
-  const entry = entries.find((candidate) => candidate.id === journalID);
-  if (!entry) return { ok: false, error: "撤销记录不存在" };
-  if (entry.undone) return { ok: false, error: "这次合并已经撤销过" };
-  if (Date.now() - new Date(entry.at).getTime() > UNDO_WINDOW_MS) {
-    return { ok: false, error: "超过 24 小时撤销窗口" };
-  }
+  return store.transaction(() => undoMergeUnlocked(store, journalID));
+}
 
-  if (entry.before.target) {
-    const before = entry.before.target;
-    await store.updateItem(before.id, {
-      title: before.title,
-      text: before.text,
-      status: before.status,
-      seenCount: before.seenCount,
-      lastSeenAt: before.lastSeenAt,
-      sources: before.sources,
-      aliases: before.aliases,
-      supersededBy: before.supersededBy,
-    });
-  }
-
-  const items = await store.listItems();
-  for (const item of items) {
-    if (
-      item.tags?.includes(`merge:${entry.id}`) &&
-      item.status !== "archived" &&
-      item.id !== entry.before.target?.id
-    ) {
-      await store.updateItem(item.id, { status: "archived", supersededBy: "undo" });
-    }
-  }
-
-  await store.upsertQueue({
-    ...entry.before.queue,
-    suggestionState: entry.before.queue.suggestion ? "ready" : undefined,
-  });
-  await store.markJournalUndone(entry.id);
+async function undoMergeUnlocked(
+  store: Store,
+  journalID: string,
+): Promise<ApplyResult> {
+  let entry: MergeJournal;
+  try { entry = await store.undoMergeEntry(journalID, UNDO_WINDOW_MS); }
+  catch (error) { return { ok: false, error: error instanceof Error ? error.message : "撤销失败" }; }
   await store.incrementStat("mergeUndone");
   await store.appendChangelog({ action: "undo_merge", journalID: entry.id, queueID: entry.queueID });
   await rebuildAutoFiles(store);

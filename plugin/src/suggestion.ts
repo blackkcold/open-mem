@@ -8,6 +8,7 @@ import type {
 import type { Store } from "./store.js";
 import { newId } from "./store.js";
 import { compact, lintText } from "./linter.js";
+import { itemContentVersion } from "./fingerprint.js";
 import { composeRewrite } from "./rewrite/composer.js";
 import { validateRewrite } from "./rewrite/validate.js";
 import type { RewriteService } from "./rewrite/index.js";
@@ -29,7 +30,11 @@ export async function buildSuggestion(
   const maxChars = maxCharsFor(deps.config, queueItem.kind);
   const titleMaxChars = deps.config.thresholds.titleMaxChars;
   const usableTarget =
-    target && (target.status === "auto" || target.status === "promoted") ? target : undefined;
+    target && (target.status === "auto" || target.status === "promoted") &&
+    target.scope === queueItem.scope &&
+    (queueItem.scope !== "project" ||
+      (queueItem.projectKey !== undefined && target.projectKey === queueItem.projectKey))
+      ? target : undefined;
   const requested = decision.mergeAction ?? "create";
 
   let suggestion: Suggestion;
@@ -66,6 +71,7 @@ export async function buildSuggestion(
       action: finalAction,
       targetId: usableTarget.id,
       targetTitle: usableTarget.title,
+      targetVersion: itemContentVersion(usableTarget),
       proposedTitle: output.title,
       proposedText: output.text,
       preserved: output.preserved,
@@ -79,7 +85,7 @@ export async function buildSuggestion(
     };
   } else {
     const finalAction =
-      requested === "reject_duplicate" && usableTarget
+      requested === "reject_duplicate"
         ? "reject_duplicate"
         : requested === "keep_both"
           ? "keep_both"
@@ -102,13 +108,16 @@ export async function buildSuggestion(
       action: finalAction,
       targetId: usableTarget?.id,
       targetTitle: usableTarget?.title,
+      targetVersion: usableTarget ? itemContentVersion(usableTarget) : undefined,
       proposedTitle: queueItem.title,
       proposedText,
       preserved: [proposedText],
       dropped: [],
       rationale:
         finalAction === "reject_duplicate"
-          ? "目标条目已经覆盖候选，建议拒绝重复。"
+          ? usableTarget
+            ? "目标条目已经覆盖候选，建议拒绝重复。"
+            : "判定为重复候选，建议归档。"
           : finalAction === "keep_both"
             ? "两者相关但不能安全合并，建议保留两条。"
             : "建议作为新条目写入。",
@@ -119,12 +128,11 @@ export async function buildSuggestion(
     };
   }
 
-  await deps.store.upsertQueue({
-    ...queueItem,
+  await deps.store.patchQueue([{ id: queueItem.id, patch: {
     suggestion,
     suggestionState: "ready",
     suggestionError: undefined,
-  });
+  } }]);
   deps.broadcast?.("suggestion.updated", suggestion);
   return suggestion;
 }

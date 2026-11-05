@@ -1,48 +1,146 @@
+import { isExtension } from "./extension/mode";
+
 const TOKEN_KEY = "openmem.token";
+
+export interface TransportResult {
+  status: number;
+  body: string;
+}
+
+export type Transport = (path: string, init: RequestInit) => Promise<TransportResult>;
+
+let transport: Transport = standaloneTransport;
+let memoryToken = "";
+
+export function setTransport(next: Transport): void {
+  transport = next;
+}
 
 export class ApiError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  readonly code?: string;
+
+  constructor(status: number, message: string, code?: string) {
     super(message);
+    this.name = "ApiError";
     this.status = status;
+    this.code = code;
+  }
+}
+
+function readStoredToken(): string {
+  try {
+    return localStorage.getItem(TOKEN_KEY) ?? "";
+  } catch {
+    // The extension iframe is an opaque origin and localStorage throws.
+    return "";
   }
 }
 
 export function readTokenFromLocation(): string {
+  if (isExtension()) return "extension";
+  try {
+    const url = new URL(window.location.href);
+    if (url.searchParams.has("connect")) return "";
+    const token = url.searchParams.get("token") ?? "";
+    if (token) {
+      setToken(token);
+      url.searchParams.delete("token");
+      window.history.replaceState(null, "", url.toString());
+    }
+    return token || getToken();
+  } catch {
+    return getToken();
+  }
+}
+
+export async function exchangeConnectTicket(): Promise<string | undefined> {
+  if (isExtension()) return undefined;
   const url = new URL(window.location.href);
-  const token = url.searchParams.get("token") ?? "";
-  if (token) setToken(token);
-  return token || getToken();
+  const ticket = url.searchParams.get("connect");
+  if (!ticket) return undefined;
+  url.searchParams.delete("connect");
+  window.history.replaceState(null, "", url.toString());
+  const response = await fetch("/api/connect", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ticket }) });
+  const data: unknown = await response.json();
+  if (!response.ok || typeof data !== "object" || data === null || !("token" in data) || typeof data.token !== "string") {
+    throw new ApiError(response.status, "连接链接已过期或已使用，请重新获取链接或输入 Token");
+  }
+  setToken(data.token);
+  return data.token;
 }
 
 export function getToken(): string {
-  return localStorage.getItem(TOKEN_KEY) ?? "";
+  return isExtension() ? "" : memoryToken || readStoredToken();
 }
 
 export function setToken(token: string): void {
-  localStorage.setItem(TOKEN_KEY, token);
+  if (isExtension()) return;
+  memoryToken = token;
+  try {
+    localStorage.setItem(TOKEN_KEY, token);
+  } catch {
+    // Standalone storage can be blocked by the browser; the token still lives
+    // in the URL for this page load.
+  }
 }
 
 export function clearToken(): void {
-  localStorage.removeItem(TOKEN_KEY);
+  if (isExtension()) return;
+  memoryToken = "";
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // Ignore storage failures; there is nothing else to clear.
+  }
+}
+
+async function standaloneTransport(
+  path: string,
+  init: RequestInit,
+): Promise<TransportResult> {
+  const token = getToken();
+  const headers = new Headers(init.headers);
+  if (init.body) headers.set("content-type", "application/json");
+  if (token) headers.set("authorization", `Bearer ${token}`);
+
+  let response: Response;
+  try {
+    response = await fetch(path, { ...init, headers });
+  } catch {
+    throw new ApiError(0, "无法连接 OpenMem 控制台。请确认它正在运行。");
+  }
+  return { status: response.status, body: await response.text() };
 }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const token = getToken();
-  const headers: Record<string, string> = {
-    authorization: `Bearer ${token}`,
-    ...(init.body ? { "content-type": "application/json" } : {}),
-    ...(init.headers as Record<string, string> | undefined),
-  };
-  const response = await fetch(path, { ...init, headers });
-  const text = await response.text();
-  const data = text ? (JSON.parse(text) as unknown) : undefined;
-  if (!response.ok) {
+  const result = await transport(path, init);
+  let data: unknown;
+  if (result.body) {
+    try {
+      data = JSON.parse(result.body) as unknown;
+    } catch {
+      data = result.body;
+    }
+  }
+  if (result.status < 200 || result.status >= 300) {
+    const record =
+      typeof data === "object" && data !== null
+        ? (data as Record<string, unknown>)
+        : undefined;
     const message =
-      typeof data === "object" && data !== null && "error" in data && typeof (data as { error: unknown }).error === "string"
-        ? (data as { error: string }).error
-        : `HTTP ${response.status}`;
-    throw new ApiError(response.status, message);
+      typeof record?.error === "string"
+        ? record.error
+        : typeof record?.message === "string"
+          ? record.message
+          : Array.isArray(record?.errors)
+            ? record.errors.filter((entry): entry is string => typeof entry === "string").join("；")
+          : `HTTP ${result.status}`;
+    throw new ApiError(
+      result.status,
+      message,
+      typeof record?.code === "string" ? record.code : undefined,
+    );
   }
   return data as T;
 }
@@ -59,6 +157,18 @@ export function formatAge(iso: string): string {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}h`;
   return `${Math.floor(hours / 24)}d`;
+}
+
+/** Longer, human phrasing for the session review card and health strip. */
+export function formatReviewAge(iso: string): string {
+  const time = new Date(iso).getTime();
+  if (!Number.isFinite(time)) return "未知";
+  const minutes = Math.max(0, Math.floor((Date.now() - time) / 60000));
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return `${Math.floor(hours / 24)} 天前`;
 }
 
 export function formatPercent(value: number): string {
