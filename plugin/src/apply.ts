@@ -12,12 +12,20 @@ import { rebuildAutoFiles } from "./rebuild.js";
 import { itemContentVersion } from "./fingerprint.js";
 import { isSuggestionReady } from "./suggestion.js";
 import { validateRewrite } from "./rewrite/validate.js";
+import { findWriteConflicts } from "./memory/write-guard.js";
+import type { RelationKind } from "./relations.js";
 import type { RewriteInput, RewriteOutput } from "./rewrite/types.js";
 
 export interface ApplyEdits {
   title?: string;
   text?: string;
   note?: string;
+}
+
+export interface RelationWarning {
+  id: string;
+  relation: RelationKind;
+  version: string;
 }
 
 export interface ApplyResult {
@@ -27,6 +35,8 @@ export interface ApplyResult {
   journalID?: string;
   target?: Item;
   item?: Item;
+  /** Non-blocking relation evidence for create/keep_both; never copied bodies. */
+  relationWarnings?: RelationWarning[];
 }
 
 const UNDO_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -174,6 +184,30 @@ async function applySuggestionUnlocked(
   if ((action === "create" || action === "keep_both") && target?.id === item.id) {
     return { ok: false, error: "合并目标不能是候选自身" };
   }
+  let relationWarnings: RelationWarning[] | undefined;
+  if (action === "create" || action === "keep_both") {
+    const guard = findWriteConflicts(
+      {
+        id: item.id,
+        title,
+        text,
+        kind: item.kind,
+        scope: item.scope,
+        projectKey: item.projectKey,
+      },
+      [...(await store.listItems()), ...(await store.listQueue())],
+      { excludeID: item.id },
+    );
+    const relevant = guard.conflicts.filter((entry) =>
+      ["exact", "covered", "classification-mismatch", "conflict"].includes(
+        entry.relation,
+      ),
+    );
+    relationWarnings =
+      relevant.length > 0
+        ? relevant.map(({ id, relation, version }) => ({ id, relation, version }))
+        : undefined;
+  }
   if (action === "create" || action === "keep_both") {
     const admission = await admitNewItem(store, config, item.kind);
     if (!admission.ok) return { ok: false, error: admission.reason ?? "容量不足" };
@@ -281,6 +315,7 @@ async function applySuggestionUnlocked(
     journalID: journal.id,
     note: edits?.note,
     humanEdited: humanEdited || undefined,
+    relationWarnings,
   });
   await rebuildAutoFiles(store);
   return {
@@ -289,6 +324,7 @@ async function applySuggestionUnlocked(
     journalID: journal.id,
     target: updatedTarget,
     item: created,
+    relationWarnings,
   };
 }
 

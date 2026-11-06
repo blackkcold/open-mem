@@ -166,6 +166,33 @@ describe("rewrite validator", () => {
     expect(validation.errors.join(" ")).toContain("不要");
   });
 
+  it("rejects a merge that swaps the object of the same negation marker", () => {
+    const swapped: RewriteInput = {
+      ...input,
+      candidate: {
+        title: "[P] screen",
+        text: "不要使用 screen",
+        kind: "preference",
+        scope: "global",
+      },
+      target: {
+        id: "item_nohup",
+        title: "[P] nohup",
+        text: "不要使用 nohup",
+        kind: "preference",
+        scope: "global",
+      },
+    };
+    const validation = validateRewrite(swapped, {
+      ...validOutput,
+      action: "merge",
+      text: "不要使用 nohup。",
+      dropped: [],
+    });
+    expect(validation.ok).toBe(false);
+    expect(validation.errors.join(" ")).toContain("screen");
+  });
+
   it("rejects a merge that keeps one qualifier but drops another", () => {
     const twoQualifiers: RewriteInput = {
       ...input,

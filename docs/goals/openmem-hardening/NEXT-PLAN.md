@@ -864,3 +864,5 @@
 | 回归与工程验证 | `npm run verify` exit 0；59 文件 / 739 用例；三端 typecheck、两端 build、extension bundle/proxy、diff whitespace 全通过 |
 
 **本批未做（留待后续批次）**：approve 与 consolidate 自动写入的冲突守卫、关系判断的“新增数字不等于冲突”细化、阶段 2–8 的覆盖/备份/性能/产物项、真实 store 恢复演练、安装目录同步与发布。真实数据、真实模型、真实断电与远程 CI 仍未验证。
+
+**第二批计划**：见 `BATCH-2-PLAN.md`（基线 v0.4.0 @ `d2eed5d`；覆盖与状态可信、写入一致性、备份状态、UX/可访问性）。

@@ -257,6 +257,152 @@ describe("runConsolidation", () => {
       jev: { ...preferenceJev, kind: "rule", strictness: "format", safeAuto: 1 }, scope: "global", autoCounts: { memory: 0, rules: 0 },
     })).toBe(false);
   });
+  it("queues a conflicting candidate instead of auto-writing it", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const at = new Date().toISOString();
+      await store.appendItem({
+        id: "port-5199",
+        title: "[F] 端口",
+        text: "本地 dev server 端口是 5199",
+        kind: "fact",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: at,
+        updatedAt: at,
+      });
+      const result = await runConsolidation("port-guard", {
+        store,
+        decision: provider({ ...preferenceJev, kind: "fact" }),
+        config: mergeConfig(DEFAULT_CONFIG, { shadow: false }),
+        readMessages: async () => [{ id: "m-port", type: "user", text: "以后本地 dev server 端口是 5198" }],
+      });
+      expect(result.auto).toBe(0);
+      expect(result.queued).toBe(1);
+      const queue = await store.listQueue();
+      expect(queue[0]?.reason).toMatch(/conflict|relation/);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("queues a partial duplicate when the model still reports a high duplicate score", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const at = new Date().toISOString();
+      await store.appendItem({
+        id: "conclusion",
+        title: "[P] 先给结论",
+        text: "回复先给结论",
+        kind: "preference",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: at,
+        updatedAt: at,
+      });
+      const result = await runConsolidation("partial-guard", {
+        store,
+        decision: provider({ ...preferenceJev, duplicate: 0.5 }),
+        config: mergeConfig(DEFAULT_CONFIG, {
+          shadow: false,
+          thresholds: { ...DEFAULT_CONFIG.thresholds, duplicateMax: 0.8 },
+        }),
+        readMessages: async () => [{ id: "m-partial", type: "user", text: "以后回复先给结论，3 个要点" }],
+      });
+      expect(result.auto).toBe(0);
+      expect(result.queued).toBe(1);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("re-checks the guard inside the transaction and does not duplicate a concurrent write", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const config = mergeConfig(DEFAULT_CONFIG, { shadow: false });
+      let injected = false;
+      const originalTransaction = store.transaction.bind(store);
+      store.transaction = async <T>(fn: () => Promise<T>): Promise<T> => {
+        if (!injected) {
+          injected = true;
+          const at = new Date().toISOString();
+          await store.appendItem({
+            id: "raced",
+            title: "[P] 以后回复先给结论",
+            text: "以后回复先给结论",
+            kind: "preference",
+            scope: "global",
+            status: "auto",
+            source: {},
+            createdAt: at,
+            updatedAt: at,
+          });
+        }
+        return originalTransaction(fn);
+      };
+      const result = await runConsolidation("race-session", {
+        store,
+        decision: provider(preferenceJev),
+        config,
+        readMessages: async () => [{ id: "m1", type: "user", text: "以后回复先给结论" }],
+      });
+      expect(result.auto).toBe(0);
+      expect(result.skipped).toBe(1);
+      expect((await store.listItems()).filter((item) => item.status === "auto")).toHaveLength(1);
+      expect((await store.listHooks())[0]?.status).toBe("ignored");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("does not drop a review candidate whose kind differs from an identical stored text", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const at = new Date().toISOString();
+      await store.appendItem({
+        id: "pref-1",
+        title: "[P] 回复先给结论",
+        text: "回复先给结论",
+        kind: "preference",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: at,
+        updatedAt: at,
+      });
+      await store.appendHook({
+        id: "review-rule",
+        key: "review-rule",
+        sessionID: "s1",
+        turnID: "t1",
+        messageID: "m1",
+        text: "回复先给结论",
+        title: "[R] 回复先给结论",
+        trigger: "review",
+        scope: "global",
+        source: {},
+        createdAt: at,
+        updatedAt: at,
+        status: "pending",
+        attempts: 0,
+        origin: "session-review",
+        reviewType: "rule",
+      });
+      const result = await runConsolidation("s1", {
+        store,
+        decision: provider(preferenceJev),
+        config: mergeConfig(DEFAULT_CONFIG, { shadow: false }),
+        readMessages: async () => [],
+      });
+      expect(result.skipped).toBe(0);
+      expect(result.queued).toBe(1);
+      expect((await store.listQueue())[0]?.kind).toBe("rule");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
   it("does not drop a candidate that changes only a port", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
     try {
@@ -437,6 +583,7 @@ describe("runConsolidation", () => {
         decision: parallelProvider,
         config,
         project: "/repo/a",
+        projectKey: "proj-a",
         readMessages: async () => turnMessages,
       });
       expect(result.auto).toBe(2);

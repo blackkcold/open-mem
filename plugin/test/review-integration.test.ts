@@ -320,6 +320,8 @@ describe("session review integration", () => {
       const originless: QueueItem = {
         ...item,
         id: "q_review_gate_2",
+        title: "构建失败先看日志",
+        text: "构建失败时先看日志",
         origin: undefined,
         reviewID: "review_x",
       };

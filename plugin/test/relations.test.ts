@@ -127,4 +127,64 @@ describe("classifyRelation", () => {
     expect(relation.identifiers.added).toEqual(expect.arrayContaining(["1.2.4", "2026-11-07"]));
     expect(relation.identifiers.missing).toEqual(expect.arrayContaining(["1.2.3", "2026-11-06"]));
   });
+
+  it("treats an added number as supplementary information instead of a conflict", () => {
+    const relation = classifyRelation(
+      { text: "回复先给结论，3 个要点", kind: "preference" },
+      { text: "回复先给结论", kind: "preference" },
+    );
+    expect(relation.relation).toBe("partial");
+    expect(relation.identifiers.added).toContain("3");
+  });
+
+  it("compares negations by their object instead of the marker alone", () => {
+    const relation = classifyRelation(
+      { text: "不要使用 nohup", kind: "rule" },
+      { text: "禁止使用 force push", kind: "rule" },
+    );
+    expect(relation.relation).not.toBe("conflict");
+    expect(relation.relation).toBe("related");
+    expect(relation.negation.clauses.candidate[0]?.object).toContain("nohup");
+    expect(relation.negation.clauses.entry[0]?.object).toContain("force");
+  });
+
+  it("does not call a short rule covered by a long paragraph", () => {
+    const relation = classifyRelation(
+      { text: "使用中文" },
+      { text: "团队约定：所有回复使用中文，代码注释保持英文，提交信息使用英文。", kind: "rule" },
+    );
+    expect(relation.relation).not.toBe("covered");
+  });
+
+  it("treats a shared title with unrelated bodies as related, not covered", () => {
+    const relation = classifyRelation(
+      { text: "部署前先备份数据库", title: "部署检查" },
+      { text: "周五下午进行代码评审", title: "部署检查", kind: "preference" },
+    );
+    expect(relation.relation).not.toBe("covered");
+    expect(relation.relation).toBe("related");
+  });
+
+  it("checks kind before identifier conflicts", () => {
+    const relation = classifyRelation(
+      { text: "本地端口是 5198", kind: "rule" },
+      { text: "本地端口是 5199", kind: "fact" },
+    );
+    expect(relation.relation).toBe("classification-mismatch");
+  });
+
+  it("keeps a replaced value a conflict when the surrounding wording changes", () => {
+    const pairs: Array<[string, string]> = [
+      ["本地端口是 5198", "本地端口为 5199"],
+      ["默认端口是 3000", "默认端口改为了 4000"],
+      ["部署版本是 1.2.3", "部署版本为 1.2.4"],
+    ];
+    for (const [candidate, entry] of pairs) {
+      const relation = classifyRelation(
+        { text: candidate, kind: "fact" },
+        { text: entry, kind: "fact" },
+      );
+      expect(relation.relation, `${candidate} vs ${entry}`).toBe("conflict");
+    }
+  });
 });

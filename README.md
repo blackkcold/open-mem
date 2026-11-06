@@ -167,7 +167,7 @@ Requires OpenChamber 2.6.0+ on web/desktop. The OpenMem server still binds
 
 ## Status
 
-`v0.4.0` · run `npm run verify` for unit/API tests, three typechecks, builds,
+`v0.5.0` · run `npm run verify` for unit/API tests, three typechecks, builds,
 extension proxy tests, and whitespace validation. [Testing](docs/TESTING.md) separates
 current synthetic verification from historical isolated live-model results.
 Recovery history has a preview-and-confirm cleanup policy (at least 90 days and

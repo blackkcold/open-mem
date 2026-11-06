@@ -16,6 +16,7 @@ import { sortQueue } from "./priority.js";
 import { computeMetrics, runAudit } from "./audit.js";
 import { projectMap } from "./map.js";
 import { applyQueueDecision, type QueueDecision } from "./actions.js";
+import type { RelationKind } from "./relations.js";
 import {
   BATCH_APPLY_CONFIDENCE_FLOOR,
   batchItemNeedsIndividualReview,
@@ -45,9 +46,9 @@ import {
   type GraphRoots,
 } from "./graph.js";
 import {
+  analyzeBaselineCoverage,
   baselineStatus,
   buildBaselineIndex,
-  matchBaseline,
 } from "./baseline.js";
 
 export interface ServerOptions {
@@ -239,7 +240,7 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
     if (requestURL.pathname === "/api/health" && req.method === "GET") {
       sendJson(res, 200, {
         ok: true,
-        version: "0.4.0",
+        version: "0.5.0",
         dataDir: store.dataDir,
         shadow: config.shadow,
         decision: {
@@ -294,11 +295,16 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
         : undefined;
       sendJson(res, 200, {
         items: sortQueue(queue).map((item) => {
-          const coverage = baseline ? matchBaseline(baseline, item) : [];
+          const analysis = baseline ? analyzeBaselineCoverage(baseline, item) : undefined;
           return {
             ...item,
             decisionVersion: queueItemSnapshotVersion(item),
-            ...(coverage.length > 0 ? { coverage } : {}),
+            ...(analysis && analysis.matches.length > 0
+              ? {
+                  coverage: analysis.matches.slice(0, 3),
+                  coverageSummary: analysis.summary,
+                }
+              : {}),
           };
         }),
         ...(baseline ? { baseline: baselineStatus(baseline) } : {}),
@@ -405,10 +411,17 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
               ? body.projectKey
               : undefined,
           confirmedByUser: isRecord(body) && body.confirmedByUser === true,
+          acknowledgedRelations: isRecord(body)
+            ? parseAcknowledgedRelations(body.acknowledgedRelations)
+            : undefined,
         },
       );
       if (!result.ok) {
-        sendJson(res, 400, { error: result.error ?? "promotion failed" });
+        sendJson(res, result.conflict ? 409 : 400, {
+          error: result.error ?? "promotion failed",
+          ...(result.code ? { code: result.code } : {}),
+          ...(result.conflicts ? { conflicts: result.conflicts } : {}),
+        });
         return;
       }
       broadcast("review.updated", { reviewID, noteIndex, item: result.item });
@@ -562,6 +575,8 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
       if (!result.ok) {
         sendJson(res, result.conflict ? 409 : 400, {
           error: result.error ?? "decision failed",
+          ...(result.code ? { code: result.code } : {}),
+          ...(result.conflicts ? { conflicts: result.conflicts } : {}),
         });
         return;
       }
@@ -1754,7 +1769,42 @@ function parseQueueDecision(value: unknown): QueueDecision | undefined {
         : undefined,
     projectKey:
       typeof value.projectKey === "string" ? value.projectKey : undefined,
+    ignoreSuggestion: value.ignoreSuggestion === true,
+    acknowledgedRelations: parseAcknowledgedRelations(value.acknowledgedRelations),
   };
+}
+
+const RELATION_KINDS: RelationKind[] = [
+  "exact",
+  "classification-mismatch",
+  "conflict",
+  "covered",
+  "partial",
+  "related",
+  "unknown",
+];
+
+function parseAcknowledgedRelations(
+  value: unknown,
+): QueueDecision["acknowledgedRelations"] {
+  if (!Array.isArray(value)) return undefined;
+  const entries = value.flatMap((entry) => {
+    if (!isRecord(entry)) return [];
+    if (
+      typeof entry.id !== "string" ||
+      typeof entry.relation !== "string" ||
+      typeof entry.version !== "string" ||
+      !RELATION_KINDS.includes(entry.relation as RelationKind)
+    ) {
+      return [];
+    }
+    return [{
+      id: entry.id,
+      relation: entry.relation as RelationKind,
+      version: entry.version,
+    }];
+  });
+  return entries.length > 0 ? entries : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

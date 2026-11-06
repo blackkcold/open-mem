@@ -214,11 +214,13 @@ describe("HTTP API", () => {
     const queue = await fetch(api("/api/queue"));
     const body = (await queue.json()) as {
       items: QueueItem[];
-      baseline?: { state: string };
+      baseline?: { state: string; analysisVersion?: string };
     };
     expect(body.items.length).toBe(1);
     expect(body.baseline?.state).toBe("ready");
+    expect(typeof body.baseline?.analysisVersion).toBe("string");
     expect(body.items[0]?.coverage?.some((entry) => entry.heading === "输出规范")).toBe(true);
+    expect(body.items[0]?.coverageSummary?.coveredCount).toBeGreaterThan(0);
   });
 
   it("reports and refreshes the baseline index without writing memory", async () => {
@@ -241,6 +243,56 @@ describe("HTTP API", () => {
     expect(response.status).toBe(200);
     expect(await store.listQueue()).toEqual([]);
     expect(await store.readAutoMemory()).toContain("先给结论");
+  });
+
+  it("returns a relation acknowledgement conflict over HTTP", async () => {
+    const at = new Date().toISOString();
+    await store.appendItem({
+      id: "api-port-5199",
+      title: "[F] 端口",
+      text: "API 测试端口是 5199",
+      kind: "fact",
+      scope: "global",
+      status: "auto",
+      source: {},
+      createdAt: at,
+      updatedAt: at,
+    });
+    await store.upsertQueue({
+      ...queueItem("q-ack", "[F] 端口", "API 测试端口是 5198"),
+      kind: "fact",
+    });
+    const response = await fetch(api("/api/queue/q-ack/decision"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action: "approve",
+        expectedVersion: await decisionVersionFor("q-ack"),
+      }),
+    });
+    expect(response.status).toBe(409);
+    const body = (await response.json()) as {
+      code?: string;
+      conflicts?: Array<{ id: string; relation: string; version: string }>;
+    };
+    expect(body.code).toBe("RELATION_ACK_REQUIRED");
+    expect(body.conflicts?.[0]?.id).toBe("api-port-5199");
+
+    const retry = await fetch(api("/api/queue/q-ack/decision"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action: "approve",
+        expectedVersion: await decisionVersionFor("q-ack"),
+        acknowledgedRelations: (body.conflicts ?? []).map((entry) => ({
+          id: entry.id,
+          relation: entry.relation,
+          version: entry.version,
+        })),
+      }),
+    });
+    expect(retry.status).toBe(200);
+    expect((await store.listQueue()).some((entry) => entry.id === "q-ack")).toBe(false);
   });
 
   it("runs an audit and returns a map", async () => {

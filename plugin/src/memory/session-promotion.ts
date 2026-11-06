@@ -6,16 +6,26 @@ import { admitNewItem } from "../capacity.js";
 import { rebuildAutoFiles } from "../rebuild.js";
 import { reviewKind } from "../review/decision.js";
 import { canPromote } from "./promotion.js";
+import type { RelationKind } from "../relations.js";
+import type { WriteConflict } from "./write-guard.js";
 
 export interface SessionPromotionDecision {
   targetScope: "project" | "global";
   projectKey?: string;
   confirmedByUser?: boolean;
+  acknowledgedRelations?: Array<{
+    id: string;
+    relation: RelationKind;
+    version: string;
+  }>;
 }
 
 export interface SessionPromotionResult {
   ok: boolean;
   error?: string;
+  conflict?: boolean;
+  code?: "RELATION_ACK_REQUIRED";
+  conflicts?: WriteConflict[];
   item?: Item;
 }
 
@@ -74,8 +84,11 @@ async function promoteSessionNoteUnlocked(
   const existing = (await store.listItems()).filter(
     (item) => item.status === "auto" || item.status === "promoted",
   );
+  const queue = await store.listQueue();
   const gate = canPromote(
     {
+      id: `review-note:${reviewID}:${index}`,
+      title,
       text: note.text,
       kind: reviewKind(note.type),
       scope: "session",
@@ -87,9 +100,60 @@ async function promoteSessionNoteUnlocked(
       confirmedByUser: decision.confirmedByUser === true,
       projectKey,
       existing,
+      queue,
     },
   );
-  if (!gate.ok) return { ok: false, error: gate.reason };
+  let acknowledged: SessionPromotionDecision["acknowledgedRelations"];
+  if (!gate.ok) {
+    const conflicts = gate.conflicts ?? [];
+    const unacknowledged = conflicts.filter(
+      (conflict) =>
+        conflict.relation === "conflict" &&
+        !(decision.acknowledgedRelations ?? []).some(
+          (entry) =>
+            entry.id === conflict.id &&
+            entry.relation === conflict.relation &&
+            entry.version === conflict.version,
+        ),
+    );
+    if (unacknowledged.length > 0) {
+      return {
+        ok: false,
+        conflict: true,
+        code: "RELATION_ACK_REQUIRED",
+        conflicts: unacknowledged,
+        error: "存在需要确认的关系",
+      };
+    }
+    acknowledged = decision.acknowledgedRelations?.filter((entry) =>
+      conflicts.some(
+        (conflict) =>
+          conflict.id === entry.id &&
+          conflict.relation === entry.relation &&
+          conflict.version === entry.version,
+      ),
+    );
+    const hardBlocks = conflicts.filter(
+      (entry) =>
+        entry.relation === "exact" ||
+        entry.relation === "covered" ||
+        entry.relation === "classification-mismatch",
+    );
+    if (hardBlocks.length > 0) {
+      const first = hardBlocks[0];
+      return {
+        ok: false,
+        conflicts: hardBlocks,
+        error:
+          first.relation === "classification-mismatch"
+            ? `与现有条目分类不一致：${first.title || first.id}。请先处理分类，再提升。`
+            : `与现有条目重复或已覆盖：${first.title || first.id}。请勿重复提升。`,
+      };
+    }
+    if (conflicts.length === 0) {
+      return { ok: false, error: gate.reason };
+    }
+  }
 
   const now = new Date().toISOString();
   const primary = note.evidence[0];
@@ -132,6 +196,8 @@ async function promoteSessionNoteUnlocked(
     itemID: item.id,
     target: decision.targetScope,
     projectKey,
+    acknowledgedRelations:
+      acknowledged && acknowledged.length > 0 ? acknowledged : undefined,
   });
   return { ok: true, item };
 }

@@ -111,8 +111,7 @@ describe("promoteSessionNote", () => {
     }
   });
 
-  it("blocks a task-only session note", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-session-promote-"));
+  it("blocks a task-only session note", async () => {    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-session-promote-"));
     try {
       const store = new Store(dir);
       await store.init();
@@ -173,6 +172,80 @@ describe("acceptReviewCandidates session notes", () => {
       expect(hooks[0].text).toBe(projectText);
       expect(hooks.some((hook) => hook.text === text)).toBe(false);
       expect(await store.listQueue()).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("checks pending queue rows and requires a version-bound acknowledgement", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-session-promote-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const now = new Date().toISOString();
+      await store.upsertQueue({
+        id: "pending-version",
+        title: "版本",
+        text: "部署版本为 1.2.4",
+        kind: "fact",
+        scope: "global",
+        status: "queue",
+        source: {},
+        createdAt: now,
+        updatedAt: now,
+        reason: "test",
+      });
+      await store.appendReview({
+        id: "review_conflict",
+        sessionID: "ses_conflict",
+        projectKey: "A",
+        status: "ready",
+        createdAt: now,
+        candidates: 1,
+        dropped: 0,
+        sessionNotes: [
+          {
+            type: "fact",
+            text: "部署版本是 1.2.3",
+            evidence: [{ messageID: "m1", quote: "1.2.3", kind: "user" }],
+            createdAt: now,
+          },
+        ],
+      });
+      const blocked = await promoteSessionNote(
+        store,
+        mergeConfig({}),
+        "review_conflict",
+        0,
+        { targetScope: "global", confirmedByUser: true },
+      );
+      expect(blocked.ok).toBe(false);
+      expect(blocked.conflict).toBe(true);
+      expect(blocked.code).toBe("RELATION_ACK_REQUIRED");
+      expect(blocked.conflicts?.[0]?.id).toBe("pending-version");
+      expect(await store.listItems()).toHaveLength(0);
+
+      const version = blocked.conflicts?.[0]?.version ?? "";
+      const allowed = await promoteSessionNote(
+        store,
+        mergeConfig({}),
+        "review_conflict",
+        0,
+        {
+          targetScope: "global",
+          confirmedByUser: true,
+          acknowledgedRelations: [
+            { id: "pending-version", relation: "conflict", version },
+          ],
+        },
+      );
+      expect(allowed.ok).toBe(true);
+      const changelog = (await store.listChangelog()).find(
+        (entry) => entry.action === "promote_session_note",
+      );
+      expect(changelog?.acknowledgedRelations).toEqual([
+        { id: "pending-version", relation: "conflict", version },
+      ]);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

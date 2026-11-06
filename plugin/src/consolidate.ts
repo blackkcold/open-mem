@@ -25,8 +25,9 @@ import {
 import { admitAutoWrite, admitQueueItem } from "./capacity.js";
 import { rebuildAutoFiles } from "./rebuild.js";
 import { isKeepAliveText, isUserAuthored } from "./session/filters.js";
-import { reviewDecision } from "./review/decision.js";
+import { reviewDecision, reviewKind } from "./review/decision.js";
 import { classifyScope, sameScopeAndProject } from "./memory/scope.js";
+import { findWriteConflicts } from "./memory/write-guard.js";
 import { classifyRelation, isExactRelation, relationLabel } from "./relations.js";
 import { redactText } from "./redact.js";
 
@@ -70,6 +71,17 @@ interface PreparedHook {
   reservationKey: string;
   reservationToken: string;
   index: number;
+}
+
+/**
+ * The pre-classification exact check runs before the model decides a kind.
+ * Where a deterministic kind already exists (a retried hook or a review
+ * candidate), pass it so identical text with a different kind is not dropped.
+ */
+function knownHookKind(hook: HookRecord): Item["kind"] | undefined {
+  if (hook.origin === "session-review") return reviewKind(hook.reviewType);
+  if (hook.decision && hook.decision.kind !== "ignore") return hook.decision.kind;
+  return undefined;
 }
 
 export async function runConsolidation(
@@ -182,8 +194,8 @@ export async function runConsolidation(
       // version, date or negation used to be silently dropped at >= 0.92. Only
       // an exact relation with compatible values may skip classification.
       const relation = classifyRelation(
-        { text: hook.text },
-        { text: best.text, kind: best.kind },
+        { text: hook.text, kind: knownHookKind(hook), title: hook.title },
+        { text: best.text, kind: best.kind, title: best.title },
       );
       if (isExactRelation(relation)) {
         await saveHook(hook, "ignored", {
@@ -324,7 +336,7 @@ export async function runConsolidation(
         (item) => item.status === "auto" && item.kind === "rule",
       ).length,
     };
-    const autoAllowed = canAutoApply({
+    let autoAllowed = canAutoApply({
       config: deps.config,
       kind,
       lintOk: lint.ok,
@@ -333,6 +345,61 @@ export async function runConsolidation(
       autoCounts,
       origin: hook.origin,
     });
+    let relationGuardNote: string | undefined;
+    if (autoAllowed) {
+      const guard = findWriteConflicts(
+        {
+          id: hook.id,
+          title,
+          text: hook.text,
+          kind,
+          scope: hook.scope,
+          projectKey: hook.projectKey,
+        },
+        entriesFor(items.filter(belongsToHook), queue.filter(belongsToHook), []),
+      );
+      if (guard.unsafe) {
+        autoAllowed = false;
+        relationGuardNote = guard.unsafe;
+      }
+      const known = guard.conflicts.find(
+        (entry) => entry.relation === "exact" || entry.relation === "covered",
+      );
+      if (autoAllowed && known) {
+        await saveHook(hook, "ignored", {
+          decision: base,
+          error: `already known: ${known.title}`,
+        });
+        result.skipped += 1;
+        continue;
+      }
+      const hard = guard.conflicts.filter(
+        (entry) =>
+          entry.relation === "conflict" ||
+          entry.relation === "classification-mismatch",
+      );
+      if (hard.length > 0) {
+        autoAllowed = false;
+        const first = hard[0];
+        relationGuardNote =
+          first.relation === "classification-mismatch"
+            ? `classification mismatch: ${first.title}`
+            : `relation conflict: ${first.title} — ${first.reasons.join("; ")}`;
+        base.mergeAction = "keep_both";
+        if (first.relation === "conflict") {
+          base.conflict = Math.max(base.conflict ?? 0, 0.8);
+        }
+      } else if (
+        guard.conflicts.some(
+          (entry) =>
+            (entry.relation === "partial" || entry.relation === "related") &&
+            base.duplicate >= 0.2,
+        )
+      ) {
+        autoAllowed = false;
+        relationGuardNote = `partial duplicate: ${guard.conflicts[0]?.title ?? "existing entry"}`;
+      }
+    }
     let admission = autoAllowed
       ? await admitAutoWrite(deps.store, deps.config, kind)
       : undefined;
@@ -403,9 +470,57 @@ export async function runConsolidation(
         sources: [hook.source],
       };
       const written = await deps.store.transaction(async () => {
-      if (!await deps.store.ownsClaim(outcome.entry.reservationKey, outcome.entry.reservationToken)) return false;
+      if (!await deps.store.ownsClaim(outcome.entry.reservationKey, outcome.entry.reservationToken)) return "blocked" as const;
+      const [freshItems, freshQueue] = await Promise.all([
+        deps.store.listItems(),
+        deps.store.listQueue(),
+      ]);
+      const freshGuard = findWriteConflicts(
+        {
+          id: hook.id,
+          title,
+          text: hook.text,
+          kind,
+          scope: hook.scope,
+          projectKey: hook.projectKey,
+        },
+        entriesFor(freshItems.filter(belongsToHook), freshQueue.filter(belongsToHook), []),
+      );
+      const freshHard = freshGuard.conflicts.find(
+        (entry) =>
+          entry.relation === "conflict" ||
+          entry.relation === "classification-mismatch",
+      );
+      const freshKnown = freshGuard.conflicts.find(
+        (entry) => entry.relation === "exact" || entry.relation === "covered",
+      );
+      if (freshKnown && !freshHard) {
+        await saveHook(hook, "ignored", {
+          decision: base,
+          error: `already known: ${freshKnown.title}`,
+        });
+        return "duplicate" as const;
+      }
+      const freshNear = freshGuard.conflicts.find(
+        (entry) =>
+          (entry.relation === "partial" || entry.relation === "related") &&
+          base.duplicate >= 0.2,
+      );
+      if (freshGuard.unsafe || freshHard || freshNear) {
+        if (freshHard) {
+          relationGuardNote =
+            freshHard.relation === "classification-mismatch"
+              ? `classification mismatch: ${freshHard.title}`
+              : `relation conflict: ${freshHard.title} — ${freshHard.reasons.join("; ")}`;
+          base.mergeAction = "keep_both";
+          if (freshHard.relation === "conflict") {
+            base.conflict = Math.max(base.conflict ?? 0, 0.8);
+          }
+        }
+        return "blocked" as const;
+      }
       admission = await admitAutoWrite(deps.store, deps.config, kind);
-      if (!admission.ok) return false;
+      if (!admission.ok) return "blocked" as const;
       if (kind === "rule") {
         await deps.store.appendAutoRule(hook.text, {
           id: item.id,
@@ -435,9 +550,13 @@ export async function runConsolidation(
         itemID: item.id,
       });
       await rebuildAutoFiles(deps.store);
-      return true;
+      return "written" as const;
       });
-      if (written) {
+      if (written === "duplicate") {
+        result.skipped += 1;
+        continue;
+      }
+      if (written === "written") {
       items = [...items, item];
       result.auto += 1;
       autoWritten = true;
@@ -479,6 +598,7 @@ export async function runConsolidation(
     }
 
     const reason =
+      relationGuardNote ??
       relationNote ??
       (hook.origin === "session-review"
         ? `会话复盘 · ${hook.reviewType ?? "fact"}`

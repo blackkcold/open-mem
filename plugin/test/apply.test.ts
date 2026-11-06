@@ -405,6 +405,40 @@ describe("apply suggestion", () => {
     },
   );
 
+  it("attaches a relation warning without blocking a create that duplicates another entry", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-apply-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const existing = {
+        ...target(),
+        id: "item_existing",
+        title: "[P] 另存条目",
+        text: "另存正文",
+      };
+      await store.appendItem(existing);
+      const entry = queue(decision("create", ""));
+      entry.suggestion = suggestionFor(entry, "create", "[P] 另存条目", "另存正文");
+      await store.upsertQueue(entry);
+
+      const applied = await applySuggestion(store, DEFAULT_CONFIG, entry.id);
+      expect(applied.ok).toBe(true);
+      expect(applied.relationWarnings?.[0]).toMatchObject({
+        id: "item_existing",
+        relation: "exact",
+      });
+      const changelog = (await store.listChangelog()).find(
+        (candidate) => candidate.action === "apply_create",
+      );
+      expect(changelog?.relationWarnings).toEqual([
+        expect.objectContaining({ id: "item_existing", relation: "exact" }),
+      ]);
+      expect(JSON.stringify(changelog)).not.toContain("另存正文");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("records replace before/after snapshots so undo can restore the target", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-apply-"));
     try {

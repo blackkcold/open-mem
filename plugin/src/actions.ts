@@ -3,9 +3,15 @@ import type { AutoMemConfig, Item, QueueItem } from "./types.js";
 import { lintText } from "./linter.js";
 import { computePriority } from "./priority.js";
 import { admitNewItem } from "./capacity.js";
-import { applySuggestion } from "./apply.js";
+import { applySuggestion, type RelationWarning } from "./apply.js";
 import { rebuildAutoFiles } from "./rebuild.js";
 import { canPromote } from "./memory/promotion.js";
+import {
+  findWriteConflicts,
+  isHardWriteBlock,
+  type WriteConflict,
+} from "./memory/write-guard.js";
+import type { RelationKind } from "./relations.js";
 import { queueItemSnapshotVersion } from "./fingerprint.js";
 import {
   BATCH_APPLY_CONFIDENCE_FLOOR,
@@ -35,6 +41,14 @@ export interface QueueDecision {
   confirmedByUser?: boolean;
   /** Full queue snapshot value the caller displayed before confirming. */
   expectedVersion?: string;
+  /** Required when a queue item already has a suggestion the user chose to skip. */
+  ignoreSuggestion?: boolean;
+  /** Relations the caller reviewed and explicitly accepted, bound to their version. */
+  acknowledgedRelations?: Array<{
+    id: string;
+    relation: RelationKind;
+    version: string;
+  }>;
 }
 
 /** Trusted internal surface label; never parsed from an HTTP body. */
@@ -47,8 +61,14 @@ export interface DecisionOrigin {
 export interface QueueActionResult {
   ok: boolean;
   error?: string;
-  /** True when the caller's displayed queue snapshot is stale. */
+  /** True when the caller's displayed queue snapshot is stale, or a relation needs acknowledgement. */
   conflict?: boolean;
+  /** Machine-readable conflict class for the console. */
+  code?: "RELATION_ACK_REQUIRED";
+  /** Relations that must be shown before an explicit acknowledgement. */
+  conflicts?: WriteConflict[];
+  /** Non-blocking relation evidence recorded by an apply create/keep_both. */
+  relationWarnings?: RelationWarning[];
   item?: Item;
   target?: string;
   journalID?: string;
@@ -61,6 +81,22 @@ export interface BatchExecutionContext {
   expectedContentHash: string;
   action: QueueAction;
   minConfidence?: number;
+}
+
+function unacknowledgedConflicts(
+  conflicts: WriteConflict[],
+  acknowledged: QueueDecision["acknowledgedRelations"],
+): WriteConflict[] {
+  return conflicts.filter(
+    (conflict) =>
+      conflict.relation === "conflict" &&
+      !(acknowledged ?? []).some(
+        (entry) =>
+          entry.id === conflict.id &&
+          entry.relation === conflict.relation &&
+          entry.version === conflict.version,
+      ),
+  );
 }
 
 export async function applyQueueDecision(
@@ -173,6 +209,8 @@ async function applyQueueDecisionUnlocked(
     );
     const gate = canPromote(
       {
+        id: found.id,
+        title: found.title,
         text: found.text,
         kind: found.kind,
         scope: found.scope,
@@ -184,9 +222,51 @@ async function applyQueueDecisionUnlocked(
         confirmedByUser: decision.confirmedByUser === true,
         projectKey,
         existing,
+        queue: queue.filter((entry) => entry.id !== found.id),
       },
     );
-    if (!gate.ok) return { ok: false, error: gate.reason };
+    let promoteAcknowledgements: QueueDecision["acknowledgedRelations"];
+    if (!gate.ok) {
+      const conflicts = gate.conflicts ?? [];
+      const unacknowledged = unacknowledgedConflicts(
+        conflicts,
+        decision.acknowledgedRelations,
+      );
+      if (unacknowledged.length > 0) {
+        return {
+          ok: false,
+          conflict: true,
+          code: "RELATION_ACK_REQUIRED",
+          conflicts: unacknowledged,
+          error: "存在需要确认的关系",
+        };
+      }
+      promoteAcknowledgements = decision.acknowledgedRelations?.filter((entry) =>
+        conflicts.some(
+          (conflict) =>
+            conflict.id === entry.id &&
+            conflict.relation === entry.relation &&
+            conflict.version === entry.version,
+        ),
+      );
+      const hardBlocks = conflicts.filter((entry) => isHardWriteBlock(entry.relation));
+      if (hardBlocks.length > 0) {
+        const first = hardBlocks[0];
+        return {
+          ok: false,
+          conflicts: hardBlocks,
+          error:
+            first.relation === "classification-mismatch"
+              ? `与现有条目分类不一致：${first.title || first.id}。请先处理分类，再提升。`
+              : `与现有条目重复或已覆盖：${first.title || first.id}。请勿重复提升。`,
+        };
+      }
+      // Every reported conflict was acknowledged; a hard block would have
+      // arrived above and still stops here.
+      if (conflicts.length === 0) {
+        return { ok: false, error: gate.reason };
+      }
+    }
     const admission = await admitNewItem(store, config, found.kind);
     if (!admission.ok) return { ok: false, error: admission.reason };
 
@@ -226,6 +306,10 @@ async function applyQueueDecisionUnlocked(
       target: targetScope,
       projectKey,
       source,
+      acknowledgedRelations:
+        promoteAcknowledgements && promoteAcknowledgements.length > 0
+          ? promoteAcknowledgements
+          : undefined,
     });
     return { ok: true, item, target: targetScope };
   }
@@ -250,6 +334,7 @@ async function applyQueueDecisionUnlocked(
       item: nextQueue.find((item) => item.id === id),
       target: result.target?.id ?? result.item?.id,
       journalID: result.journalID,
+      relationWarnings: result.relationWarnings,
     };
   }
 
@@ -257,8 +342,12 @@ async function applyQueueDecisionUnlocked(
     if (found.kind === "skill") {
       return { ok: false, error: "skill candidates need a draft; use the Skill Review flow" };
     }
-    const admission = await admitNewItem(store, config, found.kind);
-    if (!admission.ok) return { ok: false, error: admission.reason ?? "容量不足" };
+    if (found.suggestion && decision.ignoreSuggestion !== true) {
+      return {
+        ok: false,
+        error: "该候选已有合并建议；请先处理建议，或显式忽略后再批准",
+      };
+    }
 
     const title =
       decision.confirmedByUser === true ? (decision.title ?? found.title) : found.title;
@@ -276,6 +365,49 @@ async function applyQueueDecisionUnlocked(
       titleMaxChars: config.thresholds.titleMaxChars,
     });
     if (!lint.ok) return { ok: false, error: `linter: ${lint.errors.join("; ")}` };
+
+    const guard = findWriteConflicts(
+      {
+        id: found.id,
+        title,
+        text,
+        kind: found.kind,
+        scope: found.scope,
+        projectKey: found.projectKey,
+      },
+      [...(await store.listItems()), ...queue],
+      { excludeID: found.id },
+    );
+    if (guard.unsafe) return { ok: false, error: guard.unsafe };
+    const hardBlocks = guard.conflicts.filter((entry) => isHardWriteBlock(entry.relation));
+    if (hardBlocks.length > 0) {
+      const first = hardBlocks[0];
+      return {
+        ok: false,
+        conflicts: hardBlocks,
+        error:
+          first.relation === "classification-mismatch"
+            ? `与现有条目分类不一致：${first.title || first.id}。请先处理分类，再批准。`
+            : `与现有条目重复或已覆盖：${first.title || first.id}。请使用拒绝或合并路径。`,
+      };
+    }
+    const conflictList = guard.conflicts.filter((entry) => entry.relation === "conflict");
+    const unacknowledged = unacknowledgedConflicts(
+      conflictList,
+      decision.acknowledgedRelations,
+    );
+    if (unacknowledged.length > 0) {
+      return {
+        ok: false,
+        conflict: true,
+        code: "RELATION_ACK_REQUIRED",
+        conflicts: conflictList,
+        error: "存在需要确认的关系",
+      };
+    }
+
+    const admission = await admitNewItem(store, config, found.kind);
+    if (!admission.ok) return { ok: false, error: admission.reason ?? "容量不足" };
 
     const target = found.kind === "rule" ? "AUTO_RULES.md" : "AUTO_MEMORY.md";
     const meta = {
@@ -315,6 +447,17 @@ async function applyQueueDecisionUnlocked(
     await store.removeQueue(found.id);
     await rebuildAutoFiles(store);
     await store.incrementStat("suggestionApplied");
+    const editedFields: string[] = [];
+    if (title !== found.title) editedFields.push("title");
+    if (text !== found.text) editedFields.push("text");
+    const acknowledged = decision.acknowledgedRelations?.filter((entry) =>
+      conflictList.some(
+        (conflict) =>
+          conflict.id === entry.id &&
+          conflict.relation === entry.relation &&
+          conflict.version === entry.version,
+      ),
+    );
     await store.appendChangelog({
       action: "approve",
       recoveryID,
@@ -323,6 +466,14 @@ async function applyQueueDecisionUnlocked(
       target,
       note: decision.note,
       source,
+      humanEdited: editedFields.length > 0 || undefined,
+      editedFields: editedFields.length > 0 ? editedFields : undefined,
+      ignoredSuggestion:
+        found.suggestion !== undefined && decision.ignoreSuggestion === true
+          ? true
+          : undefined,
+      acknowledgedRelations:
+        acknowledged && acknowledged.length > 0 ? acknowledged : undefined,
     });
     return { ok: true, item: found, target };
   }

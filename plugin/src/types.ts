@@ -238,7 +238,17 @@ export interface QueueItem extends Item {
     line: number;
     relation: string;
     score: number;
+    reasons?: string[];
   }>;
+  /** Computed over every match before `coverage` is sliced for display. */
+  coverageSummary?: {
+    relation: string;
+    conflictCount: number;
+    mismatchCount: number;
+    coveredCount: number;
+    total: number;
+    analysisVersion: string;
+  };
 }
 
 export interface ShadowRecord {

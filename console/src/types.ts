@@ -139,7 +139,17 @@ export interface QueueItem {
     line: number;
     relation: string;
     score: number;
+    reasons?: string[];
   }>;
+  /** Computed over every match before `coverage` is sliced for display. */
+  coverageSummary?: {
+    relation: string;
+    conflictCount: number;
+    mismatchCount: number;
+    coveredCount: number;
+    total: number;
+    analysisVersion: string;
+  };
 }
 
 export type HookStatus =
@@ -327,6 +337,64 @@ export interface MemoryGraphData {
   sources: GraphSource[];
   views: Record<Exclude<MemoryGraphView, "similarity">, GraphViewData>;
   groups?: GraphGroup[];
+  backup?: BackupStatusView;
+}
+
+export type BackupIntegrity = "verified" | "partial" | "corrupt" | "unknown";
+export type BackupFreshness = "fresh" | "stale" | "unknown";
+export type RestoreSupport = "automatic" | "manual" | "none" | "unknown";
+
+export interface BackupDomainView {
+  id: string;
+  label: string;
+  required: string[];
+  present: string[];
+  missing: string[];
+  state: "present" | "missing" | "unknown";
+  integrity: BackupIntegrity;
+  freshness: BackupFreshness;
+  restoreSupport: RestoreSupport;
+  notes: string[];
+}
+
+export interface BackupCoverageView {
+  required: number;
+  present: number;
+  missing: string[];
+  unknown: string[];
+}
+
+export interface BackupSnapshotView {
+  dir: string;
+  name: string;
+  createdAt?: string;
+  complete: boolean | "unknown";
+  integrity: BackupIntegrity;
+  freshness: BackupFreshness;
+  manifestPresent: boolean;
+  domains: BackupDomainView[];
+  coverage: BackupCoverageView;
+  notes: string[];
+}
+
+export interface BackupStatusView {
+  latest?: BackupSnapshotView;
+  latestComplete?: BackupSnapshotView;
+  snapshotPresent: boolean;
+  integrity: BackupIntegrity;
+  freshness: BackupFreshness;
+  restoreSupport: RestoreSupport;
+  restoreDrill?: {
+    at: string;
+    softwareVersion?: string;
+    snapshotID?: string;
+    result: "passed" | "failed";
+  };
+  drillStatus: "passed" | "failed" | "missing" | "invalid";
+  coverage: BackupCoverageView;
+  domains: BackupDomainView[];
+  manifestPresent: boolean;
+  notes: string[];
 }
 
 export interface GraphGroup {

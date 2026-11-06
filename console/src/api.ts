@@ -19,12 +19,15 @@ export function setTransport(next: Transport): void {
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
+  /** Parsed response body, when the server sent one. */
+  readonly details?: unknown;
 
-  constructor(status: number, message: string, code?: string) {
+  constructor(status: number, message: string, code?: string, details?: unknown) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -150,6 +153,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       result.status,
       message,
       typeof record?.code === "string" ? record.code : undefined,
+      record,
     );
   }
   return data as T;

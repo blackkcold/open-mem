@@ -1,7 +1,13 @@
-import type { Item, Scope } from "../types.js";
-import { classifyRelation } from "../relations.js";
+import type { Item, QueueItem, Scope } from "../types.js";
+import {
+  findWriteConflicts,
+  isHardWriteBlock,
+  type WriteConflict,
+} from "./write-guard.js";
 
 export interface PromotionCandidate {
+  id?: string;
+  title?: string;
   text: string;
   kind: Item["kind"];
   scope: Scope;
@@ -15,11 +21,13 @@ export interface PromotionContext {
   confirmedByUser?: boolean;
   projectKey?: string;
   existing: Item[];
+  /** Pending queue rows are compared too, so a manual promotion cannot duplicate them. */
+  queue?: QueueItem[];
 }
 
 export type PromotionResult =
   | { ok: true }
-  | { ok: false; reason: string };
+  | { ok: false; reason: string; conflicts?: WriteConflict[] };
 
 const VOLATILE_RE =
   /(?:\/Users\/|\/home\/|[A-Za-z]:\\|\bses_[A-Za-z0-9]+\b|(?:\bport\b|端口)\s*(?:(?:[:=]|是|为)\s*)?\d{2,5}\b|:\d{4,5}\b)/i;
@@ -57,26 +65,41 @@ export function canPromote(
     return { ok: false, reason: "volatile identifier" };
   }
 
-  for (const item of context.existing) {
-    if (
-      item.scope !== context.target ||
-      (context.target === "project" && item.projectKey !== context.projectKey)
-    ) {
-      continue;
-    }
-    const relation = classifyRelation(
-      { text: candidate.text, kind: candidate.kind },
-      { text: item.text, kind: item.kind },
-    );
-    if (relation.relation === "classification-mismatch") {
-      return { ok: false, reason: `classification mismatch with ${item.id}` };
-    }
-    if (relation.relation === "conflict") {
-      return { ok: false, reason: `conflict with ${item.id}` };
-    }
-    if (relation.relation === "exact" || relation.relation === "covered") {
-      return { ok: false, reason: `duplicate of ${item.id}` };
-    }
+  const guard = findWriteConflicts(
+    {
+      id: candidate.id,
+      title: candidate.title ?? "",
+      text: candidate.text,
+      kind: candidate.kind,
+      scope: context.target,
+      projectKey: context.target === "project" ? context.projectKey : undefined,
+    },
+    [...context.existing, ...(context.queue ?? [])],
+    { excludeID: candidate.id },
+  );
+  if (guard.unsafe) return { ok: false, reason: "project key required" };
+
+  const hard = guard.conflicts.filter((entry) => isHardWriteBlock(entry.relation));
+  if (hard.length > 0) {
+    const first = hard[0];
+    return {
+      ok: false,
+      reason:
+        first.relation === "classification-mismatch"
+          ? `classification mismatch with ${first.id}`
+          : `duplicate of ${first.id}`,
+      conflicts: hard,
+    };
+  }
+  const conflictList = guard.conflicts.filter(
+    (entry) => entry.relation === "conflict",
+  );
+  if (conflictList.length > 0) {
+    return {
+      ok: false,
+      reason: `conflict with ${conflictList[0].id}`,
+      conflicts: conflictList,
+    };
   }
   return { ok: true };
 }
