@@ -161,7 +161,7 @@ describe("acceptReviewCandidates session notes", () => {
         input(),
         result(),
         "review_1",
-        { store, config: mergeConfig({}), project: "/repo/a" },
+        { store, config: mergeConfig({}), project: "/repo/a", projectKey: "A" },
       );
       expect(accepted.created).toBe(1);
       expect(accepted.sessionNotes).toHaveLength(1);

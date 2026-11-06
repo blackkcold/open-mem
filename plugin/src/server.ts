@@ -1,4 +1,5 @@
 import http from "node:http";
+import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { createReadStream } from "node:fs";
@@ -6,6 +7,7 @@ import { readFile, stat } from "node:fs/promises";
 import { URL } from "node:url";
 import type {
   AutoMemConfig,
+  QueueItem,
   Suggestion,
   UsageSummary,
 } from "./types.js";
@@ -14,12 +16,19 @@ import { sortQueue } from "./priority.js";
 import { computeMetrics, runAudit } from "./audit.js";
 import { projectMap } from "./map.js";
 import { applyQueueDecision, type QueueDecision } from "./actions.js";
+import {
+  BATCH_APPLY_CONFIDENCE_FLOOR,
+  batchItemNeedsIndividualReview,
+  batchSuggestionRejection,
+} from "./batch-policy.js";
+import { queueItemSnapshotVersion } from "./fingerprint.js";
 import { promoteSessionNote } from "./memory/session-promotion.js";
 import {
   applyScopeMigration,
   previewScopeMigration,
   scopeMigrationSummary,
   undoScopeMigration,
+  type ScopeProposal,
 } from "./memory/migrate.js";
 import { approveSkillDraft, rejectSkillDraft, createSkillDraft } from "./skill.js";
 import { undoMerge } from "./apply.js";
@@ -28,6 +37,18 @@ import { runCompaction } from "./compact.js";
 import { applyRetention, previewRetention } from "./retention.js";
 import { rebuildAutoFiles } from "./rebuild.js";
 import { validateModelEndpoint } from "./util/endpoint.js";
+import { mergeConfig } from "./config.js";
+import { sha16 } from "./util/text.js";
+import {
+  buildMemoryGraph,
+  readGraphSource,
+  type GraphRoots,
+} from "./graph.js";
+import {
+  baselineStatus,
+  buildBaselineIndex,
+  matchBaseline,
+} from "./baseline.js";
 
 export interface ServerOptions {
   store: Store;
@@ -37,10 +58,16 @@ export interface ServerOptions {
   port?: number;
   consoleDir?: string;
   decisionKeySource?: "env" | "auth" | "missing";
+  projectDir?: string;
+  graphRoots?: Partial<GraphRoots>;
   suggest?: (id: string) => Promise<Suggestion | undefined>;
   reviewStats?: () => Record<string, unknown>;
   onReviewRequest?: (sessionID: string) => Promise<unknown>;
   onConfigChange?: (config: AutoMemConfig) => void;
+  /** Opens a local URL without exposing its ticket to the model. */
+  openExternal?: (url: string) => Promise<boolean>;
+  /** Injectable clock for preview expiry tests. */
+  now?: () => number;
 }
 
 export interface ServerHandle {
@@ -50,6 +77,28 @@ export interface ServerHandle {
   broadcast(event: string, data: unknown): void;
   close(): Promise<void>;
   createConnectURL(): string;
+  /** Mint a one-time ticket and open it in the host browser. */
+  openConsole(): Promise<boolean>;
+}
+
+export const BATCH_PREVIEW_TTL_MS = 120_000;
+const BATCH_PREVIEW_LIMIT = 64;
+
+/** Scope migration needs human review, so its preview lives longer than a batch. */
+export const MIGRATION_PREVIEW_TTL_MS = 10 * 60_000;
+const MIGRATION_PREVIEW_LIMIT = 16;
+
+interface BatchPreviewRecord {
+  action: "apply_suggestion";
+  minConfidence: number;
+  max: number;
+  entries: Array<{ id: string; expectedContentHash: string }>;
+  expiresAt: number;
+}
+
+interface MigrationPreviewRecord {
+  proposals: ScopeProposal[];
+  expiresAt: number;
 }
 
 export async function startServer(options: ServerOptions): Promise<ServerHandle> {
@@ -59,6 +108,60 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
   const host = options.host ?? "127.0.0.1";
   const clients = new Set<http.ServerResponse>();
   const connectTickets = new Map<string, number>();
+  const batchPreviews = new Map<string, BatchPreviewRecord>();
+  const migrationPreviews = new Map<string, MigrationPreviewRecord>();
+  let configPatchChain: Promise<void> = Promise.resolve();
+  function runConfigPatchExclusive(fn: () => Promise<void>): Promise<void> {
+    const run = configPatchChain.then(fn, fn);
+    configPatchChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+  const clock = options.now ?? (() => Date.now());
+  const purgeBatchPreviews = (): void => {
+    const current = clock();
+    for (const [id, preview] of batchPreviews) {
+      if (preview.expiresAt <= current) batchPreviews.delete(id);
+    }
+  };
+  const issueBatchPreview = (
+    record: Omit<BatchPreviewRecord, "expiresAt">,
+  ): string => {
+    purgeBatchPreviews();
+    while (batchPreviews.size >= BATCH_PREVIEW_LIMIT) {
+      const oldest = batchPreviews.keys().next().value;
+      if (oldest === undefined) break;
+      batchPreviews.delete(oldest);
+    }
+    const previewID = randomBytes(18).toString("hex");
+    batchPreviews.set(previewID, {
+      ...record,
+      expiresAt: clock() + BATCH_PREVIEW_TTL_MS,
+    });
+    return previewID;
+  };
+  const purgeMigrationPreviews = (): void => {
+    const current = clock();
+    for (const [id, preview] of migrationPreviews) {
+      if (preview.expiresAt <= current) migrationPreviews.delete(id);
+    }
+  };
+  const issueMigrationPreview = (proposals: ScopeProposal[]): string => {
+    purgeMigrationPreviews();
+    while (migrationPreviews.size >= MIGRATION_PREVIEW_LIMIT) {
+      const oldest = migrationPreviews.keys().next().value;
+      if (oldest === undefined) break;
+      migrationPreviews.delete(oldest);
+    }
+    const previewID = randomBytes(18).toString("hex");
+    migrationPreviews.set(previewID, {
+      proposals,
+      expiresAt: clock() + MIGRATION_PREVIEW_TTL_MS,
+    });
+    return previewID;
+  };
   const consoleDir = path.resolve(
     options.consoleDir ??
       process.env.OPENMEM_CONSOLE_DIR ??
@@ -136,7 +239,7 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
     if (requestURL.pathname === "/api/health" && req.method === "GET") {
       sendJson(res, 200, {
         ok: true,
-        version: "0.3.0",
+        version: "0.4.0",
         dataDir: store.dataDir,
         shadow: config.shadow,
         decision: {
@@ -183,7 +286,24 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
         }
         return true;
       });
-      sendJson(res, 200, { items: sortQueue(queue), projects });
+      const baseline = options.graphRoots || options.projectDir || process.env.VITEST !== "true"
+        ? await buildBaselineIndex({
+            projectDir: options.projectDir,
+            roots: options.graphRoots,
+          })
+        : undefined;
+      sendJson(res, 200, {
+        items: sortQueue(queue).map((item) => {
+          const coverage = baseline ? matchBaseline(baseline, item) : [];
+          return {
+            ...item,
+            decisionVersion: queueItemSnapshotVersion(item),
+            ...(coverage.length > 0 ? { coverage } : {}),
+          };
+        }),
+        ...(baseline ? { baseline: baselineStatus(baseline) } : {}),
+        projects,
+      });
       return;
     }
 
@@ -419,6 +539,16 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
     if (queueDecision && req.method === "POST") {
       const id = decodeURIComponent(queueDecision[1]);
       const body = await readJson(req);
+      const expectedVersion =
+        isRecord(body) && typeof body.expectedVersion === "string"
+          ? body.expectedVersion
+          : "";
+      if (!expectedVersion) {
+        sendJson(res, 400, {
+          error: "expectedVersion is required; reload the queue before deciding",
+        });
+        return;
+      }
       const decision = parseQueueDecision(body);
       if (!decision) {
         sendJson(res, 400, { error: "invalid decision body" });
@@ -426,10 +556,13 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
       }
       const result = await applyQueueDecision(store, config, id, {
         ...decision,
+        expectedVersion,
         confirmedByUser: true,
-      });
+      }, undefined, { source: "local-token-api" });
       if (!result.ok) {
-        sendJson(res, 400, { error: result.error ?? "decision failed" });
+        sendJson(res, result.conflict ? 409 : 400, {
+          error: result.error ?? "decision failed",
+        });
         return;
       }
       broadcast("queue.updated", { id, decision: decision.action });
@@ -450,44 +583,163 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
         return;
       }
       if (body.action === "apply_suggestion") {
-        const minConfidence =
-          typeof body.minConfidence === "number" ? body.minConfidence : 0.9;
-        const max = typeof body.max === "number" ? Math.min(20, Math.max(1, body.max)) : 10;
-        const queue = await store.listQueue();
-        const eligible = queue.filter(
-          (item) =>
-            ids.includes(item.id) &&
-            item.kind !== "rule" &&
-            item.scope !== "session" &&
-            item.origin !== "session-review" &&
-            item.reviewID === undefined &&
-            item.suggestion?.validation.ok === true &&
-            item.suggestion.confidence >= minConfidence,
-        );
-        const preview = eligible.map((item) => ({
-          id: item.id,
-          title: item.title,
-          action: item.suggestion?.action,
-          targetId: item.suggestion?.targetId,
-          confidence: item.suggestion?.confidence,
-        }));
-        if (body.dryRun === true) {
-          sendJson(res, 200, {
-            dryRun: true,
-            eligible: preview,
-            skipped: ids.length - eligible.length,
-            capped: Math.max(0, eligible.length - max),
+        if (body.dryRun !== true && body.dryRun !== false) {
+          sendJson(res, 400, {
+            error: "dryRun must be an explicit boolean",
+            code: "BATCH_PREVIEW_REJECTED",
           });
           return;
         }
-        const results = [];
-        for (const item of eligible.slice(0, max)) {
-          results.push({
-            id: item.id,
-            ...(await applyQueueDecision(store, config, item.id, {
-              action: "apply_suggestion",
-              confirmedByUser: true,
+        const requestedMinConfidence =
+          typeof body.minConfidence === "number" && Number.isFinite(body.minConfidence)
+            ? body.minConfidence
+            : BATCH_APPLY_CONFIDENCE_FLOOR;
+        const previewMinConfidence = Math.max(
+          BATCH_APPLY_CONFIDENCE_FLOOR,
+          requestedMinConfidence,
+        );
+        const requestedMax =
+          typeof body.max === "number" && Number.isFinite(body.max) ? body.max : 10;
+        const previewMax = Math.min(20, Math.max(1, requestedMax));
+        if (body.dryRun === true) {
+          const queue = await store.listQueue();
+          const byId = new Map(queue.map((item) => [item.id, item]));
+          const skippedItems: Array<{ id: string; title?: string; reason: string }> = [];
+          const eligible: Array<{
+            item: QueueItem;
+            expectedContentHash: string;
+          }> = [];
+          for (const id of ids) {
+            const item = byId.get(id);
+            if (!item) {
+              skippedItems.push({ id, reason: "队列条目不存在" });
+              continue;
+            }
+            const reason = batchSuggestionRejection(item, previewMinConfidence);
+            if (reason) {
+              skippedItems.push({ id, title: item.title, reason });
+              continue;
+            }
+            eligible.push({ item, expectedContentHash: queueItemSnapshotVersion(item) });
+          }
+          const withinCap = eligible.slice(0, previewMax);
+          const cappedItems = eligible
+            .slice(previewMax)
+            .map(({ item }) => ({
+              id: item.id,
+              title: item.title,
+              reason: "超出单次批量上限",
+            }));
+          const previewID = issueBatchPreview({
+            action: "apply_suggestion",
+            minConfidence: previewMinConfidence,
+            max: previewMax,
+            entries: withinCap.map(({ item, expectedContentHash }) => ({
+              id: item.id,
+              expectedContentHash,
             })),
+          });
+          sendJson(res, 200, {
+            dryRun: true,
+            previewID,
+            eligible: withinCap.map(({ item }) => ({
+              id: item.id,
+              title: item.title,
+              action: item.suggestion?.action,
+              confidence: item.suggestion?.confidence,
+              projectKey: item.projectKey,
+              proposedTitle: item.suggestion?.proposedTitle,
+              proposedText: item.suggestion?.proposedText,
+            })),
+            skipped: skippedItems.length,
+            capped: cappedItems.length,
+            skippedItems,
+            cappedItems,
+          });
+          return;
+        }
+
+        const previewID =
+          typeof body.previewID === "string" ? body.previewID : "";
+        if (!previewID) {
+          sendJson(res, 409, {
+            error: "批量执行需要有效的 previewID，请先预览",
+            code: "BATCH_PREVIEW_REJECTED",
+          });
+          return;
+        }
+        const previewRecord = batchPreviews.get(previewID);
+        if (!previewRecord || previewRecord.expiresAt <= clock()) {
+          batchPreviews.delete(previewID);
+          sendJson(res, 409, {
+            error: "预览已过期或不存在，请重新预览",
+            code: "BATCH_PREVIEW_REJECTED",
+          });
+          return;
+        }
+        if (previewRecord.action !== "apply_suggestion") {
+          sendJson(res, 409, {
+            error: "批量请求与预览不一致，请重新预览",
+            code: "BATCH_PREVIEW_REJECTED",
+          });
+          return;
+        }
+        if (
+          body.minConfidence !== undefined &&
+          (typeof body.minConfidence !== "number" ||
+            !Number.isFinite(body.minConfidence) ||
+            body.minConfidence !== previewRecord.minConfidence)
+        ) {
+          sendJson(res, 409, {
+            error: "执行 minConfidence 与预览冻结参数不一致",
+            code: "BATCH_PREVIEW_REJECTED",
+          });
+          return;
+        }
+        if (
+          body.max !== undefined &&
+          (typeof body.max !== "number" ||
+            !Number.isFinite(body.max) ||
+            body.max !== previewRecord.max)
+        ) {
+          sendJson(res, 409, {
+            error: "执行 max 与预览冻结参数不一致",
+            code: "BATCH_PREVIEW_REJECTED",
+          });
+          return;
+        }
+        const executionMinConfidence = previewRecord.minConfidence;
+        if (
+          ids.length !== previewRecord.entries.length ||
+          !ids.every((id, index) => id === previewRecord.entries[index]?.id)
+        ) {
+          sendJson(res, 409, {
+            error: "执行 ID 与预览列表完全不一致，请重新预览",
+            code: "BATCH_PREVIEW_REJECTED",
+          });
+          return;
+        }
+        // Consume before executing so a replayed preview cannot write twice.
+        batchPreviews.delete(previewID);
+        const results = [];
+        for (const entry of previewRecord.entries) {
+          results.push({
+            id: entry.id,
+            ...(await applyQueueDecision(
+              store,
+              config,
+              entry.id,
+              {
+                action: "apply_suggestion",
+                confirmedByUser: true,
+              },
+              {
+                expectedContentHash: entry.expectedContentHash,
+                action: "apply_suggestion",
+                minConfidence: executionMinConfidence,
+              },
+              { source: "local-token-api" },
+            )),
           });
         }
         broadcast("queue.updated", { batch: results.length });
@@ -495,6 +747,13 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
         return;
       }
 
+      // A batch is never an approval or rewrite surface. Rules, review
+      // candidates, edits, merges and promotions require the single-item
+      // human review path.
+      if (body.action !== undefined) {
+        sendJson(res, 400, { error: "批量操作不能指定该 action" });
+        return;
+      }
       if (!isRecord(body.decision)) {
         sendJson(res, 400, { error: "invalid decision" });
         return;
@@ -504,14 +763,49 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
         sendJson(res, 400, { error: "invalid decision" });
         return;
       }
+      if (!["deny", "defer", "resume"].includes(decision.action)) {
+        sendJson(res, 400, {
+          error: "批量操作只支持拒绝、延后与恢复；批准、编辑、合并和提升需要逐条确认",
+        });
+        return;
+      }
+      const queue = await store.listQueue();
+      const byId = new Map(queue.map((item) => [item.id, item]));
       const results = [];
       for (const id of ids) {
+        const found = byId.get(id);
+        if (!found) {
+          results.push({
+            id,
+            ok: false,
+            error: "队列条目不存在或已在批量筛选后移除，请刷新后重试",
+          });
+          continue;
+        }
+        if (batchItemNeedsIndividualReview(found)) {
+          results.push({
+            id,
+            ok: false,
+            error: "规则与复盘候选不能批量处理，请逐条确认",
+          });
+          continue;
+        }
         results.push({
           id,
-          ...(await applyQueueDecision(store, config, id, {
-            ...decision,
-            confirmedByUser: true,
-          })),
+          ...(await applyQueueDecision(
+            store,
+            config,
+            id,
+            {
+              ...decision,
+              confirmedByUser: true,
+            },
+            {
+              expectedContentHash: queueItemSnapshotVersion(found),
+              action: decision.action,
+            },
+            { source: "local-token-api" },
+          )),
         });
       }
       broadcast("queue.updated", { batch: results.length });
@@ -531,6 +825,57 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
         store.listShadow(),
       ]);
       sendJson(res, 200, projectMap({ items, queue, shadow }));
+      return;
+    }
+
+    if (requestURL.pathname === "/api/graph" && req.method === "GET") {
+      const graph = await buildMemoryGraph({
+        store,
+        projectDir: options.projectDir,
+        roots: options.graphRoots,
+      });
+      sendJson(res, 200, graph);
+      return;
+    }
+
+    if (requestURL.pathname === "/api/graph/source" && req.method === "GET") {
+      const id = requestURL.searchParams.get("id");
+      if (!id) {
+        sendJson(res, 400, { error: "source id is required" });
+        return;
+      }
+      const detail = await readGraphSource(
+        {
+          store,
+          projectDir: options.projectDir,
+          roots: options.graphRoots,
+        },
+        id,
+      );
+      if (!detail) {
+        sendJson(res, 404, { error: "source not found" });
+        return;
+      }
+      sendJson(res, 200, detail);
+      return;
+    }
+
+    if (requestURL.pathname === "/api/baseline/status" && req.method === "GET") {
+      const baseline = await buildBaselineIndex({
+        projectDir: options.projectDir,
+        roots: options.graphRoots,
+      });
+      sendJson(res, 200, baselineStatus(baseline));
+      return;
+    }
+
+    if (requestURL.pathname === "/api/baseline/refresh" && req.method === "POST") {
+      const baseline = await buildBaselineIndex({
+        projectDir: options.projectDir,
+        roots: options.graphRoots,
+        force: true,
+      });
+      sendJson(res, 200, baselineStatus(baseline));
       return;
     }
 
@@ -651,7 +996,7 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
       const limit = Math.min(200, Math.max(1, Number(requestURL.searchParams.get("limit")) || 50));
       const action = requestURL.searchParams.get("action");
       const entries = (await store.listChangelog()).filter((entry) => !action || entry.action === action);
-      const fields = ["at", "action", "queueID", "itemID", "target", "journalID", "reviewID", "curatorID", "recoveryID"];
+      const fields = ["at", "action", "queueID", "itemID", "target", "journalID", "reviewID", "curatorID", "recoveryID", "source", "decision", "fields", "humanEdited"];
       sendJson(res, 200, { items: entries.slice(-limit).reverse().map((entry) => Object.fromEntries(fields.filter((field) => entry[field] !== undefined).map((field) => [field, entry[field]]))) });
       return;
     }
@@ -760,7 +1105,10 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
       req.method === "GET"
     ) {
       const proposals = await previewScopeMigration(store);
+      const changed = proposals.filter((proposal) => proposal.changed);
+      const previewID = changed.length > 0 ? issueMigrationPreview(changed) : undefined;
       sendJson(res, 200, {
+        previewID,
         proposals,
         summary: scopeMigrationSummary(proposals),
       });
@@ -776,9 +1124,35 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
         sendJson(res, 400, { error: "confirmedByUser is required" });
         return;
       }
-      const result = await applyScopeMigration(store);
-      broadcast("migration.updated", result ?? { applied: 0 });
-      sendJson(res, 200, result ?? { applied: 0 });
+      const previewID = typeof body.previewID === "string" ? body.previewID : "";
+      if (!previewID) {
+        sendJson(res, 409, {
+          error: "需要有效的迁移预览；请先预览并确认将要执行的条目",
+          code: "MIGRATION_PREVIEW_REJECTED",
+        });
+        return;
+      }
+      const preview = migrationPreviews.get(previewID);
+      if (!preview || preview.expiresAt <= clock()) {
+        migrationPreviews.delete(previewID);
+        sendJson(res, 409, {
+          error: "迁移预览已过期或不存在，请重新预览",
+          code: "MIGRATION_PREVIEW_REJECTED",
+        });
+        return;
+      }
+      // Consume before executing so a replayed preview cannot write twice.
+      migrationPreviews.delete(previewID);
+      try {
+        const result = await applyScopeMigration(store, preview.proposals);
+        broadcast("migration.updated", result ?? { applied: 0 });
+        sendJson(res, 200, result ?? { applied: 0 });
+      } catch (error: unknown) {
+        sendJson(res, 409, {
+          error: error instanceof Error ? error.message : String(error),
+          code: "MIGRATION_PREVIEW_REJECTED",
+        });
+      }
       return;
     }
 
@@ -805,7 +1179,12 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
     }
 
     if (requestURL.pathname === "/api/config" && req.method === "GET") {
-      sendJson(res, 200, publicConfig(config));
+      const persisted = mergeConfig(await store.readConfig());
+      sendJson(res, 200, {
+        ...publicConfig(config),
+        configRevision: configRevisionOf(persisted),
+        persistedSettings: persistedSettingsPreview(persisted, config),
+      });
       return;
     }
 
@@ -815,21 +1194,93 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
         sendJson(res, 400, { error: "invalid config body" });
         return;
       }
-      try {
-        validateNumericPatch(body, config);
-        for (const field of ["decision", "rewrite"]) {
-          const value = body[field];
-          if (isRecord(value) && typeof value.endpoint === "string") validateModelEndpoint(value.endpoint);
+      await runConfigPatchExclusive(async () => {
+        let validationError: string | undefined;
+        let revisionConflict = false;
+        let committed = false;
+        let committedLive: AutoMemConfig | undefined;
+        let committedRevision: string | undefined;
+        let committedSettings: Record<string, PersistedSettingPreview> | undefined;
+        try {
+          await store.transaction(async () => {
+            const persisted = await store.readConfig();
+            const diskBefore = structuredClone({
+              ...mergeConfig(persisted),
+              token: config.token,
+              dataDir: config.dataDir,
+            });
+            if (body.expectedConfigRevision !== undefined) {
+              if (typeof body.expectedConfigRevision !== "string") {
+                validationError = "expectedConfigRevision must be a string";
+                return;
+              }
+              if (body.expectedConfigRevision !== configRevisionOf(diskBefore)) {
+                revisionConflict = true;
+                return;
+              }
+            }
+            const diskNext = structuredClone(diskBefore);
+            const liveBefore = structuredClone(config);
+            const liveNext = structuredClone(config);
+            try {
+              validateNumericPatch(body, diskNext);
+              for (const field of ["decision", "rewrite"]) {
+                const value = body[field];
+                if (isRecord(value) && typeof value.endpoint === "string") {
+                  validateModelEndpoint(value.endpoint);
+                }
+              }
+            } catch (error) {
+              validationError =
+                error instanceof Error ? error.message : "invalid endpoint";
+              return;
+            }
+            applyConfigPatch(diskNext, body);
+            applyConfigPatch(liveNext, body);
+            const changedFields = [
+              ...new Set([
+                ...changedConfigFields(diskBefore, diskNext),
+                ...changedConfigFields(liveBefore, liveNext),
+              ]),
+            ];
+            await store.writeConfig(diskNext);
+            if (changedFields.length > 0) {
+              await store.appendChangelog({
+                action: "config_update",
+                source: "local-token-api",
+                fields: changedFields,
+              });
+            }
+            committedRevision = configRevisionOf(diskNext);
+            committedSettings = persistedSettingsPreview(diskNext, liveNext);
+            committedLive = liveNext;
+            committed = true;
+          });
+        } catch (error) {
+          sendJson(res, 500, {
+            error: error instanceof Error ? error.message : "config write failed",
+          });
+          return;
         }
-      } catch (error) {
-        sendJson(res, 400, { error: error instanceof Error ? error.message : "invalid endpoint" });
-        return;
-      }
-      applyConfigPatch(config, body);
-      await store.writeConfig(config);
-      options.onConfigChange?.(config);
-      broadcast("config.updated", publicConfig(config));
-      sendJson(res, 200, publicConfig(config));
+        if (revisionConflict) {
+          sendJson(res, 409, {
+            error: "配置已变化，请重新加载后再保存",
+          });
+          return;
+        }
+        if (!committed || !committedLive || !committedRevision || !committedSettings) {
+          sendJson(res, 400, { error: validationError ?? "invalid config body" });
+          return;
+        }
+        Object.assign(config, committedLive);
+        options.onConfigChange?.(config);
+        broadcast("config.updated", publicConfig(config));
+        sendJson(res, 200, {
+          ...publicConfig(config),
+          configRevision: committedRevision,
+          persistedSettings: committedSettings,
+        });
+      });
       return;
     }
 
@@ -917,17 +1368,23 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
     }
   }
 
+  const createConnectURL = (): string => {
+    for (const [ticket, expires] of connectTickets) if (expires < Date.now()) connectTickets.delete(ticket);
+    if (connectTickets.size >= 32) connectTickets.delete(connectTickets.keys().next().value ?? "");
+    const ticket = randomBytes(24).toString("hex");
+    connectTickets.set(ticket, Date.now() + 60_000);
+    return `http://${host}:${port}/?connect=${ticket}`;
+  };
+  const openExternal = options.openExternal ?? defaultOpenExternal;
+
   return {
     url,
     port,
     token,
     broadcast,
-    createConnectURL() {
-      for (const [ticket, expires] of connectTickets) if (expires < Date.now()) connectTickets.delete(ticket);
-      if (connectTickets.size >= 32) connectTickets.delete(connectTickets.keys().next().value ?? "");
-      const ticket = randomBytes(24).toString("hex");
-      connectTickets.set(ticket, Date.now() + 60_000);
-      return `http://${host}:${port}/?connect=${ticket}`;
+    createConnectURL,
+    async openConsole(): Promise<boolean> {
+      return openExternal(createConnectURL());
     },
     async close(): Promise<void> {
       for (const client of clients) client.end();
@@ -935,6 +1392,28 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
+}
+
+async function defaultOpenExternal(url: string): Promise<boolean> {
+  const command =
+    process.platform === "darwin"
+      ? "open"
+      : process.platform === "win32"
+        ? "cmd"
+        : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  return await new Promise<boolean>((resolve) => {
+    try {
+      const child = spawn(command, args, { stdio: "ignore", detached: true });
+      child.once("error", () => resolve(false));
+      child.once("spawn", () => {
+        child.unref();
+        resolve(true);
+      });
+    } catch {
+      resolve(false);
+    }
+  });
 }
 
 function applyConfigPatch(config: AutoMemConfig, body: Record<string, unknown>): void {
@@ -1090,6 +1569,142 @@ function assignNonNegative(
 function publicConfig(config: AutoMemConfig): Omit<AutoMemConfig, "token"> {
   const { token: _token, ...rest } = config;
   return rest;
+}
+
+/** Stable hash of the persisted config shape; excludes runtime-only secrets/paths. */
+function configRevisionOf(config: AutoMemConfig): string {
+  const { token: _token, dataDir: _dataDir, ...rest } = config;
+  return sha16(JSON.stringify(rest));
+}
+
+const PERSISTED_SETTINGS_PATHS = [
+  "shadow",
+  "autoMemory",
+  "decision.kind",
+  "decision.endpoint",
+  "decision.model",
+  "decision.apiKeyEnv",
+  "decision.timeoutMs",
+  "decision.maxCallsPerHour",
+  "decision.cacheTtlHours",
+  "rewrite.enabled",
+  "rewrite.transport",
+  "rewrite.eager",
+  "rewrite.timeoutMs",
+  "rewrite.maxCallsPerHour",
+  "rewrite.repairAttempts",
+  "rewrite.model.providerID",
+  "rewrite.model.id",
+  "rewrite.model.variant",
+  "review.enabled",
+  "review.idleMs",
+  "review.maxPerHour",
+  "review.maxCandidates",
+  "review.transcript",
+  "review.redact",
+  "review.model.providerID",
+  "review.model.id",
+  "review.model.variant",
+  "thresholds.memoryMaxChars",
+  "thresholds.ruleMaxChars",
+  "thresholds.titleMaxChars",
+  "thresholds.autoOkMin",
+  "thresholds.globalAutoOkMin",
+  "thresholds.duplicateMax",
+  "caps.autoMemory",
+  "caps.autoRules",
+  "caps.queue",
+  "caps.shadow",
+  "caps.skillDrafts",
+  "caps.itemsTotal",
+  "caps.diskBytes",
+] as const;
+
+type PersistedSettingValue = string | number | boolean | null;
+
+interface PersistedSettingPreview {
+  value: PersistedSettingValue;
+  differsFromLive: boolean;
+}
+
+function readConfigPath(config: AutoMemConfig, path: string): unknown {
+  let current: unknown = config;
+  for (const part of path.split(".")) {
+    if (!isRecord(current)) return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function safeSettingValue(path: string, value: unknown): PersistedSettingValue {
+  if (path === "decision.endpoint" || path === "rewrite.endpoint") {
+    if (typeof value !== "string") return null;
+    try {
+      const endpoint = new URL(value);
+      if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
+        return null;
+      }
+      if (
+        endpoint.username ||
+        endpoint.password ||
+        endpoint.search ||
+        endpoint.hash
+      ) {
+        return null;
+      }
+      return value;
+    } catch {
+      return null;
+    }
+  }
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  return null;
+}
+
+function persistedSettingsPreview(
+  disk: AutoMemConfig,
+  live: AutoMemConfig,
+): Record<string, PersistedSettingPreview> {
+  const settings: Record<string, PersistedSettingPreview> = {};
+  for (const path of PERSISTED_SETTINGS_PATHS) {
+    const diskValue = readConfigPath(disk, path);
+    const liveValue = readConfigPath(live, path);
+    settings[path] = {
+      value: safeSettingValue(path, diskValue),
+      differsFromLive: !Object.is(diskValue, liveValue),
+    };
+  }
+  return settings;
+}
+
+/** Field paths only; never include values, tokens or arbitrary content. */
+function changedConfigFields(
+  before: unknown,
+  after: unknown,
+  prefix = "",
+): string[] {
+  if (isRecord(before) && isRecord(after)) {
+    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+    const changed: string[] = [];
+    for (const key of keys) {
+      if (key === "token") continue;
+      const field = prefix ? `${prefix}.${key}` : key;
+      changed.push(...changedConfigFields(before[key], after[key], field));
+    }
+    return changed;
+  }
+  if (Array.isArray(before) || Array.isArray(after)) {
+    if (JSON.stringify(before) === JSON.stringify(after)) return [];
+    return prefix ? [prefix] : [];
+  }
+  if (Object.is(before, after)) return [];
+  return prefix ? [prefix] : [];
 }
 
 function isAuthorized(req: http.IncomingMessage, url: URL, token: string): boolean {

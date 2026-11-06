@@ -5,7 +5,8 @@ import path from "node:path";
 import { Store } from "../src/store.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { applyQueueDecision } from "../src/actions.js";
-import type { QueueItem } from "../src/types.js";
+import { queueItemSnapshotVersion } from "../src/fingerprint.js";
+import type { DecisionResult, QueueItem, Suggestion } from "../src/types.js";
 
 const now = new Date().toISOString();
 
@@ -34,6 +35,51 @@ function queue(id: string, title: string, text: string): QueueItem {
       reasons: [],
       source: "heuristic",
     },
+  };
+}
+
+function projectQueue(
+  id: string,
+  item: Partial<QueueItem> = {},
+  suggestion: Partial<Suggestion> = {},
+): QueueItem {
+  const base = {
+    ...queue(id, "[P] 项目安全新建", "本项目采用 pnpm 安装依赖"),
+    scope: "project" as const,
+    projectKey: "proj-a",
+    project: "/repo/a",
+    decision: {
+      kind: "preference" as const,
+      duplicate: 0,
+      safeAuto: 0.8,
+      risk: 0.1,
+      confidence: 0.96,
+      strictness: "preference" as const,
+      reasons: ["test"],
+      source: "heuristic" as const,
+      mergeAction: "create" as const,
+      conflict: 0,
+    } satisfies DecisionResult,
+    ...item,
+  };
+  return {
+    ...base,
+    suggestion: {
+      id: `sug-${id}`,
+      queueID: id,
+      action: "create",
+      proposedTitle: base.title,
+      proposedText: base.text,
+      preserved: [base.text],
+      dropped: [],
+      rationale: "test",
+      confidence: 0.96,
+      source: "composer",
+      validation: { ok: true, errors: [], warnings: [] },
+      createdAt: now,
+      ...suggestion,
+    },
+    suggestionState: "ready",
   };
 }
 
@@ -152,6 +198,68 @@ describe("queue actions", () => {
     }
   });
 
+  it("returns the persisted decisionVersion for defer and resume", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.upsertQueue(queue("defer-version", "[P] 延后版本", "延后版本测试"));
+      const deferred = await applyQueueDecision(store, DEFAULT_CONFIG, "defer-version", {
+        action: "defer",
+      });
+      expect(deferred.ok).toBe(true);
+      expect(deferred.decisionVersion).toEqual(expect.any(String));
+      const deferredRow = (await store.listQueue()).find((item) => item.id === "defer-version");
+      expect(deferredRow?.deferredUntil).toBeTruthy();
+      expect(deferred.item).toEqual(deferredRow);
+      expect(deferred.decisionVersion).toBe(queueItemSnapshotVersion(deferredRow!));
+
+      const resumed = await applyQueueDecision(store, DEFAULT_CONFIG, "defer-version", {
+        action: "resume",
+        expectedVersion: deferred.decisionVersion,
+      });
+      expect(resumed.ok).toBe(true);
+      expect(resumed.decisionVersion).toEqual(expect.any(String));
+      const resumedRow = (await store.listQueue()).find((item) => item.id === "defer-version");
+      expect(resumedRow?.deferredUntil).toBeUndefined();
+      expect(resumed.item).toEqual(resumedRow);
+      expect(resumed.decisionVersion).toBe(queueItemSnapshotVersion(resumedRow!));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when the deferred row cannot be re-read", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.upsertQueue(queue("defer-vanish", "[P] 延后消失", "延后消失测试"));
+      const originalListQueue = store.listQueue.bind(store);
+      let calls = 0;
+      store.listQueue = async () => {
+        calls += 1;
+        if (calls >= 2) return [];
+        return originalListQueue();
+      };
+      const result = await applyQueueDecision(store, DEFAULT_CONFIG, "defer-vanish", {
+        action: "defer",
+      });
+      store.listQueue = originalListQueue;
+      expect(result.ok).toBe(false);
+      expect(result.decisionVersion).toBeUndefined();
+      const row = (await store.listQueue()).find((item) => item.id === "defer-vanish");
+      expect(row?.deferredUntil).toBeUndefined();
+      expect(
+        (await store.listChangelog()).some(
+          (entry) => entry.action === "defer" && entry.queueID === "defer-vanish",
+        ),
+      ).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("promotes a session candidate to a project with the gate", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
     try {
@@ -263,6 +371,323 @@ describe("queue actions", () => {
       const result = await applyQueueDecision(store, DEFAULT_CONFIG, "q1", { action: "approve" });
       expect(result.ok).toBe(false);
       expect(await store.listQueue()).toHaveLength(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a batch suggestion when the queue item changed after screening", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const original = projectQueue("stale-scope");
+      await store.upsertQueue(original);
+      const expectedContentHash = queueItemSnapshotVersion(original);
+      await store.upsertQueue({
+        ...original,
+        scope: "global",
+        projectKey: undefined,
+        project: undefined,
+      });
+      const result = await applyQueueDecision(
+        store,
+        DEFAULT_CONFIG,
+        original.id,
+        { action: "apply_suggestion", confirmedByUser: true },
+        { expectedContentHash, action: "apply_suggestion", minConfidence: 0.9 },
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("批量筛选后变更");
+      expect(await store.listQueue()).toHaveLength(1);
+      expect(await store.listItems()).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a batch suggestion when the suggestion became unsafe after screening", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const original = projectQueue("stale-suggestion");
+      await store.upsertQueue(original);
+      const expectedContentHash = queueItemSnapshotVersion(original);
+      await store.upsertQueue({
+        ...original,
+        suggestion: {
+          ...(original.suggestion as Suggestion),
+          action: "merge_into",
+          confidence: 0.5,
+        },
+      });
+      const result = await applyQueueDecision(
+        store,
+        DEFAULT_CONFIG,
+        original.id,
+        { action: "apply_suggestion", confirmedByUser: true },
+        { expectedContentHash, action: "apply_suggestion", minConfidence: 0.9 },
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("批量筛选后变更");
+      expect(await store.listQueue()).toHaveLength(1);
+      expect(await store.listItems()).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects batch execution when assessment data is missing or unsafe", async () => {
+    const cases: Array<[string, QueueItem]> = [
+      [
+        "missing decision",
+        projectQueue("batch-no-decision", { decision: undefined, jev: undefined }),
+      ],
+      [
+        "missing conflict",
+        projectQueue("batch-no-conflict", {
+          decision: {
+            ...(projectQueue("batch-no-conflict").decision as DecisionResult),
+            conflict: undefined,
+          },
+        }),
+      ],
+      [
+        "NaN risk",
+        projectQueue("batch-nan-risk", {
+          decision: {
+            ...(projectQueue("batch-nan-risk").decision as DecisionResult),
+            risk: Number.NaN,
+          },
+        }),
+      ],
+      [
+        "safety strictness",
+        projectQueue("batch-safety", {
+          decision: {
+            ...(projectQueue("batch-safety").decision as DecisionResult),
+            strictness: "safety",
+          },
+        }),
+      ],
+    ];
+    for (const [name, candidate] of cases) {
+      const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+      try {
+        const store = new Store(dir);
+        await store.init();
+        await store.upsertQueue(candidate);
+        const result = await applyQueueDecision(
+          store,
+          DEFAULT_CONFIG,
+          candidate.id,
+          { action: "apply_suggestion", confirmedByUser: true },
+          {
+            expectedContentHash: queueItemSnapshotVersion(candidate),
+            action: "apply_suggestion",
+            minConfidence: 0.9,
+          },
+        );
+        expect(result.ok, name).toBe(false);
+        expect(await store.listQueue(), name).toHaveLength(1);
+        expect(await store.listItems(), name).toEqual([]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("rejects a batch suggestion when its proposed text changes but remains valid", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const original = projectQueue("stale-text");
+      await store.upsertQueue(original);
+      const expectedContentHash = queueItemSnapshotVersion(original);
+      await store.upsertQueue({
+        ...original,
+        suggestion: {
+          ...(original.suggestion as Suggestion),
+          proposedText: `${original.text}，并且保持安全`,
+        },
+      });
+      const result = await applyQueueDecision(
+        store,
+        DEFAULT_CONFIG,
+        original.id,
+        { action: "apply_suggestion", confirmedByUser: true },
+        { expectedContentHash, action: "apply_suggestion", minConfidence: 0.9 },
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("批量筛选后变更");
+      expect(await store.listQueue()).toHaveLength(1);
+      expect(await store.listItems()).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a still-valid replacement suggestion after preview", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const original = projectQueue("stale-replacement");
+      await store.upsertQueue(original);
+      const expectedContentHash = queueItemSnapshotVersion(original);
+      await store.upsertQueue({
+        ...original,
+        suggestion: {
+          ...(original.suggestion as Suggestion),
+          id: "sug-replacement",
+          proposedText: "本项目改用 npm 安装依赖",
+        },
+      });
+      const result = await applyQueueDecision(
+        store,
+        DEFAULT_CONFIG,
+        original.id,
+        { action: "apply_suggestion", confirmedByUser: true },
+        { expectedContentHash, action: "apply_suggestion", minConfidence: 0.9 },
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("批量筛选后变更");
+      expect(await store.listQueue()).toHaveLength(1);
+      expect(await store.listItems()).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a decision risk change even when it stays below the high-risk threshold", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const original = projectQueue("stale-risk");
+      await store.upsertQueue(original);
+      const expectedContentHash = queueItemSnapshotVersion(original);
+      await store.upsertQueue({
+        ...original,
+        decision: {
+          ...(original.decision as DecisionResult),
+          risk: 0.2,
+        },
+      });
+      const result = await applyQueueDecision(
+        store,
+        DEFAULT_CONFIG,
+        original.id,
+        { action: "apply_suggestion", confirmedByUser: true },
+        { expectedContentHash, action: "apply_suggestion", minConfidence: 0.9 },
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("批量筛选后变更");
+      expect(await store.listQueue()).toHaveLength(1);
+      expect(await store.listItems()).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("applies a validated project create through the batch context", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const candidate = projectQueue("batch-valid");
+      await store.upsertQueue(candidate);
+      const result = await applyQueueDecision(
+        store,
+        DEFAULT_CONFIG,
+        candidate.id,
+        { action: "apply_suggestion", confirmedByUser: true },
+        {
+          expectedContentHash: queueItemSnapshotVersion(candidate),
+          action: "apply_suggestion",
+          minConfidence: 0.9,
+        },
+      );
+      expect(result.ok).toBe(true);
+      expect(await store.listQueue()).toEqual([]);
+      expect((await store.listItems()).some((entry) => entry.text === candidate.text)).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("records the trusted decision source without candidate text", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const secret = "SYNTHETIC_CANDIDATE_BODY_SHOULD_NOT_BE_LOGGED";
+      await store.upsertQueue(queue("q-source", "[P] 来源", secret));
+      const result = await applyQueueDecision(
+        store,
+        DEFAULT_CONFIG,
+        "q-source",
+        { action: "deny" },
+        undefined,
+        { source: "agent-tool" },
+      );
+      expect(result.ok).toBe(true);
+      const entry = (await store.listChangelog()).find(
+        (row) => row.action === "deny" && row.queueID === "q-source",
+      );
+      expect(entry?.source).toBe("agent-tool");
+      expect(JSON.stringify(entry)).not.toContain(secret);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("records apply-suggestion provenance without candidate text", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const candidate = projectQueue("q-apply-source");
+      await store.upsertQueue(candidate);
+      const result = await applyQueueDecision(
+        store,
+        DEFAULT_CONFIG,
+        candidate.id,
+        { action: "apply_suggestion", confirmedByUser: true },
+        undefined,
+        { source: "local-token-api" },
+      );
+      expect(result.ok).toBe(true);
+      const entry = (await store.listChangelog()).find(
+        (row) =>
+          row.action === "apply_suggestion_surface" &&
+          row.queueID === candidate.id,
+      );
+      expect(entry?.source).toBe("local-token-api");
+      expect(JSON.stringify(entry)).not.toContain(candidate.text);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still approves a single rule through the user decision lane", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.upsertQueue({
+        ...queue("rule-single", "[R] 单条规则", "回复必须使用 Markdown 格式"),
+        kind: "rule",
+      });
+      const result = await applyQueueDecision(store, DEFAULT_CONFIG, "rule-single", {
+        action: "approve",
+        confirmedByUser: true,
+      });
+      expect(result.ok).toBe(true);
+      expect(await store.readAutoRules()).toContain("回复必须使用 Markdown 格式");
+      expect(await store.listQueue()).toEqual([]);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

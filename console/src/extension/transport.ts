@@ -3,7 +3,7 @@ import {
   HostRequestError,
   type GuestRequestMethod,
 } from "@openchamber/sdk";
-import { ApiError, type TransportResult } from "../api";
+import { ApiError, unknownWriteOutcome, type TransportResult } from "../api";
 
 export const host = connectHost({ requestTimeoutMs: 25_000 });
 
@@ -18,6 +18,7 @@ export async function extensionTransport(
     query[key] = value;
   });
   const body = typeof init.body === "string" ? init.body : undefined;
+  const mayWrite = method !== "GET";
 
   let result;
   try {
@@ -28,7 +29,7 @@ export async function extensionTransport(
       body,
     });
   } catch (error) {
-    throw hostError(error);
+    throw hostError(error, mayWrite);
   }
 
   const parsed = parseBody(result.body);
@@ -36,10 +37,17 @@ export async function extensionTransport(
     result.status === 202 &&
     parsed &&
     typeof parsed === "object" &&
-    "job" in parsed
+    "job" in parsed &&
+    typeof parsed.job === "string" &&
+    parsed.job.length > 0
   ) {
-    return waitForJob(String((parsed as { job: unknown }).job));
+    return waitForJob(parsed.job, mayWrite);
   }
+  if (result.status === 202 && mayWrite) throw unknownOutcome();
+  // A direct proxy response can also be an upstream response, so its error
+  // code alone cannot prove the write was never sent. Only the proxy-owned
+  // job endpoint can make that distinction with its recorded outcome.
+  if (result.status >= 500 && mayWrite) throw unknownOutcome();
   return { status: result.status, body: result.body };
 }
 
@@ -71,7 +79,7 @@ export async function serviceGet<T>(path: string): Promise<T> {
   return data as T;
 }
 
-async function waitForJob(id: string): Promise<TransportResult> {
+async function waitForJob(id: string, mayWrite: boolean): Promise<TransportResult> {
   const deadline = Date.now() + 150_000;
   while (Date.now() < deadline) {
     await sleep(350);
@@ -82,25 +90,33 @@ async function waitForJob(id: string): Promise<TransportResult> {
         path: `/jobs/${encodeURIComponent(id)}`,
       });
     } catch (error) {
-      throw hostError(error);
+      throw hostError(error, mayWrite);
     }
     const job = parseBody(result.body) as
-      | { state?: string; status?: number; body?: string; error?: string }
+      | { state?: string; status?: number; body?: string; error?: string; code?: string; outcome?: string }
       | undefined;
-    if (!job) throw new ApiError(502, "后台任务返回异常。", "OPENMEM_JOB");
+    if (result.status < 200 || result.status >= 300 || !job) {
+      throw mayWrite ? unknownOutcome() : new ApiError(502, "后台任务返回异常。", "OPENMEM_JOB");
+    }
     if (job.state === "pending") continue;
     if (job.state === "error") {
+      if (mayWrite && job.outcome !== "not-submitted") throw unknownOutcome();
       throw new ApiError(
         job.status ?? 502,
         job.error ?? "后台任务失败。",
-        "OPENMEM_JOB",
+        job.code ?? "OPENMEM_JOB",
       );
     }
     if (job.state === "done") {
+      if (typeof job.status !== "number" || typeof job.body !== "string") {
+        throw mayWrite ? unknownOutcome() : new ApiError(502, "后台任务返回异常。", "OPENMEM_JOB");
+      }
+      if (job.status >= 500 && mayWrite) throw unknownOutcome();
       return { status: job.status ?? 200, body: job.body ?? "" };
     }
-    throw new ApiError(502, "后台任务返回异常。", "OPENMEM_JOB");
+    throw mayWrite ? unknownOutcome() : new ApiError(502, "后台任务返回异常。", "OPENMEM_JOB");
   }
+  if (mayWrite) throw unknownOutcome();
   throw new ApiError(
     504,
     "建议生成仍在后台运行，稍后刷新查看。",
@@ -108,7 +124,14 @@ async function waitForJob(id: string): Promise<TransportResult> {
   );
 }
 
-function hostError(error: unknown): ApiError {
+function unknownOutcome(): ApiError {
+  return unknownWriteOutcome();
+}
+
+function hostError(error: unknown, mayWrite = false): ApiError {
+  // Host error codes alone do not prove whether a write was dispatched. This
+  // also applies to a failed GET while polling an already accepted write job.
+  if (mayWrite) return unknownOutcome();
   if (error instanceof HostRequestError) {
     const code = error.code;
     switch (code) {
@@ -128,7 +151,7 @@ function hostError(error: unknown): ApiError {
       case "SERVICE_FAILED":
         return new ApiError(
           503,
-          "OpenMem 扩展服务启动失败。刷新后会重试。",
+          "OpenMem 扩展服务不可用。请检查服务状态。",
           code,
         );
       case "REQUEST_FAILED":

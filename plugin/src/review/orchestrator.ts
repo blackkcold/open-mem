@@ -52,6 +52,7 @@ export interface ReviewOrchestratorDeps {
 export interface ReviewOrchestratorStats {
   scheduled: number;
   running: number;
+  /** Slots consumed this hour: a conservative retry budget, not proof of token spend or HTTP requests. */
   runsLastHour: number;
   paused: boolean;
   lastRunAt?: string;
@@ -64,15 +65,24 @@ const HOUR = 60 * 60 * 1000;
 const STALE_DUE = 24 * 60 * 60 * 1000;
 const CHECKPOINT_DELAY = 1500;
 const CAP_RETRY_MIN = 30_000;
-/** Consecutive model-content failures before auto review stops for a session. */
+/**
+ * Consecutive failed review runs before auto review stops for a session. Every
+ * cause counts (content, transport, provider circuit, infrastructure), so the
+ * bound is strict; the provider circuit breaker only throttles an unbounded
+ * retry, it does not cap it.
+ */
 const ATTEMPT_LIMIT = 5;
 
 /**
  * Synthesizes a session-level idle signal on top of `session.idle`, which the
  * server emits at the end of every turn. A pending review is cancelled and
  * re-armed whenever a new turn ends; state is persisted so a plugin restart can
- * resume work that was already due. New material resets the failure counter and
- * transport errors never consume it.
+ * resume work that was already due. New material or a successful run resets the
+ * failure counter. Every failed run consumes the bounded budget, including
+ * transport and provider failures, so a broken endpoint cannot be retried every
+ * turn forever. A slot is returned only when the model call provably never
+ * started; the hourly budget is a conservative cap, not proof of token spend or
+ * HTTP request counts.
  */
 export class ReviewOrchestrator {
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -92,6 +102,9 @@ export class ReviewOrchestrator {
     const state = await this.deps.store.readState();
     const session = await this.deps.store.readSession(sessionID) ?? {};
     if (session.parentSessionID) return;
+    // Auto review is terminal for this session until new material can be
+    // proven. Re-arming would retry a window whose identity is unknown.
+    if (retryExhausted(session)) return;
 
     // A live review owns this session. Queue one follow-up instead of
     // starting a second review from a turn that lands mid-call.
@@ -213,6 +226,8 @@ export class ReviewOrchestrator {
     this.paused = true;
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    // Nothing is armed while paused, so no "next review" may be advertised.
+    this.dueAt.clear();
   }
 
   resume(): void {
@@ -277,6 +292,7 @@ export class ReviewOrchestrator {
     let record: ReviewRecord | undefined;
     let slotAt: number | undefined;
     let attemptedHash: string | undefined;
+    let modelStarted = false;
 
     try {
       const state = await this.deps.store.readState();
@@ -292,6 +308,15 @@ export class ReviewOrchestrator {
       if (session.parentSessionID) {
         await this.deps.store.updateSession(sessionID, {
           reviewStatus: "skipped",
+          reviewDueAt: undefined,
+        });
+        return undefined;
+      }
+      // The retry budget is spent and the failed window cannot be named.
+      // Reading again could neither prove new material nor end the loop.
+      if (reason === "auto" && retryExhausted(session)) {
+        await this.deps.store.updateSession(sessionID, {
+          reviewStatus: "failed",
           reviewDueAt: undefined,
         });
         return undefined;
@@ -337,10 +362,14 @@ export class ReviewOrchestrator {
         return undefined;
       }
 
-      // Consecutive content failures stop auto review for this exact window;
-      // genuinely new material gets a fresh budget.
+      // Consecutive failures stop auto review for this exact window; genuinely
+      // new material gets a fresh budget. An unknown window is not new material:
+      // never reset the budget on a hash we cannot compare.
       if (reason === "auto" && (session.reviewAttempts ?? 0) >= ATTEMPT_LIMIT) {
-        if (session.reviewAttemptedHash === input.hash) {
+        if (
+          session.reviewAttemptedHash === undefined ||
+          session.reviewAttemptedHash === input.hash
+        ) {
           await this.deps.store.updateSession(sessionID, {
             reviewStatus: "failed",
             reviewDueAt: undefined,
@@ -371,9 +400,10 @@ export class ReviewOrchestrator {
         reviewStatus: "running",
         reviewStartedAt: new Date(this.now()).toISOString(),
       });
+      modelStarted = true;
       const result = await this.deps.runModel(input);
       if (this.paused) {
-        await this.releaseSlot(slotAt);
+        // The call already happened; keep its slot until the hour expires.
         await this.deps.store.updateSession(sessionID, {
           reviewStatus: "scheduled",
           reviewDueAt: new Date(
@@ -384,7 +414,7 @@ export class ReviewOrchestrator {
         return undefined;
       }
       if (this.disposed) {
-        await this.releaseSlot(slotAt);
+        // The call already happened; the slot expires with the rolling hour.
         return undefined;
       }
       if (!await this.deps.store.ownsClaim(lease, leaseToken)) return undefined;
@@ -453,25 +483,46 @@ export class ReviewOrchestrator {
       });
       return record;
     } catch (error: unknown) {
+      // Release only when the model call provably never started. Once it
+      // started, delivery is unknown (timeout, network loss) and a returned
+      // call already happened, so keep the slot until the rolling hour expires.
+      if (slotAt !== undefined && !modelStarted) await this.releaseSlot(slotAt);
       if (this.disposed) return undefined;
-      if (slotAt !== undefined) await this.releaseSlot(slotAt);
       const message = error instanceof Error ? error.message : String(error);
       this.lastError = message;
-      const countsAsAttempt =
-        (error as { countsAsAttempt?: boolean }).countsAsAttempt !== false;
-      const current = await this.deps.store.readState();
-      const previousAttempts = current.sessions[sessionID]?.reviewAttempts ?? 0;
-      const attempts = previousAttempts + (countsAsAttempt ? 1 : 0);
+      // Transport/provider failures keep their label in the record, but every
+      // failed run consumes the same strict budget. `countsAsAttempt` is not a
+      // retry gate anymore: a permanent 401/circuit would otherwise retry on
+      // every turn forever. A thrown null/undefined must not break this catch.
+      const transportFailure = isTransportFailure(error);
+      const current = await this.deps.store.readSession(sessionID) ?? {};
+      // Strict upper bound: a permanently failing session cannot grow this
+      // counter (and therefore its retries) without limit.
+      const attempts = Math.min(
+        ATTEMPT_LIMIT,
+        (current.reviewAttempts ?? 0) + 1,
+      );
       await this.deps.store.updateSession(sessionID, {
         reviewStatus: "failed",
         reviewDueAt: undefined,
         reviewAttempts: attempts,
-        reviewAttemptedHash: attemptedHash,
+        // Never overwrite a known failed window with an unknown one; the next
+        // run would otherwise read "unknown" as proof of new material.
+        reviewAttemptedHash: attemptedHash ?? current.reviewAttemptedHash,
         reviewStartedAt: undefined,
         reviewSkipToMessageID: undefined,
         reviewSkipHash: undefined,
         reviewSkipAt: undefined,
       });
+      this.deps.broadcast?.("review.failed", {
+        sessionID,
+        error: message,
+        attempts,
+      });
+      this.deps.log?.("session review failed", error);
+      // No model call was attempted, so this is not a review call. Publish the
+      // failure through session state instead of fabricating a usage row.
+      if (!modelStarted) return undefined;
       record = {
         id: reviewID,
         sessionID,
@@ -481,15 +532,9 @@ export class ReviewOrchestrator {
         dropped: 0,
         durationMs: this.now() - startedAt,
         error: message,
-        ...(countsAsAttempt ? {} : { note: "transport failure" }),
+        ...(transportFailure ? { note: "transport failure" } : {}),
       };
       await this.deps.store.appendReview(record as unknown as Record<string, unknown>);
-      this.deps.broadcast?.("review.failed", {
-        sessionID,
-        error: message,
-        attempts,
-      });
-      this.deps.log?.("session review failed", error);
       return record;
     } finally {
       await this.deps.store.releaseReservation(lease, leaseToken);
@@ -682,6 +727,31 @@ function windowKey(messages: SessionMessage[]): WindowKey {
       ),
     ),
   };
+}
+
+/**
+ * Safe classification for unknown thrown values. Throwing `null`/`undefined`
+ * is legal JavaScript, so never dereference the value directly in a catch.
+ */
+function isTransportFailure(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "countsAsAttempt" in error &&
+    error.countsAsAttempt === false
+  );
+}
+
+/**
+ * Auto review is terminal when the retry budget is spent and the failed window
+ * has no identity. Re-reading cannot prove new material, and re-reading is the
+ * step that keeps failing, so the conservative choice is to stop.
+ */
+function retryExhausted(session: SessionState): boolean {
+  return (
+    (session.reviewAttempts ?? 0) >= ATTEMPT_LIMIT &&
+    session.reviewAttemptedHash === undefined
+  );
 }
 
 /** True while another instance still owns this review call. */

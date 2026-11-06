@@ -103,3 +103,23 @@
 - 00:01 收尾实查：本轮 Playwright 页面关闭；仅停止身份标记匹配的合成 fixture PID 82972，进程已退出，127.0.0.1:47839 拒绝连接；测试目录保留供追溯，不清理真实数据。package/lock JSON 解析通过。
 - 全部已授权实施项已完成；仍未做真实模型/真实 store/远程 CI/长期 soak/完整屏幕阅读器认证/真实断电与硬件故障验证。redo WAL 不等于只读 MVCC；保留保护下限不等于磁盘硬配额。
 - 当前工作树未提交、未发布、未安装；已有其他工作树变更保留。最终说明见 `EXECUTION-REPORT.md`。
+
+## 2026-11-06 记忆图谱、基线覆盖与安全复核
+- 阶段 0：地图节点不再携带正文；Console 生成建议的邻居按 scope/projectKey 过滤；数值/端口/版本/日期/否定词变化不再被 0.92 相似度静默丢弃；同文本不同 kind 进入分类冲突；false-positive shadow 不再阻塞候选；审计与健康指标按 scope/projectKey 隔离；scope migration 增加 preview 版本与 undo 校验。
+- 阶段 1：`GET /api/graph` 五视图（架构/记忆/路由/自动化/备份）；`GET /api/graph/source` 仅按目录白名单读取有界正文；Console `记忆图谱` 单页内部视图；点云保留为“相似性”子视图；备份视图明确 OpenMem/逻辑链图恢复缺口。
+- 阶段 2：`plugin/src/baseline.ts` 只读 L0/L2 段落索引，`GET /api/queue` 返回位置型 coverage；Queue 显示“基线已覆盖/相关/冲突”；基线不可用或部分可用时明确提示“未匹配不等于未覆盖”。
+- 阶段 3（只读部分）：Inventory 显示无损关系组（完全重复/已覆盖/分类不一致/冲突），不改写、不合并、不删除。
+- 全局恢复脚本：将进程停止检查提到任何写入之前，并增加 `opencode serve` 检查；备份文件 `rollback-memory.sh.bak-20261106-114300`。未新增 OpenMem 自动恢复或逻辑链图快照。
+- 验证：`npm run verify` exit 0；57 文件 / 695 用例；三端 typecheck、构建、扩展代理测试、`git diff --check` 全通过；合成 UX fixture 检查桌面与窄屏，页面关闭、端口 47839 已关闭。
+- 未实施：阶段 4 真实语义改写/无人值守合并（需要后续明确授权）；L1 CAS 未由宿主提供，插件保持只读；未覆盖安装目录 `/Users/11169285/Documents/Opencode project/open-mem/plugin`。
+
+## 2026-11-06 NEXT-PLAN 第一批安全收口（已实施）
+- compact/curator 只对 `isExactRelation` 的同 kind 完全重复归档；端口、版本、否定差异不再因 SimHash/0.92 相似度被合并。
+- 单条 apply 要求建议 ready 且 `validation.ok`；人工编辑走独立 `humanEdited` 记录；写入前重跑 `validateRewrite`，补否定/限定条件保留。无效建议不再标记为 ready。
+- scope classifier 先判显式跨项目，再判项目证据，最后才接受频率词；review 模型 scope 经确定性钳制，project 无 projectKey 时降级为 session note；中文“端口是 5199”和 `port 5199` 纳入 volatile。
+- agent `review`/`suggest`/`decide` 按调用方 projectKey/session 过滤，外项目 ID 返回明确错误；`status`/`audit` 只输出可见范围；`console_url`/`/memory-console` 只在宿主浏览器打开一次性链接，不把 ticket 返回模型。
+- scope migration 预览返回 `previewID`，apply 只执行预览集合并逐行校验；backup/journal/queue patch 进入同一事务，undo 在同一事务写 undone 标记；迁移脚本同步发送 `previewID`。
+- 验证：`npm run verify` exit 0，59 文件 / 739 用例；plugin/console/extension typecheck、plugin/console build、extension bundle 与 service proxy、`git diff --check` 全通过。日志 `tmp/nextplan-first-batch-verify.log`。
+- 复核后补修：`exact` 只认规范化同文；否定/限定按标记集合而非“是否存在”比较；`keep_both` 保留候选而非复制目标；跨 kind 不再提供合并建议；UI 仅正文编辑可绕过失败建议，标题编辑不行；`always/never/我习惯` 在项目证据下留在项目；review 的 global 只由用户原话证据升级；session 去重/邻接按 sessionID 隔离；`console_url` 不再由模型触发浏览器。
+- 未做：approve/consolidate 自动写入的确定性冲突守卫、关系判断的“新增数字≠冲突”细化、阶段 2–8 其余项；未触碰真实 store、安装目录、发布或提交。
+- 安全边界：token/ticket 仍是本机授权凭证，不是真人身份认证；同 OS 用户有 shell 时仍可读取本地凭证。

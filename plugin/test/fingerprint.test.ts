@@ -59,6 +59,12 @@ describe("fingerprint", () => {
     expect(isExactDuplicate(text, "本地 dev server 端口是 5199")).toBe(false);
   });
 
+  it("does not let a false-positive shadow record block a candidate", () => {
+    const record = { ...shadow("s2", "项目文档默认用中文"), falsePositive: true };
+    const entries = entriesFor([], [], [record]);
+    expect(entries).toEqual([]);
+  });
+
   it("ranks the closest neighbor and includes queue/shadow sources", () => {
     const entries = entriesFor(
       [item("i1", "回复先给结论，再给细节")],

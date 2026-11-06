@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { setupPlugin, type PluginContext } from "../src/plugin.js";
 import { Store } from "../src/store.js";
+import { sha16 } from "../src/util/text.js";
 import type { SessionMessage } from "../src/types.js";
 
 interface MockTool {
@@ -24,6 +25,7 @@ interface MockState {
   hook?: (event: { sessionID?: string; system?: Array<{ type: string; text: string }> }) => void | Promise<void>;
   contextCalls: number;
   disposed: number;
+  opened: string[];
 }
 
 async function* eventStream(): AsyncGenerator<{ type: string; sessionID?: string; data?: unknown; [key: string]: unknown }> {
@@ -42,6 +44,7 @@ function createMockContext(messages: SessionMessage[]): { ctx: PluginContext; st
     commands: [],
     contextCalls: 0,
     disposed: 0,
+    opened: [],
   };
   const ctx: PluginContext = {
     location: { directory: "/tmp/openmem-plugin-test" },
@@ -192,6 +195,119 @@ describe("plugin setup with mock OpenCode context", () => {
       await state.tool?.execute({ action: "decide", id: "q_tool", decision: "approve" }, {});
       expect(await store.listQueue()).toHaveLength(1);
       expect(await store.listItems()).toEqual([]);
+    } finally {
+      await dispose?.();
+      await removeDir(dir);
+    }
+  });
+  it("scopes agent reads and writes to the calling project and session", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-plugin-"));
+    let dispose: (() => Promise<void>) | undefined;
+    try {
+      const { ctx, state } = createMockContext([]);
+      ctx.location = { directory: "/workspace/A" };
+      ctx.event = undefined;
+      const store = new Store(dir);
+      await store.init();
+      const at = new Date().toISOString();
+      const projectA = sha16("/workspace/A");
+      const projectB = sha16("/workspace/B");
+      await store.upsertQueue({
+        id: "qa", title: "A专属标题", text: "A 项目使用 pnpm", kind: "preference",
+        scope: "project", projectKey: projectA, status: "queue",
+        source: { sessionID: "s1" }, createdAt: at, updatedAt: at, reason: "test",
+      });
+      await store.upsertQueue({
+        id: "qb", title: "B专属标题", text: "B 项目使用 yarn", kind: "preference",
+        scope: "project", projectKey: projectB, status: "queue",
+        source: { sessionID: "s9" }, createdAt: at, updatedAt: at, reason: "test",
+      });
+      await store.upsertQueue({
+        id: "qs", title: "S专属标题", text: "本会话的临时规则", kind: "preference",
+        scope: "session", status: "queue",
+        source: { sessionID: "s1" }, createdAt: at, updatedAt: at, reason: "test",
+      });
+      dispose = await setupPlugin(ctx, { dataDir: dir, console: false });
+      const tool = state.tool;
+      expect(tool).toBeDefined();
+
+      const review = JSON.parse(
+        (await tool?.execute({ action: "review" }, { sessionID: "s1" }))?.content ?? "[]",
+      ) as Array<{ id: string }>;
+      expect(review.map((entry) => entry.id).sort()).toEqual(["qa", "qs"]);
+
+      const suggestForeign = await tool?.execute(
+        { action: "suggest", id: "qb" },
+        { sessionID: "s1" },
+      );
+      expect(suggestForeign?.content).toContain("不存在");
+      expect((await store.listQueue()).find((entry) => entry.id === "qb")?.suggestion).toBeUndefined();
+
+      const decideForeign = await tool?.execute(
+        { action: "decide", id: "qb", decision: "deny" },
+        { sessionID: "s1" },
+      );
+      expect(decideForeign?.content).toContain("不存在");
+      expect((await store.listQueue()).map((entry) => entry.id).sort()).toEqual([
+        "qa", "qb", "qs",
+      ]);
+
+      const status = JSON.parse(
+        (await tool?.execute({ action: "status" }, { sessionID: "s1" }))?.content ?? "{}",
+      ) as { queue: number };
+      expect(status.queue).toBe(2);
+
+      const audit = await tool?.execute({ action: "audit" }, { sessionID: "s1" });
+      expect(audit?.content).not.toContain("B专属标题");
+    } finally {
+      await dispose?.();
+      await removeDir(dir);
+    }
+  });
+
+  it("reports console availability without leaking the long-lived token", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-plugin-"));
+    let dispose: (() => Promise<void>) | undefined;
+    try {
+      const { ctx, state } = createMockContext([]);
+      ctx.event = undefined;
+      dispose = await setupPlugin(ctx, {
+        dataDir: dir,
+        console: true,
+        port: 0,
+        token: "status-long-lived-token",
+        shadow: false,
+        openExternal: async (url) => {
+          state.opened.push(url);
+          return true;
+        },
+      });
+      // Let the fire-and-forget curator finish before the temp dir is removed.
+      await waitFor(async () => (await new Store(dir).readState()).lastCuratedAt);
+      const status = await state.tool?.execute({ action: "status" }, {});
+      const content = status?.content ?? "";
+      expect(content).not.toContain("status-long-lived-token");
+      expect(content).not.toContain("token=");
+      expect(content).not.toContain("connect=");
+      const body = JSON.parse(content) as {
+        console: { available: boolean; url: string; connect: string };
+      };
+      expect(body.console.available).toBe(true);
+      expect(body.console.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
+      expect(body.console.connect).not.toContain("console_url");
+
+      const link = await state.tool?.execute({ action: "console_url" }, {});
+      expect(link?.content).toContain("/memory-console");
+      expect(link?.content).not.toContain("connect=");
+      expect(link?.content).not.toContain("status-long-lived-token");
+      // A model tool call must not open the browser; only the user command does.
+      expect(state.opened).toHaveLength(0);
+
+      const consoleCommand = state.commands.find((command) => command.name === "memory-console");
+      await consoleCommand?.execute({ sessionID: "s1" });
+      expect(state.opened).toHaveLength(1);
+      expect(state.opened[0]).toContain("connect=");
+      expect(state.prompts.every((prompt) => !prompt.includes("connect="))).toBe(true);
     } finally {
       await dispose?.();
       await removeDir(dir);

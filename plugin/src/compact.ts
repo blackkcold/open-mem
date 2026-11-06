@@ -1,8 +1,8 @@
 import type { AutoMemConfig, Item } from "./types.js";
 import type { Store } from "./store.js";
-import { fingerprintText, hammingDistance, textSimilarity } from "./fingerprint.js";
 import { rebuildAutoFiles } from "./rebuild.js";
 import { capacityStatus } from "./capacity.js";
+import { classifyRelation, isExactRelation } from "./relations.js";
 
 export interface CompactionResult {
   ok: boolean;
@@ -51,9 +51,15 @@ export async function runCompaction(
     );
     const canonical = group[0];
     for (const other of group.slice(1)) {
-      const duplicate =
-        hammingDistance(fingerprintText(canonical.text), fingerprintText(other.text)) <= 3 ||
-        textSimilarity(canonical.text, other.text) >= 0.92;
+      // Automatic maintenance may only collapse evidence-backed exact
+      // duplicates. A short SimHash/lexical distance is not enough: a port,
+      // version, date or negation can change while the text stays similar.
+      const duplicate = isExactRelation(
+        classifyRelation(
+          { text: canonical.text, kind: canonical.kind },
+          { text: other.text, kind: other.kind },
+        ),
+      );
       if (!duplicate) continue;
 
       canonical.seenCount = (canonical.seenCount ?? 1) + (other.seenCount ?? 1);

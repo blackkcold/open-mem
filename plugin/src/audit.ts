@@ -7,10 +7,13 @@ import type {
   Metrics,
   QueueItem,
   ShadowRecord,
+  SourceRef,
 } from "./types.js";
 import { Store } from "./store.js";
-import { bigrams, hasSecret, jaccard, lintText, validateSkillDraft } from "./linter.js";
+import { hasSecret, lintText, validateSkillDraft } from "./linter.js";
 import { ageDays } from "./priority.js";
+import { sameScopeAndProject } from "./memory/scope.js";
+import { classifyRelation, relationLabel } from "./relations.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -25,16 +28,108 @@ export async function runAudit(store: Store, config: AutoMemConfig): Promise<Aud
   const add = (finding: Omit<AuditFinding, "id">) =>
     findings.push({ id: `finding_${findings.length + 1}`, ...finding });
 
-  // Duplicate / conflict pass over memory, queue, and shadow candidates.
-  const pool: Array<{ id: string; title: string; text: string; status: string }> = [
-    ...items.map((item) => ({ id: item.id, title: item.title, text: item.text, status: item.status })),
-    ...queue.map((item) => ({ id: item.id, title: item.title, text: item.text, status: "queue" })),
-    ...shadow.map((item) => ({ id: item.id, title: item.title, text: item.candidate, status: "shadow" })),
+  // Duplicate / conflict pass over active memory, queue, and non-false-positive
+  // shadow candidates. Archived rows and foreign projects are never paired:
+  // a project-A rule and a project-B rule can share text without being a
+  // duplicate or a conflict.
+  const pool: Array<{
+    id: string;
+    title: string;
+    text: string;
+    kind: Item["kind"];
+    scope: Item["scope"];
+    projectKey?: string;
+    source?: SourceRef;
+    status: string;
+  }> = [
+    ...items
+      .filter((item) => item.status !== "archived")
+      .map((item) => ({
+        id: item.id,
+        title: item.title,
+        text: item.text,
+        kind: item.kind,
+        scope: item.scope,
+        projectKey: item.projectKey,
+        source: item.source,
+        status: item.status,
+      })),
+    ...queue.map((item) => ({
+      id: item.id,
+      title: item.title,
+      text: item.text,
+      kind: item.kind,
+      scope: item.scope,
+      projectKey: item.projectKey,
+      source: item.source,
+      status: "queue",
+    })),
+    ...shadow
+      .filter((item) => !item.falsePositive)
+      .map((item) => ({
+        id: item.id,
+        title: item.title,
+        text: item.candidate,
+        kind: item.kind,
+        scope: item.scope,
+        projectKey: item.projectKey,
+        source: item.source,
+        status: "shadow",
+      })),
   ];
   for (let i = 0; i < pool.length; i++) {
     for (let j = i + 1; j < pool.length; j++) {
       const left = pool[i];
       const right = pool[j];
+      if (!sameScopeAndProject(left, right)) continue;
+      const relation = classifyRelation(
+        { text: left.text, kind: left.kind },
+        { text: right.text, kind: right.kind },
+      );
+      if (relation.relation === "classification-mismatch") {
+        add({
+          severity: "warning",
+          kind: "classification",
+          title: `分类不一致：${left.title}`,
+          detail: `同一内容被归类为 "${left.kind}" 和 "${right.kind}"，请确认正确类型。`,
+          itemIDs: [left.id, right.id],
+          suggestedAction: "review",
+        });
+        continue;
+      }
+      if (relation.relation === "conflict") {
+        add({
+          severity: "warning",
+          kind: "conflict",
+          title: `可能的冲突：${left.title}`,
+          detail: `${relationLabel(relation.relation)}：${relation.reasons.join("; ") || "数值或极性不同"}`,
+          itemIDs: [left.id, right.id],
+          suggestedAction: "review",
+        });
+        continue;
+      }
+      if (relation.relation === "exact" || relation.relation === "covered") {
+        add({
+          severity: "warning",
+          kind: "duplicate",
+          title: `重复候选：${left.title}`,
+          detail: `${relationLabel(relation.relation)}，相似度 ${Math.round(relation.score * 100)}%，建议合并或拒绝其中一条。`,
+          itemIDs: [left.id, right.id],
+          suggestedAction: "merge",
+        });
+        continue;
+      }
+      if (relation.relation === "partial" && relation.score >= 0.75) {
+        add({
+          severity: "warning",
+          kind: "duplicate",
+          title: `部分重合：${left.title}`,
+          detail: `相似度 ${Math.round(relation.score * 100)}%，请确认是否应合并。`,
+          itemIDs: [left.id, right.id],
+          suggestedAction: "merge",
+        });
+        continue;
+      }
       if (left.title.toLowerCase() === right.title.toLowerCase() && left.text !== right.text) {
         add({
           severity: "warning",
@@ -43,17 +138,6 @@ export async function runAudit(store: Store, config: AutoMemConfig): Promise<Aud
           detail: "同一标题下存在不同内容，请确认哪一条是最新规则。",
           itemIDs: [left.id, right.id],
           suggestedAction: "review",
-        });
-      }
-      const score = jaccard(bigrams(`${left.title} ${left.text}`), bigrams(`${right.title} ${right.text}`));
-      if (score >= 0.75) {
-        add({
-          severity: "warning",
-          kind: "duplicate",
-          title: `重复候选：${left.title}`,
-          detail: `相似度 ${Math.round(score * 100)}%，建议合并或拒绝其中一条。`,
-          itemIDs: [left.id, right.id],
-          suggestedAction: "merge",
         });
       }
     }

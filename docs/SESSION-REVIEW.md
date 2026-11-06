@@ -13,7 +13,7 @@ non-negotiable; every threshold around it is tunable.**
 | Assistant prose never enters the model | `review/input.ts` only emits user text + tool digests | `review-input.test.ts` |
 | Raw tool output never leaves the process | `digest/tool.ts` clips and redacts before hashing | `review-input.test.ts`, `digest.test.ts` |
 | No L0 write, no skill install | no write path; skills only become drafts | `review-integration.test.ts`, `skill.test.ts` |
-| Human approval is required | `actions.ts` refuses every action on review-origin items unless `confirmedByUser`; only the token-authenticated console sets it | `review-integration.test.ts` |
+| Review decisions use the confirmation-gated path | `actions.ts` refuses review-origin actions without `confirmedByUser`; the token-authenticated API sets it. A local token or this flag does **not** prove that a human confirmed the action | `review-integration.test.ts` |
 | Synthetic / keep-alive messages are never captured | `session/filters.ts` excludes `type: "synthetic"`, warming metadata, and known keep-alive text; `consolidate` and `review/input` share it | `review-input.test.ts`, `consolidate.test.ts` |
 | Subagent sessions are skipped | `parentID` is persisted from `session.created`; turn capture and review skip child sessions | `review-orchestrator.test.ts` |
 | The injected system prefix is cache-stable | `renderContext` carries only AUTO memory/rules + shadow; live counts and audit move to `memory_autopilot status` | `context.test.ts` |
@@ -47,8 +47,8 @@ Review-specific files:
 |---|---|---|
 | `review-input.test.ts` | 7 | budget, newest-first slicing, tool digests, user-only mode, redaction, stable hash, synthetic exclusion |
 | `review-model.test.ts` | 15 | parse, confidence clamp, evidence types, repair, retry, circuit, cache |
-| `review-orchestrator.test.ts` | 9 | idle window, re-arm, deferral, hash skip, failure, hourly cap, restart, ping no-op, subagent skip |
-| `review-reliability.test.ts` | 7 | attempt reset on new material, restart not counted, slot release, pause mid-run, single message, cross-source dedupe, manual hash skip |
+| `review-orchestrator.test.ts` | see file | idle window, re-arm, deferral, hash skip, failure, hourly cap, restart, ping no-op, subagent skip |
+| `review-reliability.test.ts` | see file | bounded failures, attempt reset on new material, restart, slot accounting, pause, cross-source dedupe, manual recovery |
 | `review-integration.test.ts` | 6 | queue-only gate, rules never auto, shadow exclusion, priority floor, agent approve refused, cross-lane dedupe |
 | `review-api.test.ts` | 6 | reviews list/detail, origin filter, auth, usage, config patch (incl. 0) |
 
@@ -103,11 +103,12 @@ jq '.sessions[].reviewAttemptedHash' tmp/demo-data/state.json
 
 | Scenario | How | Expected |
 |---|---|---|
-| Missing key / 401 | Point `decision`/review at an endpoint that rejects, or unset the key | `reviews.jsonl` records `failed`, `attempts` unchanged, hourly slot released |
+| Missing key / 401 | Use a synthetic provider that rejects | The failure increments `reviewAttempts`; a provider failure records `failed` with a transport note and retains its hourly slot once the provider call started |
 | Malformed model JSON | Stub the provider with `not json` (see `review-model.test.ts`) | One repair call; if it still fails, `reviews.jsonl` gets `failed` without a `note`, and `state.json` increments `reviewAttempts` |
 | Circuit breaker | Three transport failures | `/api/health` shows `runtime.openUntil`, logs `circuit open` |
-| Queue full | Set `caps.queue` low, force a review | Hook ends `ignored` with `capacity:`, no crash |
+| Queue full | Set `caps.queue` low, force a review | Hook remains `blocked` with `capacity:` and can be reconsidered when capacity is available |
 | Cache write failure | Make only `review-cache.json` unwritable (mock `writeCacheFile`) | Review still returns; cache error is logged only. A fully read-only `dataDir` is expected to fail at `appendReview` |
+| Corrupt cache on load | Use a synthetic malformed `review-cache.json` | The provider reports an error, leaves the file untouched, and sends no model request. After repairing the file, retry explicitly if the automatic failure budget is exhausted |
 | Unchanged transcript | Run `review_session` twice with no new messages | No new `reviews.jsonl` row; `state.json .sessions[sid].reviewStatus` becomes `skipped` (`no new messages`). `transcript unchanged` only applies to auto runs |
 
 ## Cost and observability
@@ -116,8 +117,19 @@ jq '.sessions[].reviewAttemptedHash' tmp/demo-data/state.json
   System One/Two.
 - `reviews.jsonl` stores per-run `usage`, `durationMs`, `chars`, `candidates`,
   `queued`, `dropped`.
-- Default guards: 3-minute idle, 8 calls/hour (persisted across restarts), 12k input
-  chars, 8 candidates, one call per quiet window, hash cache.
+- Default guards: 3-minute idle, 8 provider-run budget slots per hour (persisted
+  across restarts), 12k input chars, 8 candidates, one run per quiet window,
+  and a hash cache. The provider also has a separate hourly request budget;
+  one run can involve more than one request due to retries or repair.
+- Automatic review stops after five failures for the same known input window,
+  including transport and pre-model failures. An unknown failed window does not
+  gain a fresh budget merely because its hash is unavailable. A genuinely new
+  known window can reset the budget; an explicit manual run can recover it.
+- The hourly budget retains a slot once the provider call starts, including on
+  timeouts or a later pause; only failures before the call release it. This may
+  conservatively count attempts that never reached the provider.
+- Runtime counters and recorded usage are not proof of billed calls or network
+  requests, particularly after transport failure or a lost response.
 
 ## Known gaps
 

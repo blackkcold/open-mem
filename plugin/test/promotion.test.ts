@@ -70,6 +70,23 @@ describe("canPromote", () => {
     ).toEqual({ ok: false, reason: "volatile identifier" });
   });
 
+  it("rejects Chinese and colon port identifiers for global promotion", () => {
+    for (const text of [
+      "本项目端口是 5199",
+      "本项目端口: 5199",
+      "本项目 port 5199",
+      "本项目 localhost:5199",
+    ]) {
+      expect(
+        canPromote(
+          { ...base, text },
+          { target: "global", confirmedByUser: true, existing: [] },
+        ),
+        text,
+      ).toEqual({ ok: false, reason: "volatile identifier" });
+    }
+  });
+
   it("allows a confirmed global rule and a project preference", () => {
     expect(
       canPromote(
@@ -90,7 +107,7 @@ describe("canPromote", () => {
   it("rejects a duplicate at the target tier", () => {
     expect(
       canPromote(
-        { ...base, text: "回复先给结论" },
+        { ...base, text: "回复先给结论", kind: "fact" },
         {
           target: "project",
           confirmedByUser: true,
@@ -99,5 +116,19 @@ describe("canPromote", () => {
         },
       ),
     ).toEqual({ ok: false, reason: "duplicate of item_existing" });
+  });
+
+  it("does not silently drop a same-text entry with a different kind", () => {
+    expect(
+      canPromote(
+        { ...base, text: "回复先给结论" },
+        {
+          target: "project",
+          confirmedByUser: true,
+          projectKey: "A",
+          existing: [item({ text: "回复先给结论", projectKey: "A" })],
+        },
+      ),
+    ).toEqual({ ok: false, reason: "classification mismatch with item_existing" });
   });
 });

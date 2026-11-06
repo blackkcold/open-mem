@@ -6,6 +6,12 @@ import { admitNewItem } from "./capacity.js";
 import { applySuggestion } from "./apply.js";
 import { rebuildAutoFiles } from "./rebuild.js";
 import { canPromote } from "./memory/promotion.js";
+import { queueItemSnapshotVersion } from "./fingerprint.js";
+import {
+  BATCH_APPLY_CONFIDENCE_FLOOR,
+  batchItemNeedsIndividualReview,
+  batchSuggestionRejection,
+} from "./batch-policy.js";
 
 export type QueueAction =
   | "approve"
@@ -27,14 +33,34 @@ export interface QueueDecision {
   projectKey?: string;
   /** Set only by a user-facing surface (console / token-authenticated API). */
   confirmedByUser?: boolean;
+  /** Full queue snapshot value the caller displayed before confirming. */
+  expectedVersion?: string;
+}
+
+/** Trusted internal surface label; never parsed from an HTTP body. */
+export type DecisionSource = "local-token-api" | "agent-tool" | "internal";
+
+export interface DecisionOrigin {
+  source: DecisionSource;
 }
 
 export interface QueueActionResult {
   ok: boolean;
   error?: string;
+  /** True when the caller's displayed queue snapshot is stale. */
+  conflict?: boolean;
   item?: Item;
   target?: string;
   journalID?: string;
+  /** Actual persisted snapshot after a successful defer/resume. */
+  decisionVersion?: string;
+}
+
+/** Internal batch context; never parsed from an HTTP body. */
+export interface BatchExecutionContext {
+  expectedContentHash: string;
+  action: QueueAction;
+  minConfidence?: number;
 }
 
 export async function applyQueueDecision(
@@ -42,13 +68,15 @@ export async function applyQueueDecision(
   config: AutoMemConfig,
   id: string,
   decision: QueueDecision,
+  batchContext?: BatchExecutionContext,
+  origin?: DecisionOrigin,
 ): Promise<QueueActionResult> {
   const key = `queue-action:${id}`;
   const token = await store.claim(key, 60_000);
   if (!token) return { ok: false, error: "该条目正在处理，请稍后刷新" };
   try {
     return await store.transaction(async () => await store.ownsClaim(key, token)
-      ? applyQueueDecisionUnlocked(store, config, id, decision)
+      ? applyQueueDecisionUnlocked(store, config, id, decision, batchContext, origin)
       : { ok: false, error: "操作租约已失效，请刷新重试" });
   } finally {
     await store.releaseReservation(key, token);
@@ -60,10 +88,45 @@ async function applyQueueDecisionUnlocked(
   config: AutoMemConfig,
   id: string,
   decision: QueueDecision,
+  batchContext?: BatchExecutionContext,
+  origin?: DecisionOrigin,
 ): Promise<QueueActionResult> {
   const queue = await store.listQueue();
   const found = queue.find((item) => item.id === id);
   if (!found) return { ok: false, error: "queue item not found" };
+  if (
+    decision.expectedVersion !== undefined &&
+    queueItemSnapshotVersion(found) !== decision.expectedVersion
+  ) {
+    return {
+      ok: false,
+      conflict: true,
+      error: "队列条目已变化，请刷新后重试",
+    };
+  }
+  const source = origin?.source ?? "internal";
+
+  if (batchContext) {
+    if (decision.action !== batchContext.action) {
+      return { ok: false, error: "批量动作与内部上下文不一致" };
+    }
+    if (queueItemSnapshotVersion(found) !== batchContext.expectedContentHash) {
+      return { ok: false, error: "队列条目已在批量筛选后变更，请重新筛选" };
+    }
+    if (decision.action === "apply_suggestion") {
+      const rejection = batchSuggestionRejection(
+        found,
+        batchContext.minConfidence ?? BATCH_APPLY_CONFIDENCE_FLOOR,
+      );
+      if (rejection) {
+        return { ok: false, error: `批量建议不再符合安全策略：${rejection}` };
+      }
+    } else if (!["deny", "defer", "resume"].includes(decision.action)) {
+      return { ok: false, error: "批量动作不在安全策略内" };
+    } else if (batchItemNeedsIndividualReview(found)) {
+      return { ok: false, error: "规则与复盘候选不能批量处理，请逐条确认" };
+    }
+  }
 
   // Review candidates are a human-in-the-loop lane: an agent-invoked tool call
   // must not touch them at all (approve, deny, edit, defer or apply).
@@ -162,6 +225,7 @@ async function applyQueueDecisionUnlocked(
       itemID: item.id,
       target: targetScope,
       projectKey,
+      source,
     });
     return { ok: true, item, target: targetScope };
   }
@@ -173,6 +237,13 @@ async function applyQueueDecisionUnlocked(
       note: decision.note,
     });
     if (!result.ok) return { ok: false, error: result.error };
+    await store.appendChangelog({
+      action: "apply_suggestion_surface",
+      queueID: id,
+      decision: "apply_suggestion",
+      journalID: result.journalID,
+      source,
+    });
     const nextQueue = await store.listQueue();
     return {
       ok: true,
@@ -251,6 +322,7 @@ async function applyQueueDecisionUnlocked(
       itemID: item.id,
       target,
       note: decision.note,
+      source,
     });
     return { ok: true, item: found, target };
   }
@@ -282,6 +354,7 @@ async function applyQueueDecisionUnlocked(
       queueID: found.id,
       itemID: item.id,
       note: decision.note,
+      source,
     });
     return { ok: true, item: found };
   }
@@ -331,7 +404,7 @@ async function applyQueueDecisionUnlocked(
       updatedAt: new Date().toISOString(),
     };
     await store.upsertQueue(next);
-    await store.appendChangelog({ action: "edit", queueID: found.id, note: decision.note });
+    await store.appendChangelog({ action: "edit", queueID: found.id, note: decision.note, source });
     return { ok: true, item: next };
   }
 
@@ -347,6 +420,18 @@ async function applyQueueDecisionUnlocked(
     queueID: found.id,
     deferredUntil,
     note: decision.note,
+    source,
   });
-  return { ok: true, item: next };
+  const persisted = (await store.listQueue()).find((item) => item.id === found.id);
+  if (!persisted) {
+    return {
+      ok: false,
+      error: "延后操作后无法重新读取条目，已回滚",
+    };
+  }
+  return {
+    ok: true,
+    item: persisted,
+    decisionVersion: queueItemSnapshotVersion(persisted),
+  };
 }

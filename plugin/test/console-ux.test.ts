@@ -1,8 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { ApiError, api, clearToken, exchangeConnectTicket, getToken, readTokenFromLocation, setTransport } from "../../console/src/api.js";
 import { connectionHint } from "../../console/src/extension/errors.js";
 
 afterEach(() => vi.unstubAllGlobals());
+
+const source = (relative: string) =>
+  readFileSync(fileURLToPath(new URL(relative, import.meta.url)), "utf8");
+
+function cssRule(css: string, selector: string): string {
+  const start = css.indexOf(`${selector} {`);
+  if (start === -1) return "";
+  const end = css.indexOf("}", start);
+  return end === -1 ? "" : css.slice(start, end);
+}
 
 describe("console recovery", () => {
   it("exchanges a one-time ticket and removes it from browser history", async () => {
@@ -31,5 +43,54 @@ describe("console recovery", () => {
   it("shows validation details instead of a bare HTTP status", async () => {
     setTransport(async () => ({ status: 400, body: JSON.stringify({ ok: false, errors: ["缺少步骤", "缺少验证"] }) }));
     await expect(api("/api/skills/x/decision")).rejects.toThrow("缺少步骤");
+  });
+});
+
+/**
+ * Structural source/style checks only. These do not render React, do not open a
+ * portal, and do not prove anything about a real browser or visual layout.
+ */
+describe("confirmation dialog source structure (not a DOM/visual test)", () => {
+  const styles = source("../../console/src/styles.css");
+  const confirm = source("../../console/src/extension/confirm.tsx");
+
+  it("preserves preview line breaks and wraps long values", () => {
+    const message = cssRule(styles, ".confirm-message");
+    expect(message).toContain("white-space: pre-wrap");
+    expect(message).toMatch(/overflow-wrap:\s*(anywhere|break-word)/);
+  });
+
+  it("caps the preview and card to the viewport with vertical scrolling", () => {
+    const message = cssRule(styles, ".confirm-message");
+    expect(message).toMatch(/max-height:[^;]*(?:calc|min|max)\([^;]*(?:dvh|vh)/);
+    expect(message).toMatch(/overflow-y:\s*auto/);
+
+    const card = cssRule(styles, ".confirm-card");
+    expect(card).toMatch(/max-height:[^;]*(?:dvh|vh)/);
+    expect(card).toMatch(/overflow-y:\s*auto/);
+  });
+
+  it("keeps the confirm and cancel actions outside the scrolling preview", () => {
+    const messageIndex = confirm.indexOf('className="confirm-message"');
+    const actionsIndex = confirm.indexOf('className="confirm-actions"');
+    expect(messageIndex).toBeGreaterThan(-1);
+    expect(actionsIndex).toBeGreaterThan(messageIndex);
+    expect(confirm.slice(messageIndex, actionsIndex)).toContain("</p>");
+  });
+
+  it("makes the scrolling preview keyboard reachable without changing the trap or description", () => {
+    expect(confirm).toContain('className="confirm-message"');
+    expect(confirm).toContain("tabIndex={0}");
+    expect(confirm).toContain("ref={messageRef}");
+    expect(confirm).toContain('role="region"');
+    expect(confirm).toContain('aria-describedby="openmem-confirm-message"');
+    expect(confirm).toContain('id="openmem-confirm-message"');
+    expect(confirm).toMatch(/messageRef\.current\s*\?\?\s*cancelRef\.current/);
+    expect(confirm).toContain('event.key === "Escape"');
+    expect(confirm).toContain("cancelRef.current?.focus()");
+    expect(confirm).toContain("target.focus({ preventScroll: true })");
+
+    const focus = cssRule(styles, ".confirm-message:focus-visible");
+    expect(focus).toMatch(/outline:\s*2px solid var\(--accent\)/);
   });
 });

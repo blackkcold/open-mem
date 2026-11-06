@@ -1,6 +1,6 @@
 # Architecture
 
-OpenMem is an OpenCode server plugin plus a local web console. It is built and tested in this repository; it is **not installed** into OpenChamber, the bundled OpenCode, or any standalone OpenCode.
+OpenMem is an OpenCode server plugin plus a local web console. It is built and tested in this repository; the test suite does **not** install it into OpenChamber, the bundled OpenCode, or a standalone OpenCode. A machine may separately point its live config at a built checkout; that installation is outside this repository's verification boundary and is never overwritten by tests.
 
 ## Two systems
 
@@ -142,9 +142,17 @@ session idle 3 min (session review)
 - **seenCount**: duplicate hits increment the canonical item instead of creating a new one.
 - **Scope isolation**: `global` and `project` never merge; project operations also
   require matching `projectKey`. Unknown project identity is not auto-merged.
+- **Value and polarity guard**: a high lexical score is not enough to drop a candidate.
+  A changed number, port, version, date or an opposite negation is a `conflict`;
+  identical text filed under different `kind` values is a `classification-mismatch`.
+  Both remain visible in the queue instead of being silently ignored
+  (`plugin/src/relations.ts`, `plugin/src/consolidate.ts`).
+- **False positives do not block**: a shadow record marked as a false positive is
+  excluded from the dedupe/neighbor pool (`plugin/src/fingerprint.ts`).
 - **Three states**:
   - identical → drop / `seenCount++`;
-  - complementary → canonical + `aliases`; rules need human approval;
+  - complementary → canonical + `aliases`; rule approvals use the
+    confirmation-gated single-item path, which does not prove human identity;
   - opposite polarity → keep both + conflict finding.
 - **Audit views**: `AUTO_MEMORY.md` / `AUTO_RULES.md` are rebuilt from active items across all scopes for human audit. `buildContext` injects only `global` + the current `projectKey` from `items.jsonl`; review known titles come from items/queue, never from the AUTO files.
 
@@ -155,7 +163,10 @@ session idle 3 min (session review)
 - uses eager generation when configured; otherwise the user clicks “生成建议”;
 - shows a “AI 合并建议” card with prefilled text and live character/linter status;
 - offers **批准建议 / 改后批准 / 重新生成 / 拒绝 / Defer**;
-- batch-applies only ready suggestions with concentration ≥ 0.9, non-rule, max 10, with a dry-run preview;
+- batch-applies only validated, project-scoped `create` / `keep_both` suggestions
+  with concentration ≥ 0.9, no high risk or conflict, and no rule, skill or review
+  origin, max 10, with a dry-run preview; merge, replace, duplicate rejection and
+  global batches require the single-item path;
 - writes `merge-journal.jsonl` and exposes 24h undo on the Health page.
 
 Apply semantics:
@@ -168,7 +179,11 @@ Apply semantics:
 | `reject_duplicate` | archive candidate, `seenCount++` target |
 | `create` | create a new item |
 
-Rules cannot merge; conflicts can only `keep_both`.
+Rules cannot merge or replace another item. The rewrite validator reports a
+high-conflict rewrite unless its output is `keep_both`. The single-item API
+refuses a pending or failed suggestion and requires `validation.ok`; only a body
+edit opens the human-validation lane (a title-only edit cannot bypass it), and
+the final text still passes the linter plus target/version checks.
 
 Suggestions store a material target version. Changed/archived targets require
 regeneration rather than overwriting newer text. Merge undo checks full post-apply
@@ -180,6 +195,32 @@ Multi-file commits persist a redo WAL before fsync/rename replacements; startup
 and subsequent mutations replay any pending commit. Single-file replacement uses
 the fsync/rename fast path. Approval, apply, undo/restore and promotion share this
 boundary. Read-only requests do not get an MVCC snapshot during physical replay.
+
+## Memory graph
+
+`GET /api/graph` is a read-only projection with five views:
+`architecture` (L0–L3, OpenMem, logic chain, backup), `inventory` (item/queue/shadow
+titles and metadata, never bodies), `routing` (parsed `Root Trigger Matrix`),
+`automation` (capture → classify → dedupe → route → review → apply, plus the separate
+confirmation-gated L1 → L0/L2 promotion lane), and `backup` (backup coverage and whether
+an automatic restore path exists). `GET /api/graph/source?id=…` reads only a source that is
+already in the catalog, with a 20 KB cap; arbitrary paths are not accepted.
+
+The console mounts this as one `记忆图谱` tab with internal views. The existing point cloud
+remains as the `相似性` subview: it is an approximate lexical projection, not the architecture
+graph. Stale, missing, disabled, partial and unknown states are shown explicitly; they are
+never rendered as “ready” or as zero. The inventory view also shows lossless relation groups
+(exact/covered/classification/conflict) as node-id groups. Grouping is read-only: no entry is
+rewritten, archived or hidden.
+
+Baseline coverage is read-only: `plugin/src/baseline.ts` builds an in-memory section index
+for `AGENTS.md`, `memory/**/*.md` and the current project's `.memory/**/*.md`. The queue
+response adds `coverage` locations and `GET /api/baseline/status` reports index state;
+`POST /api/baseline/refresh` only refreshes the cache. No baseline body is persisted or
+sent to a model. Global L0 is visible to all candidates; project L2 only to the same
+`projectKey`. When several workspaces share one data directory, the graph shows the
+project of the instance that started the shared console; it is labelled “当前实例” rather
+than treated as all projects.
 
 ## Capacity and health
 
@@ -257,14 +298,76 @@ Only `GET /api/events` accepts a query token for EventSource. `POST /api/connect
 exchanges a cryptographically random, 60-second single-use ticket for a token;
 it does not accept arbitrary unauthenticated login. Local tokens authorize the
 caller, not a proven human identity. Agent tools cannot approve/apply/promote.
+`decisionVersion` and `configRevision` are concurrency tokens only; they do not
+authenticate a person.
+Successful queue decisions record a trusted internal source (`local-token-api` or
+`agent-tool`, default `internal`) that is set by the calling entry point; a
+`source` field in an HTTP body is ignored. Successful config PATCH operations
+record `config_update` with changed field paths only, never values or secrets;
+failed validation writes no success entry. Changelog appends share the Store
+transaction with the write, but they are not tamper-proof and do not authenticate
+a human.
+`memory_autopilot status` reports console availability with a token-free base URL;
+it never returns the long-lived token or a redeemable connect ticket. `console_url`
+and `/memory-console` mint a fresh 60-second single-use link inside the server
+process and open it in the host browser; the ticket is never returned to the
+model. This narrows the model-visible surface. It is not a human identity
+boundary: a process running as the same OS user can still read local credentials.
+
+Scope migration previews carry a `previewID` bound to the changed row set and each
+row's `beforeVersion`. Apply requires that ID, re-checks every row inside the Store
+transaction, and writes the backup, queue patch and journal in one redo-WAL commit.
+A stale or replayed preview is rejected with 409.
 
 - `GET /api/health` — data dir, shadow, decision/rewrite/review status, key source
 - `GET /api/queue` — filters `kind`, `scope`, `origin`, `q`, `projectKey`;
-  returns stable project choices, with `__unassigned__` for missing ownership
+  returns stable project choices, with `__unassigned__` for missing ownership.
+  Each item includes `decisionVersion` (a full queue snapshot hash); the single
+  decision endpoint requires that value as `expectedVersion` and returns 409
+  without writing when the item changed.
+- `POST /api/queue/:id/decision` — `expectedVersion` is required; it is checked
+  inside the Store transaction after re-reading the item, before any write.
+  Successful `defer` / `resume` responses include `decisionVersion` computed from
+  the row re-read after the upsert inside that same transaction; a missing re-read
+  fails the transaction instead of returning a fabricated success.
+- `POST /api/queue/batch` — the `decision.action` form accepts only `deny`,
+  `defer` and `resume`; rule and review candidates return per-item failures, and an
+  ID missing from the screening snapshot fails as that item instead of executing
+  later. The separate top-level `action: "apply_suggestion"` form first returns a
+  dry-run preview: `previewID`, executable `eligible` entries (`id`, `title`,
+  `action`, `confidence`, `projectKey`, `proposedTitle`, `proposedText`),
+  `skippedItems` / `cappedItems` with per-item reasons, and the compatible
+  `skipped` / `capped` counts. Only entries within the effective cap are eligible.
+  Execution requires only that `previewID`, the exact same ID list in the same
+  order, `action: "apply_suggestion"` and `dryRun: false`; `dryRun` must be an
+  explicit boolean: `true` previews, `false` executes, and a missing or non-boolean
+  value is rejected before the ticket is consumed. Omitted `max` /
+  `minConfidence` are resolved from the frozen preview record, never re-defaulted.
+  If a client does send either parameter it must exactly equal the frozen value or
+  the request is rejected. Missing, forged, expired, replayed, replaced, extra or
+  omitted IDs are rejected. Pre-execution preview/ticket rejections carry
+  `code: "BATCH_PREVIEW_REJECTED"`; per-item failures after execution starts do not
+  claim an uncommitted transaction. A preview is single-use, expires after 120 seconds,
+  and the in-process store is bounded. Suggestion candidates must be explicitly
+  assigned to a project
+  with a validated `create` / `keep_both` suggestion and concentration ≥ 0.9,
+  excluding rules, skills and review candidates. Missing `decision`/`jev`,
+  missing or non-finite/out-of-range `risk` or `conflict`, and safety, permission,
+  destructive, strict_limit or unknown strictness are rejected rather than
+  treated as zero risk. The preview binds a complete queue snapshot including the
+  suggestion and assessment, and execution re-checks that snapshot and the same
+  policy inside the item transaction, so changed content is not applied. This is
+  content binding, not human identity authentication; a token or
+  `confirmedByUser` flag does not prove a person approved it.
 - `GET /api/reviews` · `GET /api/reviews/:id` — review history and its hooks
 - `POST /api/reviews/:id/notes/:index/promote` · `POST /api/reviews/:id/notes/:index/dismiss`
 - `POST /api/queue/:id/draft` — convert a workflow candidate to an uninstalled skill draft
 - `GET /api/items` · `GET /api/map`
+- `GET /api/graph` — five read-only graph views; inventory carries no bodies.
+- `GET /api/graph/source?id=…` — bounded source detail for a catalog entry only.
+- `GET /api/baseline/status` · `POST /api/baseline/refresh` — read-only coverage index
+  status and cache refresh. `GET /api/queue` adds `coverage` and `baseline` fields; coverage
+  is derived at read time and is not part of `decisionVersion`.
 - `GET /api/skills` · `GET /api/skills/:id` · `POST /api/skills/:id/decision`
 - `GET /api/audit` · `POST /api/audit/run`
 - `GET /api/metrics` · `GET /api/health-score` · `POST /api/compact`
@@ -273,7 +376,29 @@ caller, not a proven human identity. Agent tools cannot approve/apply/promote.
   and `confirmedByUser: true`; data or deletion-selection changes return 409
 - `GET /api/changelog` · `POST /api/recovery/:id/restore` · `POST /api/maintenance/:id/undo`
 - `GET /api/usage` · `GET /api/journal` · `POST /api/merge/:id/undo`
-- `GET /api/config` · `PATCH /api/config`
+- `GET /api/config` · `PATCH /api/config` — a successful PATCH merges only the
+  supplied fields into the config currently on disk inside the Store transaction,
+  after completing legacy/partial files with the project's default structure while
+  preserving unknown stored keys. It logs the union of actual disk field changes and
+  this server's live field changes for that patch, deduplicated, and then refreshes
+  this server's in-memory options. Changes already present on disk from a peer are
+  not re-logged unless this instance's live config also changes. Other server
+  instances sharing the data directory are not memory-refreshed. Their next PATCH
+  re-reads disk for fields not included in the patch, but a patch that includes a
+  stale same-field value can still overwrite a peer's committed value when the
+  returned `configRevision` matches the disk at GET time; this is not automatic
+  conflict prevention.
+  `GET /api/config` also returns `configRevision` (a token-free disk config hash)
+  and `persistedSettings`, a flat whitelist of Settings-editable paths whose values
+  are safe display forms of the same disk snapshot and whose `differsFromLive`
+  compares the raw disk and live values. Unsafe historical endpoints with userinfo,
+  query or hash are shown as `null`; tokens, `dataDir`, unknown fields and values
+  are never included. Successful PATCH responses return the same pair from the
+  committed disk/live snapshots. PATCH may send `expectedConfigRevision`; a mismatch
+  returns 409 without writing disk, memory or changelog, and a successful response
+  returns the new revision. Omitting it keeps the previous external-client behavior;
+  old clients may ignore `persistedSettings`. Revision and preview are concurrency
+  aids, not human identity authentication.
 - `POST /api/shadow/:id/false-positive`
 - `GET /api/events` (SSE)
 

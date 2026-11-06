@@ -12,6 +12,49 @@ export function itemContentVersion(item: Item): string {
   return sha16(JSON.stringify([item.title, item.text, item.kind, item.scope, item.projectKey, item.status]));
 }
 
+/**
+ * Complete queue snapshot for batch preview/execution binding.
+ * Unlike itemContentVersion, this also covers the suggestion and assessment,
+ * so any content change invalidates a preview even when it stays compliant.
+ */
+export function queueItemSnapshotVersion(item: QueueItem): string {
+  return sha16(
+    JSON.stringify({
+      base: itemContentVersion(item),
+      project: item.project,
+      origin: item.origin,
+      reviewID: item.reviewID,
+      reviewType: item.reviewType,
+      evidence: item.evidence,
+      expiresAt: item.expiresAt,
+      manual: item.manual,
+      decision: item.decision,
+      jev: item.jev,
+      priority: item.priority,
+      priorityBreakdown: item.priorityBreakdown,
+      tags: item.tags,
+      deferredUntil: item.deferredUntil,
+      seenCount: item.seenCount,
+      sources: item.sources,
+      lastSeenAt: item.lastSeenAt,
+      fingerprint: item.fingerprint,
+      supersededBy: item.supersededBy,
+      aliases: item.aliases,
+      reason: item.reason,
+      diff: item.diff,
+      suggestedAction: item.suggestedAction,
+      turnID: item.turnID,
+      hookID: item.hookID,
+      suggestion: item.suggestion,
+      suggestionState: item.suggestionState,
+      suggestionError: item.suggestionError,
+      source: item.source,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+    }),
+  );
+}
+
 export interface FingerprintEntry {
   id: string;
   title: string;
@@ -111,15 +154,17 @@ export function entriesFor(
       projectKey: item.projectKey,
       status: "queue",
     })),
-    ...shadow.map((record) => ({
-      id: record.id,
-      title: record.title,
-      text: record.candidate,
-      kind: record.kind,
-      scope: record.scope,
-      projectKey: record.projectKey,
-      status: record.falsePositive ? "false_positive" : "shadow",
-    })),
+    ...shadow
+      .filter((record) => !record.falsePositive)
+      .map((record) => ({
+        id: record.id,
+        title: record.title,
+        text: record.candidate,
+        kind: record.kind,
+        scope: record.scope,
+        projectKey: record.projectKey,
+        status: "shadow",
+      })),
   ];
 }
 

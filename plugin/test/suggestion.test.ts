@@ -5,6 +5,7 @@ import path from "node:path";
 import { Store } from "../src/store.js";
 import { DEFAULT_CONFIG, mergeConfig } from "../src/config.js";
 import { buildSuggestion } from "../src/suggestion.js";
+import { applySuggestion } from "../src/apply.js";
 import type { DecisionResult, Item, QueueItem } from "../src/types.js";
 
 const decision: DecisionResult = {
@@ -67,6 +68,95 @@ describe("buildSuggestion", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+  it("keeps both by proposing the candidate, not a copy of the target", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-suggestion-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const config = mergeConfig(DEFAULT_CONFIG, { rewrite: { enabled: false } });
+      const now = new Date().toISOString();
+      const candidate = {
+        ...queueItem(),
+        title: "[P] nohup",
+        text: "不要使用 nohup 启动 dev server",
+        kind: "preference" as const,
+      };
+      const target: Item = {
+        id: "item_nohup_target",
+        title: "[P] 启动",
+        text: "使用 nohup 启动 dev server",
+        kind: "preference",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: now,
+        updatedAt: now,
+      };
+      await store.appendItem(target);
+      await store.upsertQueue(candidate);
+      const suggestion = await buildSuggestion(
+        { store, config },
+        candidate,
+        {
+          ...decision,
+          kind: "preference",
+          mergeAction: "merge_into",
+          mergeTargetId: target.id,
+          conflict: 0.9,
+        },
+        target,
+      );
+      expect(suggestion.action).toBe("keep_both");
+      expect(suggestion.proposedTitle).toBe(candidate.title);
+      expect(suggestion.proposedText).toBe(candidate.text);
+      expect(suggestion.validation.ok).toBe(true);
+
+      const applied = await applySuggestion(store, config, candidate.id);
+      expect(applied.ok).toBe(true);
+      const items = await store.listItems();
+      expect(items.find((item) => item.id === target.id)?.text).toBe(target.text);
+      expect(items.find((item) => item.id !== target.id)?.text).toBe(candidate.text);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not offer a cross-kind target as a merge target", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-suggestion-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const candidate = {
+        ...queueItem(),
+        title: "[P] 偏好",
+        text: "回复先给结论",
+        kind: "preference" as const,
+      };
+      const target: Item = {
+        id: "item_fact_target",
+        title: "[F] 事实",
+        text: "回复先给结论",
+        kind: "fact",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: candidate.createdAt,
+        updatedAt: candidate.updatedAt,
+      };
+      await store.upsertQueue(candidate);
+      const suggestion = await buildSuggestion(
+        { store, config: DEFAULT_CONFIG },
+        candidate,
+        { ...decision, kind: "preference", mergeAction: "merge_into", mergeTargetId: target.id },
+        target,
+      );
+      expect(suggestion.targetId).toBeUndefined();
+      expect(suggestion.action).toBe("create");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps reject_duplicate when the target is missing", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-suggestion-"));
     try {

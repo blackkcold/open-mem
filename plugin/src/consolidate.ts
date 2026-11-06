@@ -26,7 +26,8 @@ import { admitAutoWrite, admitQueueItem } from "./capacity.js";
 import { rebuildAutoFiles } from "./rebuild.js";
 import { isKeepAliveText, isUserAuthored } from "./session/filters.js";
 import { reviewDecision } from "./review/decision.js";
-import { classifyScope } from "./memory/scope.js";
+import { classifyScope, sameScopeAndProject } from "./memory/scope.js";
+import { classifyRelation, isExactRelation, relationLabel } from "./relations.js";
 import { redactText } from "./redact.js";
 
 export interface ConsolidationDeps {
@@ -69,15 +70,6 @@ interface PreparedHook {
   reservationKey: string;
   reservationToken: string;
   index: number;
-}
-
-function sameScopeAndProject(
-  entry: { scope: Scope; projectKey?: string },
-  hook: HookRecord,
-): boolean {
-  return entry.scope === hook.scope &&
-    (hook.scope !== "project" ||
-      (hook.projectKey !== undefined && entry.projectKey === hook.projectKey));
 }
 
 export async function runConsolidation(
@@ -184,15 +176,22 @@ export async function runConsolidation(
     const belongsToHook = (entry: { scope: Scope; projectKey?: string }): boolean => sameScopeAndProject(entry, hook);
     const entries = entriesFor(items.filter(belongsToHook), queue.filter(belongsToHook), shadow.filter(belongsToHook));
     const neighbors = collectNeighbors(hook.text, entries, 3);
-    const exact = neighbors.find(
-      (entry) => entry.similarity >= 0.92 && entry.scope === hook.scope,
-    );
-    if (exact) {
-      await saveHook(hook, "ignored", {
-        error: `already known: ${exact.title}`,
-      });
-      result.skipped += 1;
-      continue;
+    const best = neighbors[0];
+    if (best) {
+      // A high lexical score alone is not proof of equivalence: a changed port,
+      // version, date or negation used to be silently dropped at >= 0.92. Only
+      // an exact relation with compatible values may skip classification.
+      const relation = classifyRelation(
+        { text: hook.text },
+        { text: best.text, kind: best.kind },
+      );
+      if (isExactRelation(relation)) {
+        await saveHook(hook, "ignored", {
+          error: `already known: ${best.title}`,
+        });
+        result.skipped += 1;
+        continue;
+      }
     }
 
     const reservationKey = crypto
@@ -259,10 +258,13 @@ export async function runConsolidation(
       continue;
     }
 
-    // System One already decided this is a duplicate. Honor the verdict
-    // instead of asking the user to reject it later; resolve the target from
-    // items, queued candidates, or the nearest neighbor when the model did not
-    // return one.
+    const kind = base.kind as Item["kind"];
+    let relationNote: string | undefined;
+
+    // System One already decided this is a duplicate. Honor the verdict only
+    // when the target is actually equivalent. A changed number/port/date,
+    // opposite negation, or a different kind is a conflict/classification
+    // problem that must stay visible in the queue.
     if (base.mergeAction === "reject_duplicate") {
       const target =
         (base.mergeTargetId
@@ -270,16 +272,28 @@ export async function runConsolidation(
           : undefined) ??
         outcome.entry.neighbors.find((entry) => entry.similarity >= 0.92);
       if (target) {
-        await saveHook(hook, "ignored", {
-          decision: base,
-          error: `duplicate of ${target.title}`,
-        });
-        result.skipped += 1;
-        continue;
+        const relation = classifyRelation(
+          { text: hook.text, kind },
+          { text: target.text, kind: target.kind },
+        );
+        if (isExactRelation(relation) || relation.relation === "covered") {
+          await saveHook(hook, "ignored", {
+            decision: base,
+            error: `duplicate of ${target.title}`,
+          });
+          result.skipped += 1;
+          continue;
+        }
+        relationNote = relation.relation === "classification-mismatch"
+          ? `classification mismatch: ${target.title} is "${target.kind}", candidate is "${kind}"`
+          : `model duplicate rejected: ${relationLabel(relation.relation)} — ${relation.reasons.join("; ")}`;
+        base.mergeAction = "keep_both";
+        if (relation.relation === "conflict") {
+          base.conflict = Math.max(base.conflict ?? 0, 0.8);
+        }
       }
     }
 
-    const kind = base.kind as Item["kind"];
     const title = makeTitle(kind, hook.text);
     const lint = lintText({
       title,
@@ -465,7 +479,8 @@ export async function runConsolidation(
     }
 
     const reason =
-      hook.origin === "session-review"
+      relationNote ??
+      (hook.origin === "session-review"
         ? `会话复盘 · ${hook.reviewType ?? "fact"}`
         : queueReason({
             config: deps.config,
@@ -478,7 +493,7 @@ export async function runConsolidation(
             shadow: deps.config.shadow,
             capacityReason:
               autoAllowed && admission && !admission.ok ? admission.reason : undefined,
-          });
+          }));
     const displayReason =
       hook.scope === "session" ? `session-only · ${reason}` : reason;
     const targetItem =
@@ -640,7 +655,7 @@ async function loadPendingHooks(
 ): Promise<HookRecord[]> {
   const hooks = await store.listHooks();
   const now = Date.now();
-  return hooks
+  const eligible = hooks
     .filter(
       (hook) =>
         hook.sessionID === sessionID &&
@@ -649,8 +664,24 @@ async function loadPendingHooks(
           (hook.status === "processing" &&
             now - new Date(hook.updatedAt).getTime() > 60_000)),
     )
-    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
-    .slice(0, limit);
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  // A retry already has a stored classification and is only waiting on
+  // capacity. Treating it as equal to a fresh hook lets a backlog of old
+  // blocked hooks fill the whole batch, so new pending hooks never get a turn.
+  // Fresh hooks go first. When both classes are waiting and the batch can hold
+  // two entries, one slot is reserved for retries so a steady stream of new
+  // hooks cannot starve blocked ones; the rest still go to fresh hooks first.
+  // A batch of one stays fresh-first: with a single slot a retry waits for the
+  // next run. The batch size still bounds one run, and admission checks still
+  // enforce capacity.
+  const fresh = eligible.filter((hook) => hook.status === "pending");
+  const retries = eligible.filter((hook) => hook.status !== "pending");
+  const freshSlots =
+    fresh.length > 0 && retries.length > 0 && limit >= 2
+      ? Math.min(fresh.length, limit - 1)
+      : Math.min(fresh.length, limit);
+  const picked = fresh.slice(0, freshSlots);
+  return [...picked, ...retries.slice(0, Math.max(0, limit - picked.length))];
 }
 
 async function mapPool<T, R>(
@@ -839,6 +870,9 @@ function suggestedAction(
 ): QueueItem["suggestedAction"] {
   if (reason.startsWith("merge suggested")) return "merge";
   if (reason.startsWith("duplicate")) return "deny";
+  if (reason.startsWith("classification mismatch") || reason.startsWith("model duplicate rejected")) {
+    return "edit";
+  }
   if (reason.startsWith("skill")) return "edit";
   if (
     reason.startsWith("high risk") ||

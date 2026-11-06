@@ -1,15 +1,19 @@
 import type {
   AutoMemConfig,
   HookRecord,
+  ItemKind,
   ReviewRunResult,
   ReviewSessionNote,
+  Scope,
 } from "../types.js";
 import type { Store } from "../store.js";
 import { newId } from "../store.js";
 import { compact } from "../linter.js";
-import { normalizeForFingerprint, textSimilarity } from "../fingerprint.js";
+import { normalizeForFingerprint } from "../fingerprint.js";
+import { classifyRelation } from "../relations.js";
 import { sha16 } from "../util/text.js";
 import type { ReviewInput } from "./input.js";
+import { reviewKind } from "./decision.js";
 
 export interface AcceptReviewDeps {
   store: Store;
@@ -30,6 +34,14 @@ export interface AcceptReviewResult {
  * AUTO_* files; that keeps one writer and reuses hook-key plus similarity
  * dedupe instead of a separate claim ledger.
  */
+function sessionIDOf(entry: {
+  source?: { sessionID?: string };
+  sources?: Array<{ sessionID?: string }>;
+}): string | undefined {
+  if (entry.source?.sessionID) return entry.source.sessionID;
+  return entry.sources?.find((source) => source.sessionID)?.sessionID;
+}
+
 export async function acceptReviewCandidates(
   input: ReviewInput,
   result: ReviewRunResult,
@@ -72,21 +84,43 @@ export async function acceptReviewCandidates(
       continue;
     }
 
+    const candidateKind = reviewKind(candidate.type);
+    // A project hook without a projectKey is orphaned and silently dropped by
+    // consolidation. Keep the text as a session note instead.
+    const effectiveScope: Scope =
+      candidate.scope === "project" && deps.projectKey === undefined
+        ? "session"
+        : candidate.scope;
+    const isReviewDuplicate = (text: string, kind?: ItemKind): boolean => {
+      const relation = classifyRelation(
+        { text: candidate.text, kind: candidateKind },
+        { text, kind },
+      );
+      // Only a true duplicate may be skipped. High lexical overlap with an
+      // added clause or a replaced word must reach the queue for review.
+      return relation.sameKind &&
+        (relation.relation === "exact" || relation.relation === "covered");
+    };
     const duplicate =
       corpus.some((item) =>
-        item.scope === candidate.scope &&
-        (candidate.scope !== "project" ||
+        item.scope === effectiveScope &&
+        (effectiveScope !== "project" ||
           (deps.projectKey !== undefined && item.projectKey === deps.projectKey)) &&
-        textSimilarity(item.text, candidate.text) >= 0.85,
+        (effectiveScope !== "session" ||
+          sessionIDOf(item) === input.sessionID) &&
+        isReviewDuplicate(item.text, item.kind),
       ) ||
-      acceptedTexts.some((text) => textSimilarity(text, candidate.text) >= 0.85) ||
+      acceptedTexts.some((text) => isReviewDuplicate(text)) ||
       sessionHooks.some((hook) => {
         const sameQuote =
           hook.evidence?.some(
             (evidence) =>
               evidence.kind === "user" && evidence.quote === primary.quote,
           ) ?? false;
-        return sameQuote || textSimilarity(hook.text, candidate.text) >= 0.85;
+        return sameQuote || isReviewDuplicate(
+          hook.text,
+          hook.reviewType ? reviewKind(hook.reviewType) : undefined,
+        );
       });
     if (duplicate) {
       skipped += 1;
@@ -95,7 +129,7 @@ export async function acceptReviewCandidates(
 
     // Session-only candidates never become hooks or queue items. They are
     // persisted with the review record as session notes for resume/recall.
-    if (candidate.scope === "session" || candidate.taskOnly) {
+    if (effectiveScope === "session" || candidate.taskOnly) {
       sessionNotes.push({
         type: candidate.type,
         text: candidate.text,
@@ -124,9 +158,9 @@ export async function acceptReviewCandidates(
       text: candidate.text,
       title: compact(candidate.text).slice(0, 30),
       trigger: `review:${candidate.type}`,
-      scope: candidate.scope,
+      scope: effectiveScope,
       project: deps.project,
-      projectKey: candidate.scope === "project" ? deps.projectKey : undefined,
+      projectKey: effectiveScope === "project" ? deps.projectKey : undefined,
       source: {
         sessionID: input.sessionID,
         messageID: primary.messageID,

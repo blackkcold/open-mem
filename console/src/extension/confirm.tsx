@@ -37,6 +37,7 @@ export function ConfirmHost() {
   const [pending, setPending] = useState<Pending | undefined>(undefined);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const confirmRef = useRef<HTMLButtonElement>(null);
+  const messageRef = useRef<HTMLParagraphElement>(null);
 
   useEffect(() => {
     notify = () => setPending(queue[0]);
@@ -75,7 +76,7 @@ export function ConfirmHost() {
       return;
     }
     if (event.key !== "Tab") return;
-    const first = cancelRef.current;
+    const first = messageRef.current ?? cancelRef.current;
     const last = confirmRef.current;
     if (!first || !last) return;
     if (event.shiftKey && document.activeElement === first) {
@@ -114,7 +115,15 @@ export function ConfirmHost() {
         </div>
         <div className="confirm-copy">
           <h2 id="openmem-confirm-title">{pending.title ?? "确认操作"}</h2>
-          <p id="openmem-confirm-message">{pending.message}</p>
+          <p
+            id="openmem-confirm-message"
+            className="confirm-message"
+            role="region"
+            tabIndex={0}
+            ref={messageRef}
+          >
+            {pending.message}
+          </p>
         </div>
         <div className="confirm-actions">
           <button

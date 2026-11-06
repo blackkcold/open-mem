@@ -18,12 +18,13 @@
 
 OpenMem is an OpenCode plugin plus a local web console. It turns session traffic into
 atomic memories and rules, writes low-risk facts/preferences automatically, and sends rules and other candidates
-else to a review queue with a **prefilled merge suggestion** — so approval is one click,
+to a review queue with a **prefilled merge suggestion** — so approval is one click,
 not a rewrite.
 
 Storage and console are local-only: no hosted database, telemetry, or cloud sync.
 Enabled model features can send redacted content to Ollama Cloud. Shadow mode does
-not disable those calls; review candidates and all rules still require human approval.
+not disable those calls; review decisions and rule approvals use the confirmation-gated
+path. A local token or confirmation flag does not establish a human identity.
 
 ## How it works
 
@@ -51,9 +52,12 @@ flowchart LR
 | **System One** | One request, eight typed questions: kind, safety, strict limit, duplicate, safe-to-auto, conflict, merge action, merge target. | `clef:27b-cloud` via Ollama Cloud |
 | **System Two** | Rewrites candidate + target into one compliant entry. Only for merge / replace. | `deepseek-v4.1-flash:1017#high` via Ollama Cloud (or `ctx.generate.text`) |
 
-A deterministic validator gates every rewrite: linter, numeric/identifier guard,
-preservation check, and a hard rule that rules never auto-merge and conflicts stay separate.
-If the model fails, a deterministic composer still produces an editable suggestion.
+A deterministic validator checks generated rewrites, including numeric/identifier and
+preservation checks. Rules never auto-merge. If the model fails, a deterministic
+composer still produces an editable suggestion. The single-item API refuses a pending
+or failed suggestion and requires `validation.ok`; only editing the body opens the
+human-validation lane, and a title-only edit cannot bypass that gate. The final text
+still goes through the linter and target/version checks.
 
 ## Session review
 
@@ -69,9 +73,11 @@ three minutes after a session goes quiet:
 - **One pipeline** — review candidates become normal hooks (`origin: "session-review"`),
   reuse hook-key and SimHash dedupe, and are **never auto-written**, even when the same
   verdict would auto-apply on the turn path.
-- **Cached and bounded** — 12k character budget, one model call per quiet window, zero
-  System One calls, eight reviews per hour. New material resets the retry budget;
-  transport failures never count toward it.
+- **Cached and bounded** — 12k character budget, zero System One calls, and separate
+  hourly run/request budgets. A review run may make retry or repair requests. Automatic
+  review stops after five failures for the same known window, including transport
+  failures; a new identifiable window can reset the budget. If the failed window cannot
+  be identified, recovery requires an explicit manual run.
 
 The console shows a session review card, a source filter, and the evidence quote behind
 every review item.
@@ -80,8 +86,11 @@ every review item.
 
 - **Fewer model calls** — SimHash64 dedupe runs before classification; repeats only bump `seenCount`.
 - **One-click approval** — action, target, merged text, confidence, and rationale on one card.
-- **Capacity recovery** — pressure warns or freezes auto-write; blocked candidates remain pending and approvals can drain a full queue.
+- **Capacity recovery** — pressure warns or freezes auto-write; blocked candidates remain available for retry and approvals can drain a full queue.
 - **Recoverable decisions** — approval/denial/promotion history can restore a candidate; merge undo has a 24h window and refuses later-edit conflicts.
+- **Complete memory graph** — one read-only tab shows L0–L3 sources, actual items, routing, automation and backup/restore coverage; stale/missing/disabled states stay explicit.
+- **Baseline-aware review** — queue cards show whether a candidate is already covered by L0/L2 Markdown, with a `path › heading:line` reference. Coverage is advice, never an automatic decision.
+- **Safety guards before dedupe** — changed numbers, ports, versions, dates or negations become conflicts instead of silently disappearing; false-positive Shadow records no longer block future candidates.
 - **Health you can read** — score built from capacity, duplicates, conflicts, false positives, queue age, model fallback, and acceptance.
 
 ## Quick start
@@ -110,10 +119,10 @@ Add the built plugin path to `~/.config/opencode/opencode.json`, then restart Op
 
 It starts in **shadow mode** (`shadow: true`): turn candidates are observed instead of
 automatically written. Session review remains enabled and can call a model; review
-candidates go to the human queue, not Shadow. Disable model features explicitly if
+candidates go to the review queue, not Shadow. Disable model features explicitly if
 no cloud calls are wanted. Review the evidence before disabling Shadow.
 
-Use `/mem-console` or the `console_url` tool action for a **60-second, single-use
+Use `/memory-console` or the `console_url` tool action for a **60-second, single-use
 connection link** without the long-lived token. The browser removes the ticket
 from its URL after exchange. Manual token login is also supported; a 401 screen
 offers token replacement without clearing browser data.
@@ -158,7 +167,7 @@ Requires OpenChamber 2.6.0+ on web/desktop. The OpenMem server still binds
 
 ## Status
 
-`v0.3.0` · run `npm run verify` for unit/API tests, three typechecks, builds,
+`v0.4.0` · run `npm run verify` for unit/API tests, three typechecks, builds,
 extension proxy tests, and whitespace validation. [Testing](docs/TESTING.md) separates
 current synthetic verification from historical isolated live-model results.
 Recovery history has a preview-and-confirm cleanup policy (at least 90 days and

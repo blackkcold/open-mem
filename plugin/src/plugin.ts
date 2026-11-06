@@ -3,6 +3,7 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type {
+  AuditReport,
   AutoMemConfig,
   AutopilotContext,
   DecisionConfig,
@@ -28,6 +29,7 @@ import { buildSuggestion } from "./suggestion.js";
 import { maybeCompact } from "./compact.js";
 import { collectNeighbors, entriesFor } from "./fingerprint.js";
 import { sha16 } from "./util/text.js";
+import { sameScopeAndProject } from "./memory/scope.js";
 import { runCurator } from "./memory/curator.js";
 import { DigestCache } from "./digest/cache.js";
 import {
@@ -56,6 +58,8 @@ export interface PluginOptions {
   };
   thresholds?: Partial<AutoMemConfig["thresholds"]>;
   caps?: Partial<AutoMemConfig["caps"]>;
+  /** Test seam for opening the local console without a browser. */
+  openExternal?: (url: string) => Promise<boolean>;
 }
 
 interface Disposable {
@@ -292,6 +296,18 @@ export async function setupPlugin(
     key: keyInfo.key,
   });
 
+  const project = ctx.location?.project?.canonical ?? ctx.location?.directory;
+  const projectKey = project ? sha16(project) : undefined;
+  const visible = (
+    entry: {
+      scope: Scope;
+      projectKey?: string;
+      source?: { sessionID?: string };
+      sources?: Array<{ sessionID?: string }>;
+    },
+    sessionID: string | undefined,
+  ): boolean => visibleEntry(entry, projectKey, sessionID);
+
   let suggestionChain: Promise<void> = Promise.resolve();
 
   const suggest = async (id: string): Promise<Suggestion | undefined> => {
@@ -302,18 +318,32 @@ export async function setupPlugin(
     ]);
     const item = queue.find((entry) => entry.id === id);
     if (!item) return undefined;
+    // The console suggest path used to pass every item/queue/shadow row to the
+    // model, including other projects. Keep the same one-way scope rule used by
+    // turn consolidation: unknown project identity matches nothing.
+    const belongsToItem = (entry: { scope: Scope; projectKey?: string }): boolean =>
+      sameScopeAndProject(entry, item);
+    const scopedItems = items.filter(belongsToItem);
+    const scopedQueue = queue.filter(belongsToItem);
+    const scopedShadow = shadow.filter(belongsToItem);
     const targetID = item.suggestion?.targetId ?? item.decision?.mergeTargetId;
-    const target = targetID ? items.find((entry) => entry.id === targetID) : undefined;
+    const target = targetID
+      ? scopedItems.find((entry) => entry.id === targetID)
+      : undefined;
     const resolved =
       item.decision ??
       (await decision.classify({
         candidate: item.text,
         title: item.title,
         existingTitles: [
-          ...items.map((entry) => entry.title),
-          ...queue.map((entry) => entry.title),
+          ...scopedItems.map((entry) => entry.title),
+          ...scopedQueue.map((entry) => entry.title),
         ],
-        neighbors: collectNeighbors(item.text, entriesFor(items, queue, shadow), 3),
+        neighbors: collectNeighbors(
+          item.text,
+          entriesFor(scopedItems, scopedQueue, scopedShadow),
+          3,
+        ),
         scope: item.scope,
         project: item.project,
       }));
@@ -332,6 +362,8 @@ export async function setupPlugin(
         token,
         consoleDir: options.consoleDir ?? bundledConsoleDir(),
         decisionKeySource: keyInfo.source,
+        projectDir: project,
+        openExternal: options.openExternal,
         suggest,
         reviewStats: () => reviewStatsFor(dataDir),
         onReviewRequest: (sessionID: string) => requestReviewFor(dataDir, sessionID),
@@ -347,8 +379,6 @@ export async function setupPlugin(
     }
   }
 
-  const project = ctx.location?.project?.canonical ?? ctx.location?.directory;
-  const projectKey = project ? sha16(project) : undefined;
   const deps = {
     store,
     decision,
@@ -668,12 +698,26 @@ export async function setupPlugin(
             const request = parseToolInput(input);
             if (!request) return { content: "Invalid memory_autopilot input." };
             if (request.action === "status") {
-              const [items, queue, shadow, audit] = await Promise.all([
+              const sessionID = context.sessionID;
+              const [allItems, allQueue, allShadow, allSkills, audit] = await Promise.all([
                 store.listItems(),
                 store.listQueue(),
                 store.listShadow(),
+                store.listSkillDrafts(),
                 store.readAudit(),
               ]);
+              const items = allItems.filter((entry) => visible(entry, sessionID));
+              const queue = allQueue.filter((entry) => visible(entry, sessionID));
+              const shadow = allShadow.filter((entry) => visible(entry, sessionID));
+              const visibleIDs = new Set(
+                [...items, ...queue, ...shadow].map((entry) => entry.id),
+              );
+              for (const draft of allSkills) {
+                if (!draft.source?.sessionID || draft.source.sessionID === sessionID) {
+                  visibleIDs.add(draft.id);
+                }
+              }
+              const scopedAudit = visibleAuditReport(audit, visibleIDs);
               return {
                 content: JSON.stringify(
                   {
@@ -681,8 +725,8 @@ export async function setupPlugin(
                     queue: queue.length,
                     shadow: shadow.length,
                     auto: items.filter((item) => item.status === "auto").length,
-                    audit: audit.summary,
-                    console: server?.url,
+                    audit: scopedAudit.summary,
+                    console: publicConsoleInfo(server),
                     decision: {
                       kind: config.decision.kind,
                       model: config.decision.model,
@@ -695,33 +739,66 @@ export async function setupPlugin(
               };
             }
             if (request.action === "review") {
-              return { content: JSON.stringify(sortQueue(await store.listQueue()), null, 2) };
+              const sessionID = context.sessionID;
+              const queue = (await store.listQueue()).filter((entry) =>
+                visible(entry, sessionID),
+              );
+              return { content: JSON.stringify(sortQueue(queue), null, 2) };
             }
             if (request.action === "review_session") {
               if (!context.sessionID) {
                 return { content: "review_session needs an active session." };
               }
-              const record = await reviewOrchestrator.runNow(context.sessionID, "manual");
+              const record = reviewRuntime.run
+                ? await reviewRuntime.run(context.sessionID)
+                : await reviewOrchestrator.runNow(context.sessionID, "manual");
               return {
                 content: JSON.stringify(
-                  record ?? { status: "skipped", reason: "no new material or hourly cap" },
+                  record ?? { status: "skipped", reason: "session is not owned by this project or has no new material" },
                   null,
                   2,
                 ),
               };
             }
             if (request.action === "audit") {
-              const report = await runAudit(store, config);
-              return { content: JSON.stringify(report, null, 2) };
+              const sessionID = context.sessionID;
+              const [report, items, queue, shadow, skills] = await Promise.all([
+                runAudit(store, config),
+                store.listItems(),
+                store.listQueue(),
+                store.listShadow(),
+                store.listSkillDrafts(),
+              ]);
+              const visibleIDs = new Set(
+                [...items, ...queue, ...shadow]
+                  .filter((entry) => visible(entry, sessionID))
+                  .map((entry) => entry.id),
+              );
+              for (const draft of skills) {
+                if (!draft.source?.sessionID || draft.source.sessionID === sessionID) {
+                  visibleIDs.add(draft.id);
+                }
+              }
+              return {
+                content: JSON.stringify(visibleAuditReport(report, visibleIDs), null, 2),
+              };
             }
             if (request.action === "suggest") {
               if (!request.id) return { content: "suggest requires id." };
+              const item = (await store.listQueue()).find((entry) => entry.id === request.id);
+              if (!item || !visible(item, context.sessionID)) {
+                return { content: "队列条目不存在或不属于当前项目/会话。" };
+              }
               const suggestion = await suggest(request.id);
               return { content: JSON.stringify(suggestion ?? null, null, 2) };
             }
             if (request.action === "decide") {
               if (!request.id || !request.decision) {
                 return { content: "decide requires id and decision." };
+              }
+              const item = (await store.listQueue()).find((entry) => entry.id === request.id);
+              if (!item || !visible(item, context.sessionID)) {
+                return { content: "队列条目不存在或不属于当前项目/会话。" };
               }
               if (["approve", "apply_suggestion", "promote"].includes(request.decision)) {
                 return { content: "正式写入、合并与提升需要用户在控制台确认；请展示候选供用户处理。" };
@@ -731,7 +808,7 @@ export async function setupPlugin(
                 text: request.text,
                 title: request.title,
                 note: request.note,
-              });
+              }, undefined, { source: "agent-tool" });
               return { content: JSON.stringify(result, null, 2) };
             }
             if (request.action === "learn_skill") {
@@ -750,7 +827,11 @@ export async function setupPlugin(
               return { content: JSON.stringify(draft, null, 2) };
             }
             if (request.action === "console_url") {
-              return { content: server?.createConnectURL() ?? "Console is disabled." };
+              if (!server) return { content: "Console is disabled." };
+              return {
+                content:
+                  "控制台由用户在本地运行 /memory-console 打开；一次性连接链接不会返回给模型。",
+              };
             }
             return { content: "Unknown action." };
           },
@@ -778,12 +859,27 @@ export async function setupPlugin(
           name: "memory-review-session",
           description: "Review the current session and queue durable memory candidates for approval.",
           execute: async ({ sessionID }: { sessionID: string }) => {
-            const record = await reviewOrchestrator.runNow(sessionID, "manual");
+            const record = reviewRuntime.run
+              ? await reviewRuntime.run(sessionID)
+              : await reviewOrchestrator.runNow(sessionID, "manual");
+            const summary =
+              record && typeof record === "object"
+                ? (record as { status?: unknown; candidates?: unknown })
+                : undefined;
+            if (!summary) {
+              await prompt(
+                sessionID,
+                "Session review skipped: no new material, unchanged transcript, or hourly cap reached.",
+              );
+              return;
+            }
+            const status =
+              typeof summary.status === "string" ? summary.status : "done";
+            const candidates =
+              typeof summary.candidates === "number" ? summary.candidates : 0;
             await prompt(
               sessionID,
-              record
-                ? `Session review ${record.status}: ${record.candidates} candidate(s) queued. Call memory_autopilot with action=review to show them.`
-                : "Session review skipped: no new material, unchanged transcript, or hourly cap reached.",
+              `Session review ${status}: ${candidates} candidate(s) queued. Call memory_autopilot with action=review to show them.`,
             );
           },
         });
@@ -799,11 +895,18 @@ export async function setupPlugin(
         });
         editor.add({
           name: "memory-console",
-          description: "Show the local OpenMem console URL.",
+          description: "Open the local OpenMem console in the host browser.",
           execute: async ({ sessionID }: { sessionID: string }) => {
+            if (!server) {
+              await prompt(sessionID, "OpenMem 控制台未启用。");
+              return;
+            }
+            const opened = await server.openConsole();
             await prompt(
               sessionID,
-              `OpenMem 控制台：${server?.createConnectURL() ?? "(disabled)"}。这是 60 秒内有效的一次性连接链接，不含长期 Token。`,
+              opened
+                ? "已在本地浏览器打开 OpenMem 控制台（一次性链接，不经过模型）。"
+                : "无法自动打开浏览器；请让本地用户运行 /memory-console。",
             );
           },
         });
@@ -839,6 +942,8 @@ export async function ensureConsoleServer(options: {
   token: string;
   consoleDir?: string;
   decisionKeySource: "env" | "auth" | "missing";
+  projectDir?: string;
+  openExternal?: (url: string) => Promise<boolean>;
   suggest: (id: string) => Promise<Suggestion | undefined>;
   reviewStats?: () => Record<string, unknown>;
   onReviewRequest?: (sessionID: string) => Promise<unknown>;
@@ -866,6 +971,8 @@ export async function ensureConsoleServer(options: {
     port: options.config.port,
     consoleDir: options.consoleDir,
     decisionKeySource: options.decisionKeySource,
+    projectDir: options.projectDir,
+    openExternal: options.openExternal,
     suggest: options.suggest,
     reviewStats: options.reviewStats,
     onReviewRequest: options.onReviewRequest,
@@ -1015,6 +1122,53 @@ function eventSessionID(event: OpenCodeEvent): string | undefined {
     return event.properties.sessionID;
   }
   return undefined;
+}
+
+/** Console availability without the long-lived token or a redeemable ticket. */
+function visibleEntry(
+  entry: {
+    scope: Scope;
+    projectKey?: string;
+    source?: { sessionID?: string };
+    sources?: Array<{ sessionID?: string }>;
+  },
+  projectKey: string | undefined,
+  sessionID: string | undefined,
+): boolean {
+  if (entry.scope === "global") return true;
+  if (entry.scope === "project") {
+    return projectKey !== undefined && entry.projectKey === projectKey;
+  }
+  if (entry.scope !== "session" || !sessionID) return false;
+  if (entry.source?.sessionID === sessionID) return true;
+  return (entry.sources ?? []).some((source) => source.sessionID === sessionID);
+}
+
+function visibleAuditReport(report: AuditReport, visibleIDs: Set<string>): AuditReport {
+  const findings = report.findings.filter(
+    (finding) =>
+      // Aggregate capacity/shadow findings have no item IDs and contain no
+      // project content; keep them so the agent still sees health warnings.
+      finding.itemIDs.length === 0 ||
+      finding.itemIDs.every((id) => visibleIDs.has(id)),
+  );
+  const summary = { error: 0, warning: 0, info: 0 };
+  for (const finding of findings) summary[finding.severity] += 1;
+  return { ...report, findings, summary };
+}
+
+function publicConsoleInfo(
+  server: ServerHandle | undefined,
+): { available: boolean; url: string; connect: string } | null {
+  if (!server) return null;
+  const endpoint = new URL(server.url);
+  endpoint.search = "";
+  endpoint.hash = "";
+  return {
+    available: true,
+    url: endpoint.toString(),
+    connect: "user-command: /memory-console",
+  };
 }
 
 /** V2 and legacy envelopes expose parent/agent under different keys. */

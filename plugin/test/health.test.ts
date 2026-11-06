@@ -67,4 +67,27 @@ describe("health score", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("does not count cross-project copies as duplicates or conflicts", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-health-scope-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.appendItem({
+        ...item("a", "[F] same", "同一个项目规则"),
+        scope: "project",
+        projectKey: "A",
+      });
+      await store.appendItem({
+        ...item("b", "[F] same", "同一个项目规则"),
+        scope: "project",
+        projectKey: "B",
+      });
+      const health = await computeHealth(store, DEFAULT_CONFIG);
+      expect(health.details.duplicateRate).toBe(0);
+      expect(health.details.conflictCount).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

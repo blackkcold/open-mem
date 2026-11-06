@@ -13,6 +13,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { queueItemSnapshotVersion } from "./fingerprint.js";
 import type {
   AuditReport,
   AutoMemConfig,
@@ -364,9 +365,20 @@ export class Store {
    */
   async patchQueue(
     patches: Array<{ id: string; patch: Partial<QueueItem> }>,
+    expectedVersions?: Map<string, string>,
   ): Promise<QueueItem[]> {
     return this.withWriteLock(async () => {
       const queue = await this.readJson<QueueItem[]>(this.queuePath, []);
+      if (expectedVersions) {
+        const byID = new Map(queue.map((entry) => [entry.id, entry]));
+        for (const [id, expected] of expectedVersions) {
+          const entry = byID.get(id);
+          if (!entry) throw new Error(`queue item missing: ${id}`);
+          if (queueItemSnapshotVersion(entry) !== expected) {
+            throw new Error(`queue item changed since preview: ${id}`);
+          }
+        }
+      }
       const byID = new Map<string, Partial<QueueItem>>();
       for (const entry of patches) {
         byID.set(entry.id, { ...(byID.get(entry.id) ?? {}), ...entry.patch });
@@ -928,7 +940,12 @@ export class Store {
           throw new Error("条目在合并后已被修改，无法安全撤销");
         }
       }
-      const restoredQueue = { ...entry.before.queue, suggestionState: entry.before.queue.suggestion ? "ready" as const : undefined };
+      const restoredQueue = {
+        ...entry.before.queue,
+        suggestionState: entry.before.queue.suggestion
+          ? (entry.before.queue.suggestion.validation.ok ? "ready" as const : "failed" as const)
+          : undefined,
+      };
       const currentQueue = queue.find((item) => item.id === entry.queueID);
       if (currentQueue && !(entry.undoing && same(currentQueue, restoredQueue))) throw new Error("候选已被其他操作恢复或修改，请刷新");
       entry.undoing = true;

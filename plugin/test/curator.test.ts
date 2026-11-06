@@ -162,6 +162,47 @@ describe("zero-model curator", () => {
     }
   });
 
+  it("does not merge a changed version or opposite negation in similar text", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-curator-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.appendItem(
+        item({
+          id: "a",
+          text: "启动 dev server 时不要使用 nohup，因为退出终端后进程可能被回收；如果需要保持后台运行，应该先确认日志目录可写，再使用受控的后台任务并在关闭终端后检查端口是否仍然监听。",
+        }),
+      );
+      await store.appendItem(
+        item({
+          id: "b",
+          text: "启动 dev server 时使用 nohup，因为退出终端后进程可能被回收；如果需要保持后台运行，应该先确认日志目录可写，再使用受控的后台任务并在关闭终端后检查端口是否仍然监听。",
+        }),
+      );
+      await store.appendItem(
+        item({
+          id: "c",
+          text: "部署脚本要求 Node 版本是 2.4.1，并且使用 pnpm 安装依赖后运行构建，然后执行完整测试并记录构建身份，最后上传产物到临时目录等待人工核对。",
+        }),
+      );
+      await store.appendItem(
+        item({
+          id: "d",
+          text: "部署脚本要求 Node 版本是 2.4.2，并且使用 pnpm 安装依赖后运行构建，然后执行完整测试并记录构建身份，最后上传产物到临时目录等待人工核对。",
+        }),
+      );
+      const result = await runCurator(store, mergeConfig({}), {
+        now,
+        force: true,
+      });
+      expect(result.merged).toBe(0);
+      const items = await store.listItems();
+      expect(items.filter((entry) => entry.status === "auto")).toHaveLength(4);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("respects the 24h gate and is idempotent when forced", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-curator-"));
     try {

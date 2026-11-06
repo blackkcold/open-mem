@@ -33,11 +33,28 @@ const REVIEW_PROMPT_VERSION = 2;
 export class ReviewRequestError extends Error {
   constructor(
     message: string,
-    /** Only real content failures count toward a session's retry cap. */
+    /**
+     * True for a content failure, false for a transport/provider failure
+     * (network, HTTP status, circuit open). The orchestrator uses this only to
+     * label the review record as a transport failure; every failed run
+     * consumes the same bounded retry budget, so this does not gate retries.
+     */
     readonly countsAsAttempt = false,
   ) {
     super(message);
     this.name = "ReviewRequestError";
+  }
+}
+
+/**
+ * The persisted review cache exists but its top-level shape is invalid.
+ * Thrown loudly so the orchestrator never treats it as an empty cache and a
+ * later persist cannot silently overwrite the damaged file.
+ */
+export class ReviewCacheError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReviewCacheError";
   }
 }
 
@@ -201,46 +218,66 @@ export class ReviewProvider {
   }
 
   private async loadCache(): Promise<void> {
-    if (!this.loading) this.loading = this.readCache();
+    if (!this.loading) {
+      const attempt = this.readCache();
+      this.loading = attempt;
+      try {
+        return await attempt;
+      } catch (error: unknown) {
+        // A temporary read/corruption failure must stay retryable: drop only
+        // the in-flight reference, keep the error visible to the caller, and
+        // leave the cache file untouched (readCache assigns the map only after
+        // a successful read). Concurrent callers still share this attempt.
+        if (this.loading === attempt) this.loading = undefined;
+        throw error;
+      }
+    }
     await this.loading;
   }
 
   private async readCache(): Promise<void> {
-    const file = await this.options.store.readCacheFile<CacheFile>(
-      this.options.store.reviewCachePath,
-      { version: 1, entries: {} },
-    );
-    this.cache = new Map();
-    if (!file || !isRecord(file.entries)) return;
-    for (const [key, entry] of Object.entries(file.entries)) {
-      if (!isRecord(entry) || typeof entry.at !== "number" || !isRecord(entry.result)) continue;
-      this.cache.set(key, entry as unknown as CacheEntry);
-    }
+    const cachePath = this.options.store.reviewCachePath;
+    const file = await this.options.store.readCacheFile<unknown>(cachePath, {
+      version: 1,
+      entries: {},
+    });
+    this.cache = parseCacheFile(file, cachePath).entries;
   }
 
   private async persist(key: string, result: ReviewRunResult): Promise<void> {
+    const cachePath = this.options.store.reviewCachePath;
+    let committed: Map<string, CacheEntry> | undefined;
     await this.options.store.transaction(async () => {
-    if (!this.cache) this.cache = new Map();
-    const stored = await this.options.store.readCacheFile<CacheFile>(this.options.store.reviewCachePath, { version: 1, entries: {} });
-    for (const [id, entry] of Object.entries(stored.entries ?? {})) {
-      if (!this.cache.has(id) || (this.cache.get(id)?.at ?? 0) < entry.at) this.cache.set(id, entry);
-    }
-    this.cache.set(key, { at: this.now(), result });
-    while (this.cache.size > MAX_CACHE_ENTRIES) {
-      let oldestKey: string | undefined;
-      let oldest = Number.POSITIVE_INFINITY;
-      for (const [entryKey, entry] of this.cache) {
-        if (entry.at < oldest) {
-          oldest = entry.at;
-          oldestKey = entryKey;
+      // Re-read and re-validate the latest on-disk snapshot inside the write
+      // lock: another instance may have damaged it after our first successful
+      // load. A throw aborts the transaction, leaves the file untouched, and
+      // review() still returns the completed model result.
+      const stored = await this.options.store.readCacheFile<unknown>(cachePath, {
+        version: 1,
+        entries: {},
+      });
+      const loaded = parseCacheFile(stored, cachePath);
+      const next = new Map(loaded.entries);
+      if (this.cache) {
+        for (const [id, entry] of this.cache) {
+          const existing = next.get(id);
+          if (!existing || existing.at <= entry.at) next.set(id, entry);
         }
       }
-      if (oldestKey === undefined) break;
-      this.cache.delete(oldestKey);
-    }
-    const file: CacheFile = { version: 1, entries: Object.fromEntries(this.cache) };
-    await this.options.store.writeCacheFile(this.options.store.reviewCachePath, file);
+      next.set(key, { at: this.now(), result });
+      trimCache(next);
+      const file: CacheFile = {
+        // Keep unknown top-level fields instead of silently dropping them.
+        ...loaded.extras,
+        version: 1,
+        entries: Object.fromEntries(next),
+      };
+      await this.options.store.writeCacheFile(cachePath, file);
+      committed = next;
     });
+    // Assign only after the transaction commits; a failed write must not make
+    // the in-memory cache claim entries the disk never accepted.
+    if (committed) this.cache = committed;
   }
 }
 
@@ -333,4 +370,95 @@ function numberValue(value: unknown): number | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/** JSON object, excluding arrays (`isRecord` would accept an array). */
+function isCacheObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+interface ParsedCache {
+  entries: Map<string, CacheEntry>;
+  /** Unknown top-level fields, preserved verbatim on the next write. */
+  extras: Record<string, unknown>;
+}
+
+/**
+ * Validate one parsed cache file. Error messages must never echo cache keys,
+ * version values or text: the cache is untrusted content and may hold private
+ * material. Report the damage category and counts only.
+ */
+function parseCacheFile(file: unknown, cachePath: string): ParsedCache {
+  if (!isCacheObject(file)) {
+    throw new ReviewCacheError(`复盘缓存顶层不是 JSON 对象（${cachePath}）`);
+  }
+  if (file.version !== undefined && file.version !== 1) {
+    throw new ReviewCacheError(`复盘缓存版本不受支持（${cachePath}）`);
+  }
+  const entries = file.entries;
+  // Store.init writes `{}`; a missing entries field is the legacy empty cache.
+  // Anything else at the top level was never written or read by this provider,
+  // so preserve the file instead of silently replacing it.
+  if (entries === undefined) {
+    const unknown = Object.keys(file).filter((field) => field !== "version");
+    if (unknown.length > 0) {
+      throw new ReviewCacheError(
+        `复盘缓存缺少 entries 且含 ${unknown.length} 个无法识别的顶层字段（${cachePath}）`,
+      );
+    }
+    return { entries: new Map(), extras: {} };
+  }
+  if (!isCacheObject(entries)) {
+    throw new ReviewCacheError(`复盘缓存 entries 不是 JSON 对象（${cachePath}）`);
+  }
+  const extras: Record<string, unknown> = {};
+  for (const [field, value] of Object.entries(file)) {
+    if (field !== "version" && field !== "entries") extras[field] = value;
+  }
+  const parsed = new Map<string, CacheEntry>();
+  let broken = 0;
+  for (const [key, entry] of Object.entries(entries)) {
+    // A malformed row must not disappear on the next persist: abort the load
+    // and keep the file for manual repair. Valid rows are not used until the
+    // whole file is loadable.
+    if (!isCacheEntry(entry)) {
+      broken += 1;
+      continue;
+    }
+    parsed.set(key, entry);
+  }
+  if (broken > 0) {
+    throw new ReviewCacheError(
+      `复盘缓存含 ${broken} 条无法解析的条目（${cachePath}）`,
+    );
+  }
+  return { entries: parsed, extras };
+}
+
+/** Keep the newest MAX_CACHE_ENTRIES rows, oldest `at` first. */
+function trimCache(entries: Map<string, CacheEntry>): void {
+  while (entries.size > MAX_CACHE_ENTRIES) {
+    let oldestKey: string | undefined;
+    let oldest = Number.POSITIVE_INFINITY;
+    for (const [key, entry] of entries) {
+      if (entry.at < oldest) {
+        oldest = entry.at;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey === undefined) break;
+    entries.delete(oldestKey);
+  }
+}
+
+/**
+ * Structural envelope of one cache row. Keeps the pre-existing per-entry
+ * acceptance (numeric `at`, object `result`); result fields are not revalidated.
+ */
+function isCacheEntry(value: unknown): value is CacheEntry {
+  return (
+    isCacheObject(value) &&
+    typeof value.at === "number" &&
+    isCacheObject(value.result)
+  );
 }

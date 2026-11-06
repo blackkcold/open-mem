@@ -73,6 +73,28 @@ describe("projectMap", () => {
     expect(data.nodes.map((node) => node.status)).toContain("shadow");
   });
 
+  it("never exposes entry bodies on map nodes", () => {
+    const itemText = "secret item body 111111";
+    const queueText = "secret queue body 222222";
+    const shadowText = "secret shadow body 333333";
+    const data = projectMap({
+      items: [item("a", "[R] visible title", itemText)],
+      queue: [queueItem("q", "[R] queue title", queueText)],
+      shadow: [shadow("s", "[F] shadow title", shadowText)],
+    });
+    const allowed = new Set(["id", "title", "kind", "scope", "status", "priority", "x", "y"]);
+    for (const node of data.nodes) {
+      expect(Object.keys(node).every((key) => allowed.has(key))).toBe(true);
+      expect(node).not.toHaveProperty("text");
+      expect(node).not.toHaveProperty("candidate");
+      expect(JSON.stringify(node)).not.toContain("secret ");
+    }
+    const wire = JSON.stringify(data);
+    expect(wire).not.toContain(itemText);
+    expect(wire).not.toContain(queueText);
+    expect(wire).not.toContain(shadowText);
+  });
+
   it("handles a single node and empty input", () => {
     const single = projectMap({ items: [item("a", "x", "a single memory")], queue: [], shadow: [] });
     expect(single.nodes.length).toBe(1);

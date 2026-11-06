@@ -5,7 +5,7 @@ import path from "node:path";
 import { Store } from "../src/store.js";
 import { DEFAULT_CONFIG, mergeConfig } from "../src/config.js";
 import { canAutoApply, extractCandidates, runConsolidation } from "../src/consolidate.js";
-import type { DecisionProvider, JevResult, SessionMessage } from "../src/types.js";
+import type { DecisionProvider, HookRecord, JevResult, SessionMessage } from "../src/types.js";
 
 const preferenceJev: JevResult = {
   kind: "preference",
@@ -36,6 +36,46 @@ const queuePreferenceJev: JevResult = {
 
 function provider(result: JevResult): DecisionProvider {
   return { async classify() { return result; } };
+}
+
+function capacityBlockedHook(id: string, text: string, createdAt: string): HookRecord {
+  return {
+    id,
+    key: id,
+    sessionID: "s-starve",
+    turnID: "t-old",
+    messageID: `m-${id}`,
+    text,
+    title: `[P] ${text}`,
+    trigger: "test",
+    scope: "global",
+    source: {},
+    createdAt,
+    updatedAt: createdAt,
+    status: "blocked",
+    attempts: 1,
+    decision: queuePreferenceJev,
+    error: "capacity: 审批队列已满，请先处理或压缩",
+  };
+}
+
+function pendingCandidateHook(id: string, text: string, createdAt: string): HookRecord {
+  return {
+    id,
+    key: id,
+    sessionID: "s-starve",
+    turnID: "t-new",
+    messageID: `m-${id}`,
+    text,
+    title: `[P] ${text}`,
+    trigger: "test",
+    scope: "global",
+    source: {},
+    createdAt,
+    updatedAt: createdAt,
+    status: "pending",
+    attempts: 0,
+  };
 }
 
 const messages: SessionMessage[] = [
@@ -90,6 +130,113 @@ describe("runConsolidation", () => {
       expect(calls).toBe(1);
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
+  it("processes a new pending candidate before retrying older capacity-blocked ones", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const at = new Date().toISOString();
+      await store.upsertQueue({ id: "full", title: "占位", text: "完全不同", kind: "fact", scope: "global", status: "queue", source: {}, createdAt: at, updatedAt: at, reason: "test" });
+      await store.appendHook(capacityBlockedHook("old-1", "旧候选一：使用 pnpm 安装依赖", "2026-01-01T00:00:00.000Z"));
+      await store.appendHook(capacityBlockedHook("old-2", "旧候选二：构建失败先看日志", "2026-01-01T00:00:01.000Z"));
+      await store.appendHook({
+        id: "new-1", key: "new-1", sessionID: "s-starve", turnID: "t-new", messageID: "m-new-1",
+        text: "以后测试失败先检查磁盘空间", title: "[P] 测试失败先查磁盘", trigger: "test", scope: "global",
+        source: {}, createdAt: "2026-01-01T00:00:10.000Z", updatedAt: "2026-01-01T00:00:10.000Z",
+        status: "pending", attempts: 0,
+      });
+      let calls = 0;
+      const result = await runConsolidation("s-starve", {
+        store,
+        config: mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 1 }, turn: { maxCandidates: 2 } }),
+        decision: { async classify() { calls++; return queuePreferenceJev; } },
+        readMessages: async () => [],
+      });
+      expect(calls).toBe(1);
+      const fresh = (await store.listHooks()).find((hook) => hook.id === "new-1");
+      expect(fresh?.status).toBe("blocked");
+      expect(fresh?.decision).toBeDefined();
+      expect(result.processed).toBe(2);
+      expect(await store.listQueue()).toHaveLength(1);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it("admits new pending candidates before older blocked retries when the queue has room", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.appendHook(capacityBlockedHook("old-1", "旧候选一：使用 pnpm 安装依赖", "2026-01-01T00:00:00.000Z"));
+      await store.appendHook(capacityBlockedHook("old-2", "旧候选二：构建失败先看日志", "2026-01-01T00:00:01.000Z"));
+      await store.appendHook({
+        id: "new-1", key: "new-1", sessionID: "s-starve", turnID: "t-new", messageID: "m-new-1",
+        text: "以后测试失败先检查磁盘空间", title: "[P] 测试失败先查磁盘", trigger: "test", scope: "global",
+        source: {}, createdAt: "2026-01-01T00:00:10.000Z", updatedAt: "2026-01-01T00:00:10.000Z",
+        status: "pending", attempts: 0,
+      });
+      let calls = 0;
+      const result = await runConsolidation("s-starve", {
+        store,
+        config: mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 2 }, turn: { maxCandidates: 2 } }),
+        decision: { async classify() { calls++; return queuePreferenceJev; } },
+        readMessages: async () => [],
+      });
+      expect(result.queued).toBe(2);
+      expect(calls).toBe(1);
+      const queue = await store.listQueue();
+      expect(queue).toHaveLength(2);
+      expect(queue.map((item) => item.hookID)).toContain("new-1");
+      const hooks = await store.listHooks();
+      expect(hooks.find((hook) => hook.id === "new-1")?.status).toBe("queue");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it("gives fresh and retry each a slot when both are waiting and the batch has room", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.appendHook(capacityBlockedHook("old-1", "旧候选一：使用 pnpm 安装依赖", "2026-01-01T00:00:00.000Z"));
+      await store.appendHook(capacityBlockedHook("old-2", "旧候选二：构建失败先看日志", "2026-01-01T00:00:01.000Z"));
+      await store.appendHook(pendingCandidateHook("fresh-1", "以后测试失败先检查磁盘空间", "2026-01-01T00:00:10.000Z"));
+      await store.appendHook(pendingCandidateHook("fresh-2", "以后提交前先运行一遍 tsc", "2026-01-01T00:00:11.000Z"));
+      let calls = 0;
+      const result = await runConsolidation("s-starve", {
+        store,
+        config: mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 5 }, turn: { maxCandidates: 2 } }),
+        decision: { async classify() { calls++; return queuePreferenceJev; } },
+        readMessages: async () => [],
+      });
+      expect(result.processed).toBe(2);
+      expect(calls).toBe(1);
+      const queue = await store.listQueue();
+      expect(queue).toHaveLength(2);
+      expect(queue.map((item) => item.hookID)).toEqual(expect.arrayContaining(["fresh-1", "old-1"]));
+      const hooks = await store.listHooks();
+      expect(hooks.find((hook) => hook.id === "fresh-2")?.status).toBe("pending");
+      expect(hooks.find((hook) => hook.id === "old-2")?.status).toBe("blocked");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it("keeps fresh priority when the batch size is one", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.appendHook(capacityBlockedHook("old-1", "旧候选一：使用 pnpm 安装依赖", "2026-01-01T00:00:00.000Z"));
+      await store.appendHook(pendingCandidateHook("fresh-1", "以后提交前先运行一遍 tsc", "2026-01-01T00:00:10.000Z"));
+      let calls = 0;
+      const result = await runConsolidation("s-starve", {
+        store,
+        config: mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 5 }, turn: { maxCandidates: 1 } }),
+        decision: { async classify() { calls++; return queuePreferenceJev; } },
+        readMessages: async () => [],
+      });
+      expect(result.queued).toBe(1);
+      expect(calls).toBe(1);
+      const queue = await store.listQueue();
+      expect(queue.map((item) => item.hookID)).toEqual(["fresh-1"]);
+      const hooks = await store.listHooks();
+      expect(hooks.find((hook) => hook.id === "old-1")?.status).toBe("blocked");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
   it("rejects credentials before capture or model classification", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
     try {
@@ -109,6 +256,38 @@ describe("runConsolidation", () => {
     expect(canAutoApply({ config: mergeConfig(DEFAULT_CONFIG, { autoRules: true }), kind: "rule", lintOk: true,
       jev: { ...preferenceJev, kind: "rule", strictness: "format", safeAuto: 1 }, scope: "global", autoCounts: { memory: 0, rules: 0 },
     })).toBe(false);
+  });
+  it("does not drop a candidate that changes only a port", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const at = new Date().toISOString();
+      await store.appendItem({
+        id: "port-5199",
+        title: "[R] dev server 端口 5199",
+        text: "以后本地 dev server 端口是 5199",
+        kind: "rule",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: at,
+        updatedAt: at,
+      });
+      const result = await runConsolidation("port-change", {
+        store,
+        decision: provider(riskyRuleJev),
+        config: mergeConfig(DEFAULT_CONFIG, { shadow: false }),
+        readMessages: async () => [{ id: "m-port", type: "user", text: "以后本地 dev server 端口是 5198" }],
+      });
+      expect(result.queued).toBe(1);
+      const queue = await store.listQueue();
+      expect(queue).toHaveLength(1);
+      expect(queue[0].text).toContain("5198");
+      expect(queue[0].reason).toMatch(/conflict|high risk/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
   it("does not discard a project candidate because another project has the same text", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));

@@ -45,7 +45,7 @@ interface Harness {
   store: Store;
   reader: SessionReader;
   orchestrator: ReviewOrchestrator;
-  source: { messages: SessionMessage[] };
+  source: { messages: SessionMessage[]; failRead: boolean; reads: number };
   calls: Array<{ sessionID: string; chars: number }>;
 }
 
@@ -58,10 +58,16 @@ async function harness(options: {
   const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-orch-"));
   const store = new Store(dir);
   await store.init();
-  const source = {
+  const source: Harness["source"] = {
     messages: options.messages ?? [user("m1", "以后回复都用中文"), user("m2", "另外记得用 pnpm")],
+    failRead: false,
+    reads: 0,
   };
-  const reader = new SessionReader(async () => source.messages, { maxMessages: 100 });
+  const reader = new SessionReader(async () => {
+    source.reads += 1;
+    if (source.failRead) throw new Error("transcript unavailable");
+    return source.messages;
+  }, { maxMessages: 100 });
   const digestCache = new DigestCache(store, { maxEntries: 20 });
   await digestCache.load();
   const config = mergeConfig({
@@ -377,6 +383,52 @@ describe("ReviewOrchestrator", () => {
       await h.orchestrator.schedule("ses_1");
       const state = await h.store.readState();
       expect(state.sessions["ses_1"].reviewDueAt).toBeUndefined();
+    } finally {
+      await h.orchestrator.dispose();
+      await cleanup(h.dir);
+    }
+  });
+
+  it("stops auto retries after repeated transcript read failures", async () => {
+    const h = await harness();
+    try {
+      h.source.failRead = true;
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        await h.orchestrator.runNow("ses_1", "auto");
+      }
+      const state = await h.store.readState();
+      expect(state.sessions["ses_1"].reviewStatus).toBe("failed");
+      // Strict upper bound: the counter stops at the cap instead of growing.
+      expect(state.sessions["ses_1"].reviewAttempts).toBe(5);
+      // And further calls never re-read the transcript.
+      expect(h.source.reads).toBe(5);
+      expect(h.calls).toHaveLength(0);
+      // No model call means no failed review row (usage counts stay truthful).
+      expect(await h.store.listReviews()).toHaveLength(0);
+      expect(h.orchestrator.stats().lastError).toContain("transcript unavailable");
+
+      // New turns take the same cheap terminal path instead of re-reading.
+      await h.orchestrator.schedule("ses_1");
+      expect((await h.store.readState()).sessions["ses_1"].reviewDueAt).toBeUndefined();
+      await h.orchestrator.runNow("ses_1", "auto");
+      expect(h.source.reads).toBe(5);
+    } finally {
+      await h.orchestrator.dispose();
+      await cleanup(h.dir);
+    }
+  });
+
+  it("does not report a next review while paused", async () => {
+    const h = await harness({ review: { idleMs: 60_000 } });
+    try {
+      await h.orchestrator.schedule("ses_1");
+      expect(h.orchestrator.stats().scheduled).toBe(1);
+      expect(h.orchestrator.stats().nextReviewAt).toBeTruthy();
+
+      h.orchestrator.pause();
+      const stats = h.orchestrator.stats();
+      expect(stats.scheduled).toBe(0);
+      expect(stats.nextReviewAt).toBeUndefined();
     } finally {
       await h.orchestrator.dispose();
       await cleanup(h.dir);
