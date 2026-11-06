@@ -1,10 +1,10 @@
 # Testing
 
-## Current hardening verification (2026-11-05)
+## Current hardening verification (2026-11-06)
 
 `npm run verify` runs the plugin Vitest suite, plugin/console/extension typechecks,
 plugin + console build, extension bundles, extension service proxy tests and
-`git diff --check`. The 00:00 local run passed **43 files / 284 tests**, all
+`git diff --check`. The latest local run passed **59 files / 739 tests**, all
 typechecks/builds and the extension proxy tests (exit 0). The latest result is in
 the hardening ledger and completion report; earlier counts below are historical. The
 verification scope and remaining gaps are recorded in
@@ -137,6 +137,21 @@ Every test is isolated:
 ### `map.test.ts` (2)
 
 - coordinates in `[0,1]`; duplicate edge; queue/shadow nodes; empty/single input.
+- node field allowlist: item/queue/shadow bodies never appear on the wire.
+
+### `graph.test.ts` (1)
+
+- five views; L0/L1/L2/OpenMem/backup sources; routing matrix; backup/restore gaps;
+  source detail; inventory never contains memory bodies.
+
+### `baseline.test.ts` (2)
+
+- curated section matching, project isolation, numeric/negation conflicts.
+
+### `relations.test.ts` (8)
+
+- exact, classification mismatch, changed port, negation, containment, partial/related,
+  versions/dates.
 
 ### `skill.test.ts` (2)
 

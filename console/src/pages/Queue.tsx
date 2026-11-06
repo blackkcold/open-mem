@@ -1,16 +1,75 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, formatAge, formatReviewAge, priorityClass } from "../api";
+import { ApiError, api, formatAge, formatReviewAge, priorityClass } from "../api";
 import { confirmAction } from "../extension/confirm";
-import type { Config, QueueItem, ReviewRecord, Suggestion, TurnSummary } from "../types";
+import {
+  auditFindingLink,
+  findingsForQueueItem,
+  consumeTarget,
+  markTargetCheck,
+  resolveQueueTarget,
+  targetCheckHandled,
+  targetConsumed,
+  type ConsumedTarget,
+  type TargetCheckMark,
+} from "./audit-links";
+import {
+  anyQueueFilterActive,
+  describeDuplicateClues,
+  emptyQueueFilters,
+  queueScopeView,
+  reviewCountsView,
+  summarizeTurnHooks,
+} from "./queue-triage";
+import { suggestionApplyState } from "./queue-apply";
+import {
+  decisionLockedByUnknown,
+  decisionSnapshotOf,
+  deferRebaseExpectation,
+  discardQueueDraft,
+  globalQueueTotal,
+  hasDecisionVersion,
+  hasDirtyQueueDrafts,
+  initialQueueDraft,
+  queueDraftConflict,
+  rebaselineQueueDraft,
+  resolveDeferRebase,
+  sameDecisionSnapshot,
+  shouldClearConsumedDraft,
+  storeQueueDraft,
+  type DeferRebaseExpectation,
+  type PendingDecisionCheck,
+  type QueueDraft,
+  type QueueDrafts,
+} from "./queue-draft";
+import {
+  buildBatchExecution,
+  classifyBatchSubmitFailure,
+  parseBatchPreview,
+  parseBatchResults,
+  shortItemID,
+  summarizeBatchResults,
+  unknownSubmissionReport,
+  type BatchPreview,
+  type BatchRequestScope,
+  type BatchResultReport,
+  type BatchResultStatus,
+} from "./queue-batch-result";
+import type { AuditReport, Config, QueueItem, ReviewRecord, Suggestion, TurnSummary } from "../types";
 
 interface Props {
   refreshKey: number;
   onChanged: () => void;
+  targetItemID?: string;
+  /** Global pending total from App's single /api/metrics snapshot. */
+  globalQueueCount?: number;
+  /** False while the queue is kept mounted but another tab is visible. */
+  visible?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 type Action = "approve" | "deny" | "defer" | "resume" | "apply_suggestion";
 
-const ACTION_LABEL: Record<Suggestion["action"], string> = {
+const ACTION_LABEL: Record<string, string> = {
   create: "新建条目",
   merge_into: "合并到已有",
   replace: "替换旧条目",
@@ -49,7 +108,14 @@ const STATUS_TONE: Record<ReviewRecord["status"], string> = {
   failed: "error",
 };
 
-export function QueuePage({ refreshKey, onChanged }: Props) {
+export function QueuePage({
+  refreshKey,
+  onChanged,
+  targetItemID,
+  globalQueueCount,
+  visible = true,
+  onDirtyChange,
+}: Props) {
   const [items, setItems] = useState<QueueItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -61,6 +127,7 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [queueError, setQueueError] = useState(false);
+  const [baseline, setBaseline] = useState<{ state: string; sources: number; sections: number }>();
   const [editTitle, setEditTitle] = useState("");
   const [editText, setEditText] = useState("");
   const [note, setNote] = useState("");
@@ -83,11 +150,44 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
   const [nextReviewAt, setNextReviewAt] = useState<string>();
   const [reviewBusy, setReviewBusy] = useState(false);
   const [canRunReview, setCanRunReview] = useState(false);
+  const [batchPreview, setBatchPreview] = useState<BatchPreview | null>(null);
+  const [batchReport, setBatchReport] = useState<BatchResultReport | null>(null);
+  const [batchLabels, setBatchLabels] = useState<Record<string, string>>({});
+  const [auditReport, setAuditReport] = useState<AuditReport>();
+  const [auditError, setAuditError] = useState(false);
+  const [drafts, setDrafts] = useState<QueueDrafts>({});
+  const draftsRef = useRef<QueueDrafts>({});
+  const [targetNotice, setTargetNotice] = useState<
+    { tone: "warning" | "error"; text: string } | null
+  >(null);
+  const targetHandled = useRef<TargetCheckMark | null>(null);
+  const consumedTarget = useRef<ConsumedTarget | null>(null);
+  const targetRefreshRequested = useRef<string | null>(null);
+  const [pendingDecision, setPendingDecision] = useState<PendingDecisionCheck | null>(
+    null,
+  );
+  const decisionInputsRef = useRef<{
+    selected: QueueItem | null;
+    title: string;
+    text: string;
+    note: string;
+  }>({ selected: null, title: "", text: "", note: "" });
+  const deferExpectations = useRef<Record<string, DeferRebaseExpectation>>({});
+
+  const hasFilters = anyQueueFilterActive({
+    kind,
+    scope,
+    projectKey,
+    originFilter,
+    query,
+    queryInput,
+  });
 
   const turnItems = useMemo(
     () => (turn?.turnID ? items.filter((item) => item.turnID === turn.turnID) : []),
     [items, turn?.turnID],
   );
+  const turnView = turn ? summarizeTurnHooks(turn) : undefined;
   const displayItems = items;
 
   const selected = useMemo(
@@ -95,25 +195,58 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
     [displayItems, selectedId],
   );
   const suggestion = selected?.suggestion;
+  const activeDraft = selected ? drafts[selected.id] : undefined;
+  const draftConflict = activeDraft
+    ? queueDraftConflict(activeDraft, selected)
+    : null;
+  const orphanDraft = selectedId && !selected ? drafts[selectedId] : undefined;
+  const orphanDraftIDs = Object.keys(drafts).filter(
+    (id) => !displayItems.some((item) => item.id === id),
+  );
+  const relatedFindings = useMemo(
+    () =>
+      selected && auditReport
+        ? findingsForQueueItem(selected.id, auditReport.findings)
+        : [],
+    [selected?.id, auditReport],
+  );
+  const duplicateClues = selected ? describeDuplicateClues(selected) : undefined;
+  decisionInputsRef.current = {
+    selected,
+    title: editTitle,
+    text: editText,
+    note,
+  };
+  const decisionVersionReady = Boolean(
+    selected && hasDecisionVersion(selected.decisionVersion),
+  );
+  const decisionUnknownLocked = decisionLockedByUnknown(
+    pendingDecision,
+    selected?.id,
+  );
+  const decisionsBlocked =
+    draftConflict !== null || !decisionVersionReady || decisionUnknownLocked;
   useEffect(() => {
+    if (!visible) return;
     if (selectedId && window.matchMedia("(max-width: 900px)").matches) {
       detailRef.current?.focus({ preventScroll: true });
       detailRef.current?.scrollIntoView({ block: "start", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" });
     }
-  }, [selectedId]);
+  }, [selectedId, visible]);
   const maxChars = selected
     ? selected.kind === "rule"
       ? limits.rule
       : limits.memory
     : limits.memory;
   const overLimit = editText.length > maxChars || editTitle.length > limits.title;
-  const edited = Boolean(
-    suggestion &&
-      (editTitle !== suggestion.proposedTitle || editText !== suggestion.proposedText),
-  );
-  const canApply = Boolean(
-    suggestion && !overLimit && (suggestion.validation.ok || edited),
-  );
+  const applyState = suggestionApplyState({
+    suggestion,
+    suggestionState: selected?.suggestionState,
+    title: editTitle,
+    text: editText,
+    overLimit,
+  });
+  const { edited, canApply } = applyState;
 
   useEffect(() => {
     api<Config>("/api/config")
@@ -141,17 +274,26 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
     if (query) params.set("q", query);
     const id = ++requestID.current;
     setLoading(true);
-    api<{ items: QueueItem[]; projects?: Array<{ key: string; label: string }> }>(`/api/queue?${params.toString()}`)
+    api<{
+      items: QueueItem[];
+      projects?: Array<{ key: string; label: string }>;
+      baseline?: { state: string; sources: number; sections: number };
+    }>(`/api/queue?${params.toString()}`)
       .then((data) => {
         if (id !== requestID.current) return;
         setItems(data.items);
         setProjects(data.projects ?? []);
+        setBaseline(data.baseline);
         setLoadedFilter(filterKey);
         setQueueError(false);
         setError("");
-        setSelectedId((current) =>
-          current && data.items.some((item) => item.id === current) ? current : null,
-        );
+        setSelectedId((current) => {
+          if (!current) return null;
+          if (data.items.some((item) => item.id === current)) return current;
+          // A background refresh or filter change must not drop a dirty draft:
+          // keep the id so the detail can offer copy/discard for it.
+          return draftsRef.current[current] ? current : null;
+        });
       })
       .catch((caught: unknown) => {
         if (id !== requestID.current) return;
@@ -191,11 +333,200 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
   }, [originFilter, kind, scope, query, projectKey]);
 
   useEffect(() => {
+    api<AuditReport>("/api/audit")
+      .then((data) => {
+        setAuditReport(data);
+        setAuditError(false);
+      })
+      .catch(() => {
+        setAuditReport(undefined);
+        setAuditError(true);
+      });
+  }, [refreshKey]);
+
+
+  useEffect(() => {
+    if (!targetItemID) {
+      targetHandled.current = null;
+      consumedTarget.current = null;
+      targetRefreshRequested.current = null;
+      setTargetNotice(null);
+      return;
+    }
+    // The deep link selects its target exactly once. After that a refresh (or
+    // the user picking another row) must not steal the selection back.
+    if (targetConsumed(consumedTarget.current, targetItemID)) return;
+    if (loading || filterPending) return;
+    const key = `${targetItemID}|${filterKey}`;
+    const generation = requestID.current;
+    if (targetCheckHandled(targetHandled.current, key, generation)) return;
+    const visible = items.find((item) => item.id === targetItemID);
+    if (visible) {
+      targetHandled.current = markTargetCheck(key, generation);
+      consumedTarget.current = consumeTarget(targetItemID);
+      setSelectedId(visible.id);
+      setTargetNotice(null);
+      return;
+    }
+    let cancelled = false;
+    setTargetNotice(null);
+    api<{ items: QueueItem[] }>("/api/queue")
+      .then((data) => {
+        if (cancelled || requestID.current !== generation) return;
+        // Mark only after the check completed, so a cancelled reload retries.
+        targetHandled.current = markTargetCheck(key, generation);
+        const status = resolveQueueTarget(
+          targetItemID,
+          [],
+          data.items,
+          hasFilters,
+        );
+        if (status === "filtered") {
+          setTargetNotice({
+            tone: "warning",
+            text: "该审批条目存在，但被当前筛选隐藏；清除筛选后即可查看。",
+          });
+          return;
+        }
+        if (status === "stale-list") {
+          if (targetRefreshRequested.current !== targetItemID) {
+            targetRefreshRequested.current = targetItemID;
+            onChanged();
+          }
+          setTargetNotice({
+            tone: "warning",
+            text: "该审批条目存在于全量队列，但当前列表尚未刷新；已请求刷新，请稍后查看。",
+          });
+          return;
+        }
+        setTargetNotice({
+          tone: "error",
+          text: "该审批条目已不在队列中（可能已处理或删除）。",
+        });
+      })
+      .catch((caught: unknown) => {
+        if (cancelled || requestID.current !== generation) return;
+        targetHandled.current = markTargetCheck(key, generation);
+        setTargetNotice({
+          tone: "error",
+          text: `无法核对目标审批条目：${errorMessage(caught)}`,
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [targetItemID, filterKey, loading, filterPending, items, hasFilters, onChanged]);
+
+  useEffect(() => {
     if (!selected) return;
-    setEditTitle(selected.suggestion?.proposedTitle ?? selected.title);
-    setEditText(selected.suggestion?.proposedText ?? selected.text);
-    setNote("");
-  }, [selected?.id, selected?.suggestion?.id]);
+    const existing = draftsRef.current[selected.id];
+    if (existing) {
+      // A dirty draft wins over the fresh server version; a conflict banner
+      // offers explicit discard or re-confirmation.
+      setEditTitle(existing.title);
+      setEditText(existing.text);
+      setNote(existing.note);
+      return;
+    }
+    const initial = initialQueueDraft(selected);
+    setEditTitle(initial.title);
+    setEditText(initial.text);
+    setNote(initial.note);
+  }, [
+    selected?.id,
+    selected?.suggestion?.id,
+    selected?.suggestion?.proposedTitle,
+    selected?.suggestion?.proposedText,
+    selected?.updatedAt,
+    selected?.title,
+    selected?.text,
+  ]);
+
+  const draftsDirty = hasDirtyQueueDrafts(drafts);
+  useEffect(() => {
+    onDirtyChange?.(draftsDirty);
+  }, [draftsDirty, onDirtyChange]);
+  useEffect(
+    () => () => {
+      onDirtyChange?.(false);
+    },
+    [onDirtyChange],
+  );
+
+  // Only our own defer/resume may auto-rebaseline a draft, and only after the
+  // reloaded item proves exactly the version the server returned.
+  useEffect(() => {
+    if (!selected) return;
+    const expectation = deferExpectations.current[selected.id];
+    if (!expectation) return;
+    const outcome = resolveDeferRebase({
+      expectation,
+      draft: draftsRef.current[selected.id],
+      current: selected,
+    });
+    if (outcome.action === "rebase") {
+      delete deferExpectations.current[selected.id];
+      syncDrafts(storeQueueDraft(draftsRef.current, outcome.draft));
+      return;
+    }
+    if (outcome.action === "none" || outcome.action === "conflict") {
+      delete deferExpectations.current[selected.id];
+    }
+  }, [selected, drafts]);
+
+  function syncDrafts(next: QueueDrafts) {
+    draftsRef.current = next;
+    setDrafts(next);
+  }
+
+  function editDraft(field: "title" | "text" | "note", value: string) {
+    if (!selected) return;
+    const base = draftsRef.current[selected.id] ?? initialQueueDraft(selected);
+    const nextDraft: QueueDraft = { ...base, [field]: value };
+    syncDrafts(storeQueueDraft(draftsRef.current, nextDraft));
+    if (field === "title") setEditTitle(value);
+    else if (field === "text") setEditText(value);
+    else setNote(value);
+  }
+
+  function discardSelectedDraft() {
+    if (!selected) return;
+    syncDrafts(discardQueueDraft(draftsRef.current, selected.id));
+    const initial = initialQueueDraft(selected);
+    setEditTitle(initial.title);
+    setEditText(initial.text);
+    setNote(initial.note);
+    setMessage("已放弃草稿，改用当前版本。");
+  }
+
+  function rebaselineSelectedDraft() {
+    if (!selected) return;
+    const draft = draftsRef.current[selected.id];
+    if (!draft) return;
+    const rebased = rebaselineQueueDraft(draft, selected);
+    if (!rebased) {
+      setError(
+        "无法按当前版本重新确认草稿（缺少 decisionVersion 或条目 ID 不一致），草稿仍保留。",
+      );
+      return;
+    }
+    syncDrafts(storeQueueDraft(draftsRef.current, rebased));
+    setMessage("草稿已按当前版本重新确认；提交前请复核内容。");
+  }
+
+  async function discardOrphanDraft() {
+    if (!selectedId) return;
+    const ok = await confirmAction({
+      title: "放弃这份草稿？",
+      message: "该审批条目已不在当前列表，放弃后草稿内容无法恢复。",
+      confirmLabel: "放弃草稿",
+      danger: true,
+    });
+    if (!ok) return;
+    syncDrafts(discardQueueDraft(draftsRef.current, selectedId));
+    setSelectedId(null);
+    setMessage("已放弃离开队列条目的草稿。");
+  }
 
   async function generate(id: string) {
     requested.current.add(id);
@@ -209,7 +540,11 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
       setItems((current) =>
         current.map((item) =>
           item.id === id
-            ? { ...item, suggestion: result, suggestionState: "ready" }
+            ? {
+                ...item,
+                suggestion: result,
+                suggestionState: result.validation.ok ? "ready" : "failed",
+              }
             : item,
         ),
       );
@@ -224,6 +559,26 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
 
   async function act(action: Action) {
     if (!selected) return;
+    if (decisionUnknownLocked) {
+      setError("该条目上次提交结果未知；请先刷新核对并解除锁定，再重新操作。");
+      return;
+    }
+    if (!decisionVersionReady) {
+      setError("该审批条目缺少 decisionVersion，已停止提交；请刷新队列后重试。");
+      return;
+    }
+    if (draftConflict) {
+      setError("草稿对应的条目或建议已更新；请先丢弃草稿或按当前版本重新确认。");
+      return;
+    }
+    const snapshot = decisionSnapshotOf(selected, {
+      title: editTitle,
+      text: editText,
+      note,
+    });
+    // Bind the draft object that exists at submit time. Reading it after the
+    // await could bind a replacement object created while the request runs.
+    const submittedDraft = draftsRef.current[snapshot.itemID];
     if (action === "apply_suggestion") {
       if (!suggestion || !canApply) return;
       if (selected.kind === "rule" || (selected.priority ?? 0) >= 85) {
@@ -243,6 +598,23 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
       });
       if (!ok) return;
     }
+    // The confirm dialog may be open while a refresh or an edit changes the
+    // item: abort before writing instead of submitting a different version.
+    const live = decisionInputsRef.current;
+    if (
+      !live.selected ||
+      !sameDecisionSnapshot(
+        snapshot,
+        decisionSnapshotOf(live.selected, {
+          title: live.title,
+          text: live.text,
+          note: live.note,
+        }),
+      )
+    ) {
+      setError("确认期间所选条目或内容已变化，已中止提交（未写入）。");
+      return;
+    }
     setBusy(true);
     setMessage("");
     setError("");
@@ -252,16 +624,55 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
         error?: string;
         target?: string;
         journalID?: string;
+        decisionVersion?: string;
+        item?: QueueItem;
       }>(`/api/queue/${selected.id}/decision`, {
         method: "POST",
         body: JSON.stringify({
           action,
-          title: editTitle,
-          text: editText,
-          note,
+          title: snapshot.title,
+          text: snapshot.text,
+          note: snapshot.note,
+          expectedVersion: snapshot.decisionVersion,
         }),
       });
-      if (!result.ok) throw new Error(result.error ?? "decision failed");
+      if (!result.ok) {
+        setError(result.error ?? "decision failed");
+        return;
+      }
+      const after = decisionInputsRef.current;
+      if (
+        after.selected?.id === snapshot.itemID &&
+        shouldClearConsumedDraft({
+          action,
+          itemID: snapshot.itemID,
+          draft: draftsRef.current[snapshot.itemID],
+          submitted: {
+            title: snapshot.title,
+            text: snapshot.text,
+            note: snapshot.note,
+          },
+          current: { title: after.title, text: after.text, note: after.note },
+        })
+      ) {
+        syncDrafts(discardQueueDraft(draftsRef.current, snapshot.itemID));
+      }
+      if (action === "defer" || action === "resume") {
+        const expectation = deferRebaseExpectation({
+          draft: submittedDraft,
+          itemID: snapshot.itemID,
+          oldVersion: snapshot.decisionVersion,
+          draftVersion: submittedDraft?.baseline.decisionVersion,
+          responseItemID: result.item?.id,
+          responseVersion: result.decisionVersion,
+        });
+        if (expectation) {
+          deferExpectations.current[snapshot.itemID] = expectation;
+        } else {
+          delete deferExpectations.current[snapshot.itemID];
+        }
+      }
+      setPendingDecision(null);
       setMessage(
         action === "apply_suggestion"
           ? result.journalID
@@ -273,7 +684,16 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
       );
       onChanged();
     } catch (caught: unknown) {
-      setError(errorMessage(caught));
+      if (caught instanceof ApiError && caught.status >= 400 && caught.status < 500) {
+        // The server answered with a rejection; the transaction did not write.
+        setError(errorMessage(caught));
+      } else {
+        setPendingDecision({ itemID: snapshot.itemID, action });
+        setError(
+          `提交结果未知：${errorMessage(caught)}。请先刷新队列核对；核对前不会重复提交。该核对标记仅保存在当前页面，刷新页面或断开连接后会丢失。`,
+        );
+        onChanged();
+      }
     } finally {
       setBusy(false);
     }
@@ -281,6 +701,14 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
 
   async function promoteSelected(targetScope: "project" | "global") {
     if (!selected) return;
+    if (decisionUnknownLocked) {
+      setError("该条目上次提交结果未知；请先刷新核对并解除锁定，再重新操作。");
+      return;
+    }
+    if (!decisionVersionReady) {
+      setError("该审批条目缺少 decisionVersion，已停止提交；请刷新队列后重试。");
+      return;
+    }
     if (targetScope === "project" && !selected.projectKey) {
       setError("该条目缺少 projectKey，无法保存到项目");
       return;
@@ -290,6 +718,14 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
       setError("task-only 候选不能提升为全局");
       return;
     }
+    const snapshot = decisionSnapshotOf(selected, {
+      title: editTitle,
+      text: editText,
+      note,
+    });
+    // Bind the draft object that exists at submit time. Reading it after the
+    // await could bind a replacement object created while the request runs.
+    const submittedDraft = draftsRef.current[snapshot.itemID];
     {
       const ok = await confirmAction({
         title: targetScope === "global" ? "提升为全局？" : "保存到项目？",
@@ -297,6 +733,21 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
         confirmLabel: targetScope === "global" ? "提升" : "保存到项目",
       });
       if (!ok) return;
+    }
+    const live = decisionInputsRef.current;
+    if (
+      !live.selected ||
+      !sameDecisionSnapshot(
+        snapshot,
+        decisionSnapshotOf(live.selected, {
+          title: live.title,
+          text: live.text,
+          note: live.note,
+        }),
+      )
+    ) {
+      setError("确认期间所选条目或内容已变化，已中止提交（未写入）。");
+      return;
     }
     setBusy(true);
     setMessage("");
@@ -310,14 +761,27 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
             action: "promote",
             targetScope,
             projectKey: selected.projectKey,
+            expectedVersion: snapshot.decisionVersion,
           }),
         },
       );
-      if (!result.ok) throw new Error(result.error ?? "promotion failed");
+      if (!result.ok) {
+        setError(result.error ?? "promotion failed");
+        return;
+      }
+      setPendingDecision(null);
       setMessage(targetScope === "global" ? "已提升为全局" : "已保存到项目");
       onChanged();
     } catch (caught: unknown) {
-      setError(errorMessage(caught));
+      if (caught instanceof ApiError && caught.status >= 400 && caught.status < 500) {
+        setError(errorMessage(caught));
+      } else {
+        setPendingDecision({ itemID: snapshot.itemID, action: "promote" });
+        setError(
+          `提交结果未知：${errorMessage(caught)}。请先刷新队列核对；核对前不会重复提交。该核对标记仅保存在当前页面，刷新页面或断开连接后会丢失。`,
+        );
+        onChanged();
+      }
     } finally {
       setBusy(false);
     }
@@ -383,12 +847,7 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
     setMessage("");
     setError("");
     try {
-      const preview = await api<{
-        dryRun: boolean;
-        eligible: Array<{ id: string; title: string; action?: string; confidence?: number }>;
-        skipped: number;
-        capped: number;
-      }>("/api/queue/batch", {
+      const response = await api<unknown>("/api/queue/batch", {
         method: "POST",
         body: JSON.stringify({
           ids,
@@ -398,39 +857,92 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
           dryRun: true,
         }),
       });
-      if (preview.eligible.length === 0) {
+      const parsed = parseBatchPreview(response, ids);
+      if (!parsed.ok) {
+        setBatchPreview(null);
+        setError(`批量预览不可用：${parsed.reason}。未执行任何条目。`);
+        return;
+      }
+      setBatchPreview(parsed.preview);
+      if (parsed.preview.eligible.length === 0) {
         setMessage(
-          `没有可批量批准的条目（规则、低集中度、缺少建议会被跳过；跳过 ${preview.skipped} 条）。`,
+          `没有可批量应用的条目（跳过 ${parsed.preview.skipped} 条，超限 ${parsed.preview.capped} 条）；未执行任何条目。`,
         );
         return;
       }
-      const ok = await confirmAction({
-        title: "批量应用建议？",
-        message: `将应用 ${preview.eligible.length} 条建议（最多 10 条，跳过 ${preview.skipped} 条，超出 ${preview.capped} 条）。`,
-        confirmLabel: "应用",
-      });
-      if (!ok) return;
-      const result = await api<{ results: Array<{ id: string; ok: boolean; error?: string }> }>(
-        "/api/queue/batch",
-        {
-          method: "POST",
-          body: JSON.stringify({
-            ids: preview.eligible.map((entry) => entry.id),
-            action: "apply_suggestion",
-            max: 10,
-            dryRun: false,
-          }),
-        },
-      );
-      const failed = result.results.filter((entry) => !entry.ok);
       setMessage(
-        `已应用 ${result.results.length - failed.length} 条${failed.length ? `，失败 ${failed.length} 条` : ""}。`,
+        `批量预览已生成：将执行 ${parsed.preview.eligible.length} 条（跳过 ${parsed.preview.skipped} 条，超限 ${parsed.preview.capped} 条）。请核对下方明细后确认。`,
       );
-      if (failed.length > 0) setError(failed.map((entry) => entry.error).filter(Boolean).join("; "));
-      setSelectedIds(new Set());
+    } catch (caught: unknown) {
+      setBatchPreview(null);
+      setError(`无法获取批量预览：${errorMessage(caught)}。未执行任何条目。`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function cancelBatchPreview() {
+    setBatchPreview(null);
+    setMessage("已取消批量执行，未提交任何条目。");
+    setError("");
+  }
+
+  async function confirmBatchExecution() {
+    const preview = batchPreview;
+    if (!preview || preview.eligible.length === 0) return;
+    setBatchPreview(null);
+    const ids = preview.eligible.map((entry) => entry.id);
+    const scope: BatchRequestScope = {
+      ids,
+      previewID: preview.previewID,
+      skipped: preview.skippedItems,
+      capped: preview.cappedItems,
+    };
+    const labels: Record<string, string> = {};
+    for (const entry of preview.eligible) {
+      labels[entry.id] = entry.proposedTitle || entry.title;
+    }
+    setBatchLabels(labels);
+    setBusy(true);
+    setMessage("");
+    setError("");
+    try {
+      const response = await api<unknown>("/api/queue/batch", {
+        method: "POST",
+        body: JSON.stringify(buildBatchExecution(preview)),
+      });
+      const resultsRaw =
+        typeof response === "object" && response !== null && "results" in response
+          ? response.results
+          : undefined;
+      const parsed = parseBatchResults(resultsRaw);
+      if (!parsed.ok) {
+        setBatchReport(unknownSubmissionReport(scope, parsed.reason));
+        setSelectedIds(new Set());
+        onChanged();
+        return;
+      }
+      const report = summarizeBatchResults(scope, parsed.results);
+      setBatchReport(report);
+      setSelectedIds(new Set(report.retryIds));
       onChanged();
     } catch (caught: unknown) {
-      setError(errorMessage(caught));
+      const code = caught instanceof ApiError ? caught.code : undefined;
+      if (classifyBatchSubmitFailure(code) === "not-submitted") {
+        // The server explicitly rejected the preview before executing: nothing
+        // was written, so the selection can be kept for a fresh preview.
+        setBatchReport(null);
+        setMessage(
+          "服务端拒绝该预览（可能已过期），未提交任何条目；请重新选择后再次预览。",
+        );
+        setError("");
+        return;
+      }
+      // A lost response cannot prove the request was not applied: keep the
+      // batch size, ask for a refresh, and never mark it for blind retry.
+      setBatchReport(unknownSubmissionReport(scope, errorMessage(caught)));
+      setSelectedIds(new Set());
+      onChanged();
     } finally {
       setBusy(false);
     }
@@ -449,16 +961,35 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
     setBusy(true);
     setMessage("");
     setError("");
+    const labels: Record<string, string> = {};
+    for (const item of items) {
+      if (ids.includes(item.id)) labels[item.id] = item.title;
+    }
+    setBatchLabels(labels);
     try {
-      await api("/api/queue/batch", {
+      const response = await api<unknown>("/api/queue/batch", {
         method: "POST",
         body: JSON.stringify({ ids, decision: { action: "deny" } }),
       });
-      setSelectedIds(new Set());
-      setMessage(`已拒绝 ${ids.length} 条`);
+      const resultsRaw =
+        typeof response === "object" && response !== null && "results" in response
+          ? response.results
+          : undefined;
+      const parsed = parseBatchResults(resultsRaw);
+      if (!parsed.ok) {
+        setBatchReport(unknownSubmissionReport({ ids }, parsed.reason));
+        setSelectedIds(new Set());
+        onChanged();
+        return;
+      }
+      const report = summarizeBatchResults({ ids }, parsed.results);
+      setBatchReport(report);
+      setSelectedIds(new Set(report.retryIds));
       onChanged();
     } catch (caught: unknown) {
-      setError(errorMessage(caught));
+      setBatchReport(unknownSubmissionReport({ ids }, errorMessage(caught)));
+      setSelectedIds(new Set());
+      onChanged();
     } finally {
       setBusy(false);
     }
@@ -474,9 +1005,10 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
         method: "POST",
         body: JSON.stringify({ sessionID: latestReview.sessionID }),
       });
+      const counts = result.record ? reviewCountsView(result.record) : undefined;
       setMessage(
-        result.record?.status === "failed" ? `复盘未完成：${result.record.error ?? "模型不可用，请稍后重试"}` : result.record
-          ? `复盘完成：${result.record.candidates} 条候选，${result.record.queued ?? 0} 条入队。`
+        result.record?.status === "failed" ? `复盘未完成：${result.record.error ?? "模型不可用，请稍后重试"}` : counts
+          ? `复盘完成：提取 ${counts.candidates ?? "未知"} 条候选，生成 ${counts.hooksCreated ?? "未知"} 个待处理候选（未必进入审批队列）。`
           : result.reason ?? "没有可复盘的新内容。",
       );
       onChanged();
@@ -499,10 +1031,7 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
   }
 
   const highCount = displayItems.filter((item) => (item.priority ?? 0) >= 75).length;
-  const latestSkipped =
-    latestReview && typeof latestReview.queued === "number"
-      ? Math.max(0, latestReview.candidates - latestReview.queued - latestReview.dropped)
-      : 0;
+  const reviewView = latestReview ? reviewCountsView(latestReview) : undefined;
   const ruleCount = displayItems.filter((item) => item.kind === "rule").length;
   const allSelected =
     displayItems.length > 0 && displayItems.every((item) => selectedIds.has(item.id));
@@ -513,6 +1042,22 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
     );
   }
 
+  function selectQueueItem(id: string) {
+    if (targetItemID) consumedTarget.current = consumeTarget(targetItemID);
+    setSelectedId(id);
+  }
+
+  function batchEntryLabel(id: string): string {
+    const label = batchLabels[id];
+    const short = shortItemID(id);
+    return label ? `${label}（${short}）` : short || id;
+  }
+
+  function unlockPendingDecision() {
+    setPendingDecision(null);
+    setMessage("已解除该条目的提交锁定；请先确认服务端实际结果，再决定是否重新操作。");
+  }
+
   function toggleOne(id: string) {
     const next = new Set(selectedIds);
     if (next.has(id)) next.delete(id);
@@ -520,35 +1065,48 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
     setSelectedIds(next);
   }
 
-  const hasFilters = Boolean(kind || scope || query || originFilter);
+  const scopeView = queueScopeView(
+    displayItems.length,
+    globalQueueTotal(globalQueueCount),
+    hasFilters,
+  );
 
   function clearFilters() {
-    setKind("");
-    setScope("");
-    setOriginFilter("");
-    setQueryInput("");
-    setQuery("");
+    const empty = emptyQueueFilters();
+    setKind(empty.kind);
+    setScope(empty.scope);
+    setProjectKey(empty.projectKey);
+    setOriginFilter(empty.originFilter);
+    setQueryInput(empty.queryInput);
+    setQuery(empty.query);
   }
 
   return (
     <div>
-      {turn?.turnID ? (
+      {turn?.turnID && turnView ? (
         <section className="turn-review">
           <div className="turn-review-main">
             <span className="turn-kicker">Turn Review</span>
-            <strong>本轮捕获 {turn.counts.captured} 条</strong>
+            <strong>本轮捕获 {turnView.captured === null ? "未知" : turnView.captured} 条</strong>
             <span className="turn-counts">
-              <span className="ok">自动 {turn.counts.auto}</span>
-              <span className="warn">待审 {turn.counts.queue}</span>
-              <span>Shadow {turn.counts.shadow}</span>
-              <span>忽略 {turn.counts.ignored}</span>
-              {turn.counts.pending > 0 ? (
-                <span>处理中 {turn.counts.pending}</span>
-              ) : null}
-              {turn.counts.failed > 0 ? (
-                <span className="sev-error">失败 {turn.counts.failed}</span>
-              ) : null}
+              {turnView.entries.map((entry) => (
+                <span
+                  key={entry.status}
+                  className={
+                    entry.status === "failed"
+                      ? "sev-error"
+                      : entry.status === "blocked"
+                        ? "warn"
+                        : ""
+                  }
+                >
+                  {entry.label} {entry.count === null ? "未知" : entry.count}
+                </span>
+              ))}
             </span>
+            {turnView.note ? (
+              <span className="muted small">{turnView.note}</span>
+            ) : null}
           </div>
           <div className="turn-review-actions">
             <button
@@ -599,16 +1157,22 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
               </span>
             ) : latestReview.status === "scheduled" ? (
               <span className="review-counts">已排期，等待会话安静</span>
-            ) : latestReview.status === "skipped" ? null : (
+            ) : latestReview.status === "skipped" ? null : reviewView ? (
               <span className="review-counts">
-                <span className="ok">入队 {latestReview.queued ?? 0}</span>
-                <span>提取 {latestReview.candidates}</span>
-                <span>丢弃 {latestReview.dropped}</span>
-                {latestSkipped > 0 ? <span>跳过 {latestSkipped}</span> : null}
-                {typeof latestReview.chars === "number" ? <span>{latestReview.chars} 字</span> : null}
+                {reviewView.segments.map((segment) => (
+                  <span
+                    key={segment.label}
+                    className={segment.label === "生成候选" ? "ok" : ""}
+                    title={
+                      segment.label === "生成候选" ? reviewView.note : undefined
+                    }
+                  >
+                    {segment.label} {segment.value === null ? "未知" : segment.value}
+                  </span>
+                ))}
                 {latestReview.model ? <span className="mono">{latestReview.model}</span> : null}
               </span>
-            )}
+            ) : null}
             {latestReview.status === "skipped" ? (
               <p className="review-summary">
                 {latestReview.note ?? "本次没有新的可沉淀内容"}
@@ -711,14 +1275,53 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
       ) : null}
 
       <div className="kpis">
-        <div className="kpi" title="当前筛选下的候选数；侧栏徽标显示全部待审">
-          <span>当前筛选</span>
-          <b className="warn">{displayItems.length}</b>
+        <div className="kpi" title="仅统计当前筛选结果，不代表全部待审">
+          <span>{scopeView.visibleLabel}</span>
+          <b className="warn">{scopeView.visible}</b>
+        </div>
+        <div className="kpi" title="来自 App 定期获取的 /api/metrics 快照（该接口会写入指标文件）；不可用时显示未知">
+          <span>{scopeView.globalLabel}</span>
+          <b>{scopeView.global === null ? "未知" : scopeView.global}</b>
         </div>
         <div className="kpi"><span>高优先级</span><b className="warn">{highCount}</b></div>
         <div className="kpi"><span>规则类</span><b>{ruleCount}</b></div>
         <div className="kpi"><span>已选</span><b>{selectedIds.size}</b></div>
       </div>
+
+      {targetNotice ? (
+        <div
+          className={`banner ${targetNotice.tone === "error" ? "error" : ""}`}
+          role="status"
+        >
+          {targetNotice.text}
+        </div>
+      ) : null}
+
+      {pendingDecision ? (
+        <div className="banner error" role="status">
+          条目 {shortItemID(pendingDecision.itemID)} 的 {pendingDecision.action} 提交结果未知；请先刷新核对服务端结果，核对前不会重复提交。该标记仅保存在当前页面，刷新页面或断开连接后会丢失。
+          <button className="btn" type="button" onClick={unlockPendingDecision}>
+            已核对结果，解除提交锁定
+          </button>
+        </div>
+      ) : null}
+
+      {orphanDraftIDs.length > 0 ? (
+        <div className="banner" role="status">
+          有 {orphanDraftIDs.length} 条未保存草稿对应的审批条目不在当前列表中：
+          {orphanDraftIDs.map((id) => (
+            <button
+              className="btn"
+              key={id}
+              type="button"
+              title={id}
+              onClick={() => selectQueueItem(id)}
+            >
+              查看草稿 {id.slice(0, 8)}…
+            </button>
+          ))}
+        </div>
+      ) : null}
 
       {message ? (
         <div className="banner ok" role="status">
@@ -729,6 +1332,182 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
         <div className="banner error" role="alert">
           {error}
         </div>
+      ) : null}
+      {baseline && baseline.state !== "ready" ? (
+        <div className="banner warning" role="status">
+          基线索引{baseline.state === "unavailable" ? "不可用" : baseline.state === "partial" ? "部分可用" : "为空"}：
+          覆盖提示可能不完整，未匹配不等于未覆盖。
+          {baseline.sections > 0 ? ` 已索引 ${baseline.sections} 个段落。` : ""}
+        </div>
+      ) : null}
+
+      {batchPreview ? (
+        <section className="panel" aria-label="批量执行确认">
+          <div className="panel-head">
+            <h2>批量执行确认</h2>
+            <span className="muted small mono" title={batchPreview.previewID}>
+              预览 {batchPreview.previewID.slice(0, 12)}
+            </span>
+          </div>
+          <div className="detail-body">
+            <p className="muted small" style={{ margin: 0 }}>
+              执行清单已与服务端预览绑定；取消不会提交任何条目。
+            </p>
+            {batchPreview.eligible.length === 0 ? (
+              <div className="empty">没有可执行的条目。</div>
+            ) : (
+              <ol style={{ margin: 0, paddingLeft: 20, display: "grid", gap: 12 }}>
+                {batchPreview.eligible.map((entry) => (
+                  <li key={entry.id}>
+                    <div className="chips">
+                      <span className="badge success">
+                        {ACTION_LABEL[entry.action] ?? entry.action}
+                      </span>
+                      <span className="chip">
+                        {Math.round(entry.confidence * 100)}% 集中度
+                      </span>
+                      <span className="chip project-chip" title={entry.projectKey}>
+                        项目：{projectLabel(entry.projectKey)}
+                      </span>
+                      <span className="chip" title={entry.id}>
+                        ID {shortItemID(entry.id)}
+                      </span>
+                    </div>
+                    <div>
+                      <strong>{entry.title}</strong>
+                    </div>
+                    <div className="muted small">建议标题：{entry.proposedTitle}</div>
+                    <div className="diff" style={{ marginTop: 4, whiteSpace: "pre-wrap" }}>
+                      {entry.proposedText}
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            )}
+            {batchPreview.skippedItems.length > 0 ? (
+              <div>
+                <span className="badge warning">跳过 {batchPreview.skipped} 条</span>
+                <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
+                  {batchPreview.skippedItems.map((entry) => (
+                    <li key={entry.id}>
+                      {entry.title ?? entry.id}（{shortItemID(entry.id)}）：{entry.reason}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {batchPreview.cappedItems.length > 0 ? (
+              <div>
+                <span className="badge">超限 {batchPreview.capped} 条</span>
+                <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
+                  {batchPreview.cappedItems.map((entry) => (
+                    <li key={entry.id}>
+                      {entry.title ?? entry.id}（{shortItemID(entry.id)}）：{entry.reason}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            <div className="actions">
+              <button
+                className="btn primary"
+                type="button"
+                disabled={busy || batchPreview.eligible.length === 0}
+                onClick={() => void confirmBatchExecution()}
+              >
+                确认执行 {batchPreview.eligible.length} 条
+              </button>
+              <button className="btn" type="button" disabled={busy} onClick={cancelBatchPreview}>
+                取消
+              </button>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {batchReport ? (
+        <section className="panel" aria-label="批量执行结果">
+          <div className="panel-head">
+            <h2>批量执行结果</h2>
+            <span className={`badge ${batchStatusTone(batchReport.status)}`}>
+              {BATCH_STATUS_LABEL[batchReport.status]}
+            </span>
+          </div>
+          <div className="detail-body">
+            <div>{batchReport.message}</div>
+            {batchReport.succeeded.length > 0 ? (
+              <div className="chips">
+                {batchReport.succeeded.map((id) => (
+                  <span className="chip" key={id}>
+                    ✓ {batchEntryLabel(id)}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+            {batchReport.failed.length > 0 ? (
+              <div>
+                <span className="badge error">失败 {batchReport.failed.length} 条</span>
+                <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
+                  {batchReport.failed.map((entry) => (
+                    <li key={entry.id}>
+                      {batchEntryLabel(entry.id)}：{entry.error ?? "处理失败"}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {batchReport.unresolved.length > 0 ? (
+              <div className="banner error" style={{ margin: 0 }}>
+                <strong>状态未知：{batchReport.unresolved.length} 条未确认最终结果。</strong>
+                <div>
+                  请刷新队列核对后再决定是否重新提交；在核对完成前不要重新提交这些条目。
+                </div>
+                <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
+                  {batchReport.unresolved.map((id) => (
+                    <li key={id}>{batchEntryLabel(id)}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {batchReport.skipped.length > 0 ? (
+              <div>
+                <span className="badge warning">跳过 {batchReport.skipped.length} 条</span>
+                <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
+                  {batchReport.skipped.map((entry) => (
+                    <li key={entry.id}>
+                      {entry.title ?? entry.id}（{shortItemID(entry.id)}）：{entry.reason}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {batchReport.capped.length > 0 ? (
+              <div>
+                <span className="badge">超限 {batchReport.capped.length} 条</span>
+                <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
+                  {batchReport.capped.map((entry) => (
+                    <li key={entry.id}>
+                      {entry.title ?? entry.id}（{shortItemID(entry.id)}）：{entry.reason}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {batchReport.error ? (
+              <div className="muted small">{batchReport.error}</div>
+            ) : null}
+            {batchReport.retryIds.length > 0 ? (
+              <div className="muted small">
+                已选中 {batchReport.retryIds.length} 条失败项，可在上方复核后单独处理；跳过与超限项未选中。
+              </div>
+            ) : null}
+            <div className="actions">
+              <button className="btn" type="button" onClick={() => setBatchReport(null)}>
+                关闭结果
+              </button>
+            </div>
+          </div>
+        </section>
       ) : null}
 
       <div className="queue-layout">
@@ -833,7 +1612,7 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                     data-queue-id={item.id}
                     className={item.id === selectedId ? "selected" : ""}
                     aria-current={item.id === selectedId}
-                    onClick={() => setSelectedId(item.id)}
+                    onClick={() => selectQueueItem(item.id)}
                   >
                     <td onClick={(event) => event.stopPropagation()}>
                       <label className="queue-check">
@@ -854,11 +1633,12 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                     <td><span className="badge">{item.kind}</span></td>
                     <td>
                       <div className="candidate-title">
-                        <button className="candidate-open" type="button" disabled={filterPending || queueError} aria-label={`查看 ${item.title}，项目归属 ${item.project ?? item.projectKey ?? "无"}`} onClick={() => setSelectedId(item.id)}>{item.title}</button>
+                        <button className="candidate-open" type="button" disabled={filterPending || queueError} aria-label={`查看 ${item.title}，项目归属 ${item.project ?? item.projectKey ?? "无"}`} onClick={() => selectQueueItem(item.id)}>{item.title}</button>
                         <span className="chip project-chip" title={item.project ?? item.projectKey}>{item.project?.split(/[\\/]/).filter(Boolean).at(-1) ?? item.projectKey ?? "无项目归属"}</span>
                         {item.origin === "session-review" ? (
                           <span className="chip review-chip">复盘</span>
                         ) : null}
+                        <CoverageChip coverage={item.coverage} />
                       </div>
                       <div className="muted" style={{ fontSize: "0.66rem", marginTop: 2 }}>
                         {item.reason}
@@ -866,8 +1646,23 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                     </td>
                     <td>
                       {item.suggestion ? (
-                        <span className={`badge ${item.suggestion.validation.ok ? "success" : "warning"}`}>
-                          {ACTION_LABEL[item.suggestion.action]}
+                        <span
+                          className={`badge ${
+                            item.suggestionState === "failed"
+                              ? "warning"
+                              : item.suggestion.validation.ok
+                                ? "success"
+                                : "warning"
+                          }`}
+                          title={
+                            item.suggestionState === "failed"
+                              ? item.suggestionError
+                              : undefined
+                          }
+                        >
+                          {item.suggestionState === "failed"
+                            ? "建议失败"
+                            : ACTION_LABEL[item.suggestion.action]}
                         </span>
                       ) : item.suggestionState === "pending" ? (
                         <span className="badge warning">生成中</span>
@@ -905,11 +1700,130 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
         </section>
 
         <aside className="panel detail" ref={detailRef} tabIndex={-1} aria-label="候选详情">
-          {!selected ? (
+          {!selected && orphanDraft ? (
+            <div className="detail-body">
+              <h2>草稿已保留</h2>
+              <div className="banner error" role="status">
+                该审批条目不在当前筛选结果中（可能被筛选隐藏或已离开队列）。草稿不会自动提交；可复制内容后明确放弃。
+              </div>
+              {pendingDecision && pendingDecision.itemID === selectedId ? (
+                <div className="banner error" role="alert">
+                  该条目上次提交结果未知（{pendingDecision.action}），请先核对服务端结果再决定；核对标记仅保存在当前页面。
+                  <div className="actions">
+                    <button
+                      className="btn"
+                      type="button"
+                      onClick={unlockPendingDecision}
+                    >
+                      已核对结果，解除提交锁定
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+              <div className="field">
+                <label>标题</label>
+                <textarea
+                  className="textarea"
+                  readOnly
+                  aria-label="保留的草稿标题"
+                  value={orphanDraft.title}
+                  style={{ minHeight: 44 }}
+                />
+              </div>
+              <div className="field">
+                <label>建议正文</label>
+                <textarea
+                  className="textarea"
+                  readOnly
+                  aria-label="保留的草稿正文"
+                  value={orphanDraft.text}
+                  style={{ minHeight: 96 }}
+                />
+              </div>
+              <div className="field">
+                <label>备注</label>
+                <textarea
+                  className="textarea"
+                  readOnly
+                  aria-label="保留的草稿备注"
+                  value={orphanDraft.note}
+                  style={{ minHeight: 44 }}
+                />
+              </div>
+              <div className="actions">
+                <button
+                  className="btn danger"
+                  type="button"
+                  onClick={() => void discardOrphanDraft()}
+                >
+                  放弃草稿
+                </button>
+              </div>
+            </div>
+          ) : !selected ? (
             <div className="empty">选择左侧一条候选，查看 AI 合并建议、优先级分解和操作。</div>
           ) : (
             <fieldset className="detail-body" disabled={busy || filterPending || queueError}>
               <h2>{selected.title}</h2>
+              {draftConflict ? (
+                <div className="banner error" style={{ margin: 0 }} role="alert">
+                  <strong>
+                    {draftConflict === "suggestion-changed"
+                      ? "AI 建议已更新"
+                      : draftConflict === "item-mismatch"
+                        ? "草稿与当前审批条目不一致"
+                        : draftConflict === "version-missing"
+                          ? "缺少服务端决策版本，无法确认草稿版本"
+                          : draftConflict === "version-changed"
+                            ? "服务端决策版本已变化"
+                            : "审批条目已更新"}
+                    ：草稿仍保留，未应用到新版本。
+                  </strong>
+                  <div className="actions">
+                    <button
+                      className="btn"
+                      type="button"
+                      disabled={busy}
+                      onClick={discardSelectedDraft}
+                    >
+                      丢弃草稿，使用当前版本
+                    </button>
+                    <button
+                      className="btn"
+                      type="button"
+                      disabled={busy}
+                      onClick={rebaselineSelectedDraft}
+                    >
+                      保留草稿并按当前版本重新确认
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+              {!decisionVersionReady ? (
+                <div className="banner error" style={{ margin: 0 }} role="alert">
+                  该审批条目缺少 decisionVersion，无法安全提交；请刷新队列后再操作。
+                </div>
+              ) : null}
+              {decisionUnknownLocked && pendingDecision ? (
+                <div className="banner error" style={{ margin: 0 }} role="alert">
+                  <strong>
+                    该条目上次提交结果未知（{pendingDecision.action}）。
+                  </strong>
+                  <div>
+                    请先刷新队列核对服务端实际结果；核对前不会重复提交。该核对标记仅保存在当前页面，刷新页面或断开连接后会丢失。
+                  </div>
+                  <div className="actions">
+                    <button
+                      className="btn"
+                      type="button"
+                      disabled={busy}
+                      onClick={unlockPendingDecision}
+                    >
+                      已核对结果，解除提交锁定
+                    </button>
+                  </div>
+                </div>
+              ) : null}
               <div className="chips">
                 <span className="chip">{selected.kind}</span>
                 <span className="chip">{SCOPE_LABEL[selected.scope] ?? selected.scope}</span>
@@ -924,17 +1838,81 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                   <span className="chip">seen {selected.seenCount}</span>
                 ) : null}
               </div>
+              <div className="field">
+                <label>审计关联</label>
+                {auditError ? (
+                  <span className="muted small">无法读取审计报告，暂不显示关联。</span>
+                ) : !auditReport ? (
+                  <span className="muted small">正在核对审计关联…</span>
+                ) : relatedFindings.length === 0 ? (
+                  <span className="muted small">没有审计发现引用此审批条目。</span>
+                ) : (
+                  <div className="chips">
+                    {relatedFindings.map((finding) => (
+                      <a
+                        className="chip"
+                        key={finding.id}
+                        href={auditFindingLink(finding.id, auditReport.generatedAt)}
+                        title={`打开审计发现：${finding.title}`}
+                      >
+                        {finding.severity} · {finding.kind} · {finding.title}
+                      </a>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="field">
+                <label>重复 / 合并线索</label>
+                {duplicateClues?.available ? (
+                  <div>
+                    <div className="chips">
+                      <span className="badge info">{duplicateClues.label}</span>
+                    </div>
+                    <div className="chips">
+                      {duplicateClues.clues.map((clue) => (
+                        <span className="chip" key={`${clue.source}-${clue.kind}`}>
+                          {clue.text}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <span className="muted small">
+                    {duplicateClues?.emptyText ?? "未标注"}
+                  </span>
+                )}
+              </div>
+              <div className="field">
+                <label>基线覆盖</label>
+                {selected.coverage?.length ? (
+                  <div className="chips">
+                    {selected.coverage.map((entry) => (
+                      <span
+                        className={`chip${coverageTone(entry.relation) ? ` ${coverageTone(entry.relation)}` : ""}`}
+                        key={`${entry.sourceId}-${entry.line}`}
+                        title={entry.source}
+                      >
+                        {coverageLabel(entry.relation)} · {shortSource(entry.source)} › {entry.heading}:{entry.line}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <span className="muted small">
+                    未匹配到 L0/L2 基线；这不等于“未覆盖”，可能只是词面不同或索引不可用。
+                  </span>
+                )}
+              </div>
               <div className="muted" style={{ fontSize: "0.72rem", lineHeight: 1.5 }}>
                 {selected.reason}
               </div>
 
               <div className="actions" style={{ marginTop: 6 }}>
-                {selected.deferredUntil && Date.parse(selected.deferredUntil) > Date.now() ? <button className="btn" disabled={busy} onClick={() => void act("resume")}>取消延后</button> : null}
+                {selected.deferredUntil && Date.parse(selected.deferredUntil) > Date.now() ? <button className="btn" disabled={busy || decisionsBlocked} onClick={() => void act("resume")}>取消延后</button> : null}
                 {selected.scope === "session" && selected.kind !== "skill" ? (
                   <button
                     className="btn primary"
                     type="button"
-                    disabled={busy || !selected.projectKey}
+                    disabled={busy || !selected.projectKey || decisionsBlocked}
                     title={
                       selected.projectKey
                         ? "写入候选所属项目的长期记忆"
@@ -949,7 +1927,7 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                   <button
                     className="btn"
                     type="button"
-                    disabled={busy || selected.reason.includes("task-only")}
+                    disabled={busy || selected.reason.includes("task-only") || decisionsBlocked}
                     title={
                       selected.reason.includes("task-only")
                         ? "task-only 内容不能提升为全局"
@@ -1000,7 +1978,13 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
               ) : suggestion ? (
                 <div className="suggestion">
                   <div className="suggestion-head">
-                    <span className="badge success">AI 合并建议</span>
+                    <span
+                      className={`badge ${
+                        selected.suggestionState === "failed" ? "warning" : "success"
+                      }`}
+                    >
+                      {selected.suggestionState === "failed" ? "建议失败" : "AI 合并建议"}
+                    </span>
                     <span className="chip">{ACTION_LABEL[suggestion.action]}</span>
                     {suggestion.targetTitle ? (
                       <span className="muted small">目标：{suggestion.targetTitle}</span>
@@ -1019,7 +2003,8 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                       className="input"
                       value={editTitle}
                       aria-label="候选标题"
-                      onChange={(event) => setEditTitle(event.target.value)}
+                      disabled={suggestion.action === "reject_duplicate"}
+                      onChange={(event) => editDraft("title", event.target.value)}
                     />
                   </div>
                   <div className="field">
@@ -1028,7 +2013,8 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                       className="textarea"
                       value={editText}
                       aria-label="建议文本"
-                      onChange={(event) => setEditText(event.target.value)}
+                      disabled={suggestion.action === "reject_duplicate"}
+                      onChange={(event) => editDraft("text", event.target.value)}
                       style={{ minHeight: 96 }}
                     />
                   </div>
@@ -1049,6 +2035,11 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                       {suggestion.validation.errors.join("；")}
                     </div>
                   ) : null}
+                  {selected.suggestionState === "failed" && suggestion.validation.ok ? (
+                    <div className="banner warning" style={{ margin: 0 }}>
+                      上次生成失败：{selected.suggestionError ?? "未知原因"}。可重新生成，或直接编辑正文后应用。
+                    </div>
+                  ) : null}
                   {suggestion.dropped.length > 0 ? (
                     <div className="muted small">
                       已丢弃：{suggestion.dropped.map((drop) => `${drop.text}（${drop.reason}）`).join("；")}
@@ -1058,7 +2049,7 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                   <div className="actions">
                     <button
                       className="btn primary"
-                      disabled={busy || !canApply}
+                      disabled={busy || !canApply || decisionsBlocked}
                       onClick={() => void act("apply_suggestion")}
                       type="button"
                     >
@@ -1072,10 +2063,10 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                     >
                       重新生成
                     </button>
-                    <button className="btn" disabled={busy} onClick={() => void act("defer")} type="button">
+                    <button className="btn" disabled={busy || decisionsBlocked} onClick={() => void act("defer")} type="button">
                       延后 24 小时
                     </button>
-                    <button className="btn danger" disabled={busy} onClick={() => void act("deny")} type="button">
+                    <button className="btn danger" disabled={busy || decisionsBlocked} onClick={() => void act("deny")} type="button">
                       拒绝
                     </button>
                   </div>
@@ -1113,7 +2104,7 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                     <button className="btn primary" disabled={busy || generating} onClick={() => void generate(selected.id)} type="button">
                       生成建议
                     </button>
-                    <button className="btn" disabled={busy} onClick={() => void act("approve")} type="button">
+                    <button className="btn" disabled={busy || decisionsBlocked} onClick={() => void act("approve")} type="button">
                       作为新记忆批准
                     </button>
                   </div>
@@ -1139,10 +2130,10 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                 <>
                   <div className="diff">{selected.diff ?? `+ ${selected.text}`}</div>
                   <div className="actions">
-                    <button className="btn" disabled={busy} onClick={() => void act("defer")} type="button">
+                    <button className="btn" disabled={busy || decisionsBlocked} onClick={() => void act("defer")} type="button">
                       延后 24 小时
                     </button>
-                    <button className="btn danger" disabled={busy} onClick={() => void act("deny")} type="button">
+                    <button className="btn danger" disabled={busy || decisionsBlocked} onClick={() => void act("deny")} type="button">
                       拒绝
                     </button>
                   </div>
@@ -1155,7 +2146,7 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
                   className="input"
                   aria-label="审批备注"
                   value={note}
-                  onChange={(event) => setNote(event.target.value)}
+                  onChange={(event) => editDraft("note", event.target.value)}
                   placeholder="为什么这样处理"
                 />
               </div>
@@ -1169,6 +2160,56 @@ export function QueuePage({ refreshKey, onChanged }: Props) {
       </div>
     </div>
   );
+}
+
+function CoverageChip({ coverage }: { coverage: QueueItem["coverage"] }) {
+  if (!coverage?.length) return null;
+  const tone = coverageTone(coverage[0].relation);
+  return (
+    <span
+      className={`chip${tone ? ` ${tone}` : ""}`}
+      title={coverage.map((entry) => `${entry.source} › ${entry.heading}:${entry.line}`).join("\n")}
+    >
+      {coverageLabel(coverage[0].relation)}
+    </span>
+  );
+}
+
+function coverageLabel(relation: string): string {
+  if (relation === "exact" || relation === "covered") return "基线已覆盖";
+  if (relation === "conflict") return "基线冲突";
+  if (relation === "classification-mismatch") return "基线分类不一致";
+  if (relation === "partial") return "基线部分重合";
+  if (relation === "related") return "基线相关";
+  return "基线待确认";
+}
+
+function coverageTone(relation: string): string {
+  if (relation === "conflict") return "warn";
+  if (relation === "exact" || relation === "covered") return "ok";
+  return "";
+}
+
+function shortSource(source: string): string {
+  return source.split(/[\\/]/).filter(Boolean).slice(-2).join("/");
+}
+
+const BATCH_STATUS_LABEL: Record<BatchResultStatus, string> = {
+  ok: "全部成功",
+  partial: "部分失败",
+  failed: "全部失败",
+  unknown: "状态未知",
+};
+
+function batchStatusTone(status: BatchResultStatus): string {
+  if (status === "ok") return "success";
+  if (status === "partial") return "warning";
+  if (status === "unknown") return "info";
+  return "error";
+}
+
+function projectLabel(key: string): string {
+  return key.split(/[\\/]/).filter(Boolean).at(-1) ?? key;
 }
 
 function primaryLabel(action: Suggestion["action"], edited: boolean): string {

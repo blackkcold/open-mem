@@ -85,6 +85,220 @@ describe("rewrite validator", () => {
     expect(validation.ok).toBe(false);
   });
 
+  it("rejects a merge that drops the candidate's negation", () => {
+    const negated: RewriteInput = {
+      ...input,
+      candidate: {
+        title: "[P] nohup",
+        text: "不要使用 nohup 启动 dev server",
+        kind: "preference",
+        scope: "global",
+      },
+      target: {
+        id: "item_neg",
+        title: "[P] 启动",
+        text: "使用 nohup 启动 dev server",
+        kind: "preference",
+        scope: "global",
+      },
+    };
+    const validation = validateRewrite(negated, {
+      ...validOutput,
+      action: "merge",
+      text: "使用 nohup 启动 dev server。",
+      dropped: [],
+    });
+    expect(validation.ok).toBe(false);
+    expect(validation.errors.join(" ")).toContain("否定");
+  });
+
+  it("rejects a merge that flips a strict prohibition to permission", () => {
+    const prohibited: RewriteInput = {
+      ...input,
+      candidate: {
+        title: "[P] 允许",
+        text: "允许使用 nohup",
+        kind: "preference",
+        scope: "global",
+      },
+      target: {
+        id: "item_prohibit",
+        title: "[P] 严禁",
+        text: "严禁使用 nohup",
+        kind: "preference",
+        scope: "global",
+      },
+    };
+    const validation = validateRewrite(prohibited, {
+      ...validOutput,
+      action: "merge",
+      text: "允许使用 nohup。",
+      dropped: [],
+    });
+    expect(validation.ok).toBe(false);
+    expect(validation.errors.join(" ")).toContain("严禁");
+  });
+
+  it("rejects a merge that keeps one negation but drops another", () => {
+    const twoNegations: RewriteInput = {
+      ...input,
+      candidate: {
+        title: "[P] force push",
+        text: "禁止使用 force push",
+        kind: "preference",
+        scope: "global",
+      },
+      target: {
+        id: "item_nohup",
+        title: "[P] nohup",
+        text: "不要使用 nohup",
+        kind: "preference",
+        scope: "global",
+      },
+    };
+    const validation = validateRewrite(twoNegations, {
+      ...validOutput,
+      action: "merge",
+      text: "禁止使用 force push。",
+      dropped: [],
+    });
+    expect(validation.ok).toBe(false);
+    expect(validation.errors.join(" ")).toContain("不要");
+  });
+
+  it("rejects a merge that keeps one qualifier but drops another", () => {
+    const twoQualifiers: RewriteInput = {
+      ...input,
+      candidate: {
+        title: "[P] 测试",
+        text: "必须先运行测试",
+        kind: "preference",
+        scope: "global",
+      },
+      target: {
+        id: "item_prod",
+        title: "[P] 生产环境",
+        text: "只能在生产环境运行构建",
+        kind: "preference",
+        scope: "global",
+      },
+    };
+    const validation = validateRewrite(twoQualifiers, {
+      ...validOutput,
+      action: "merge",
+      text: "必须先运行测试。",
+      dropped: [],
+    });
+    expect(validation.ok).toBe(false);
+    expect(validation.errors.join(" ")).toContain("只能");
+  });
+
+  it("treats a changed prerelease version as a lost identifier", () => {
+    const versions: RewriteInput = {
+      ...input,
+      candidate: {
+        title: "[F] 版本",
+        text: "部署版本是 1.2.3-beta",
+        kind: "fact",
+        scope: "global",
+      },
+      target: {
+        id: "item_version",
+        title: "[F] 版本",
+        text: "部署版本是 1.2.3-alpha",
+        kind: "fact",
+        scope: "global",
+      },
+    };
+    const validation = validateRewrite(versions, {
+      ...validOutput,
+      action: "merge",
+      text: "部署版本是 1.2.3-alpha。",
+      dropped: [],
+    });
+    expect(validation.ok).toBe(false);
+    expect(validation.errors.join(" ")).toContain("1.2.3-beta");
+  });
+
+  it("does not require both sides in the text for keep_both", () => {
+    const ports: RewriteInput = {
+      ...input,
+      candidate: {
+        title: "[F] 端口",
+        text: "本地端口是 5198",
+        kind: "fact",
+        scope: "global",
+      },
+      target: {
+        id: "item_port",
+        title: "[F] 端口",
+        text: "本地端口是 5199",
+        kind: "fact",
+        scope: "global",
+      },
+    };
+    const validation = validateRewrite(ports, {
+      ...validOutput,
+      action: "keep_both",
+      text: "本地端口是 5199",
+      dropped: [],
+    });
+    expect(validation.ok).toBe(true);
+  });
+
+  it("rejects a merge that drops a decisive qualifier", () => {
+    const qualified: RewriteInput = {
+      ...input,
+      candidate: {
+        title: "[P] 生产环境",
+        text: "只能在生产环境运行构建",
+        kind: "preference",
+        scope: "global",
+      },
+      target: {
+        id: "item_qualifier",
+        title: "[P] 构建",
+        text: "在生产环境运行构建",
+        kind: "preference",
+        scope: "global",
+      },
+    };
+    const validation = validateRewrite(qualified, {
+      ...validOutput,
+      action: "merge",
+      text: "在生产环境运行构建。",
+      dropped: [],
+    });
+    expect(validation.ok).toBe(false);
+    expect(validation.errors.join(" ")).toContain("限定");
+  });
+
+  it("allows keep_both to keep only one side without pretending a merge happened", () => {
+    const negated: RewriteInput = {
+      ...input,
+      candidate: {
+        title: "[P] nohup",
+        text: "不要使用 nohup 启动 dev server",
+        kind: "preference",
+        scope: "global",
+      },
+      target: {
+        id: "item_neg",
+        title: "[P] 启动",
+        text: "使用 nohup 启动 dev server",
+        kind: "preference",
+        scope: "global",
+      },
+    };
+    const validation = validateRewrite(negated, {
+      ...validOutput,
+      action: "keep_both",
+      text: "使用 nohup 启动 dev server",
+      dropped: [],
+    });
+    expect(validation.ok).toBe(true);
+  });
+
   it("rejects a rule merge and a conflict merge", () => {
     const rule = validateRewrite(
       {

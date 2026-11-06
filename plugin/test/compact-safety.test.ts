@@ -99,6 +99,61 @@ describe("compaction safety", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+  it("does not merge two memories whose port values differ", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-compact-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const item = (id: string, text: string): Item => ({
+        id, title: id, text, kind: "fact", scope: "global", status: "auto",
+        source: {}, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      await store.appendItem(item("a", "本地 dev server 端口是 5198"));
+      await store.appendItem(item("b", "本地 dev server 端口是 5199"));
+      const result = await runCompaction(store, mergeConfig({}));
+      expect(result.merged).toBe(0);
+      expect(result.archived).toBe(0);
+      expect((await store.listItems()).filter((entry) => entry.status === "auto")).toHaveLength(2);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("does not merge opposite negation or a changed version in long text", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-compact-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const item = (id: string, text: string): Item => ({
+        id, title: id, text, kind: "fact", scope: "global", status: "auto",
+        source: {}, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      await store.appendItem(item("a", "启动 dev server 时不要使用 nohup，因为退出终端后进程可能被回收；如果需要保持后台运行，应该先确认日志目录可写，再使用受控的后台任务并在关闭终端后检查端口是否仍然监听。"));
+      await store.appendItem(item("b", "启动 dev server 时使用 nohup，因为退出终端后进程可能被回收；如果需要保持后台运行，应该先确认日志目录可写，再使用受控的后台任务并在关闭终端后检查端口是否仍然监听。"));
+      await store.appendItem(item("c", "部署脚本要求 Node 版本是 2.4.1，并且使用 pnpm 安装依赖后运行构建，然后执行完整测试并记录构建身份，最后上传产物到临时目录等待人工核对。"));
+      await store.appendItem(item("d", "部署脚本要求 Node 版本是 2.4.2，并且使用 pnpm 安装依赖后运行构建，然后执行完整测试并记录构建身份，最后上传产物到临时目录等待人工核对。"));
+      const result = await runCompaction(store, mergeConfig({}));
+      expect(result.merged).toBe(0);
+      expect(result.archived).toBe(0);
+      expect((await store.listItems()).filter((entry) => entry.status === "auto")).toHaveLength(4);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("still merges exact duplicates with the same kind", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-compact-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const item = (id: string, text: string): Item => ({
+        id, title: id, text, kind: "fact", scope: "global", status: "auto",
+        source: {}, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      await store.appendItem(item("a", "本地 dev server 使用 5199 端口。"));
+      await store.appendItem(item("b", "本地 dev server 使用 5199 端口"));
+      const result = await runCompaction(store, mergeConfig({}));
+      expect(result.merged).toBe(1);
+      expect(result.archived).toBe(1);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
   it("preserves project boundaries and user-approved items", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-compact-"));
     try {

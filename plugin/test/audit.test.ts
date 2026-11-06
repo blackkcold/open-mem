@@ -105,4 +105,78 @@ describe("runAudit", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("links a queue finding by exact id without changing approval or memory state", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-audit-links-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.appendItem(item("mem-link", "[R] memory", "长期记忆内容", daysAgo(100)));
+      await store.upsertQueue(
+        queue("q-link", "[R] queue link", "等待处理的候选", daysAgo(10)),
+      );
+
+      const beforeQueue = await store.listQueue();
+      const beforeItems = await store.listItems();
+      const report = await runAudit(store, DEFAULT_CONFIG);
+
+      expect(await store.listQueue()).toEqual(beforeQueue);
+      expect(await store.listItems()).toEqual(beforeItems);
+
+      const queueFinding = report.findings.find((finding) => finding.kind === "queue");
+      expect(queueFinding?.itemIDs).toEqual(["q-link"]);
+      expect(report.findings.some((finding) => finding.itemIDs.includes("mem-link"))).toBe(
+        true,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not pair different projects and flags a kind mismatch", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-audit-scope-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.appendItem({
+        ...item("a", "[R] same", "同一个项目规则"),
+        scope: "project",
+        projectKey: "A",
+      });
+      await store.appendItem({
+        ...item("b", "[R] same", "同一个项目规则"),
+        scope: "project",
+        projectKey: "B",
+      });
+      const crossProject = await runAudit(store, DEFAULT_CONFIG);
+      expect(
+        crossProject.findings.some(
+          (finding) =>
+            finding.kind === "duplicate" &&
+            finding.itemIDs.includes("a") &&
+            finding.itemIDs.includes("b"),
+        ),
+      ).toBe(false);
+
+      await store.appendItem({
+        ...item("c", "[R] same text", "回复先给结论"),
+        kind: "rule",
+      });
+      await store.appendItem({
+        ...item("d", "[P] same text", "回复先给结论"),
+        kind: "preference",
+      });
+      const report = await runAudit(store, DEFAULT_CONFIG);
+      expect(
+        report.findings.some(
+          (finding) =>
+            finding.kind === "classification" &&
+            finding.itemIDs.includes("c") &&
+            finding.itemIDs.includes("d"),
+        ),
+      ).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

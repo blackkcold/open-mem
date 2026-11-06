@@ -31,6 +31,7 @@ export async function buildSuggestion(
   const titleMaxChars = deps.config.thresholds.titleMaxChars;
   const usableTarget =
     target && (target.status === "auto" || target.status === "promoted") &&
+    target.kind === queueItem.kind &&
     target.scope === queueItem.scope &&
     (queueItem.scope !== "project" ||
       (queueItem.projectKey !== undefined && target.projectKey === queueItem.projectKey))
@@ -64,7 +65,21 @@ export async function buildSuggestion(
       ? await deps.rewrite.suggest(input)
       : composeRewrite(input);
     const validation = validateRewrite(input, output);
-    const finalAction = output.action === "keep_both" ? "keep_both" : requested;
+    const keepBoth = output.action === "keep_both";
+    const finalAction = keepBoth ? "keep_both" : requested;
+    // "Keep both" creates a second row for the candidate. The rewrite output
+    // is the target (or a merged text), so using it here would duplicate the
+    // target and silently drop the candidate.
+    const keepBothLint = keepBoth
+      ? lintText({
+          title: queueItem.title,
+          text: queueItem.text,
+          kind: queueItem.kind,
+          scope: queueItem.scope,
+          maxChars,
+          titleMaxChars,
+        })
+      : undefined;
     suggestion = {
       id: newId("sug"),
       queueID: queueItem.id,
@@ -72,15 +87,23 @@ export async function buildSuggestion(
       targetId: usableTarget.id,
       targetTitle: usableTarget.title,
       targetVersion: itemContentVersion(usableTarget),
-      proposedTitle: output.title,
-      proposedText: output.text,
-      preserved: output.preserved,
-      dropped: output.dropped,
-      rationale: output.rationale,
+      proposedTitle: keepBoth ? queueItem.title : output.title,
+      proposedText: keepBoth ? queueItem.text : output.text,
+      preserved: keepBoth ? [queueItem.text] : output.preserved,
+      dropped: keepBoth ? [] : output.dropped,
+      rationale: keepBoth
+        ? "两者相关但不能安全合并，建议保留两条。"
+        : output.rationale,
       confidence: decision.confidence,
-      source: output.source,
-      model: output.model,
-      validation: { ok: validation.ok, errors: validation.errors, warnings: validation.warnings },
+      source: keepBoth ? "composer" : output.source,
+      model: keepBoth ? undefined : output.model,
+      validation: keepBoth
+        ? {
+            ok: keepBothLint?.ok ?? false,
+            errors: keepBothLint?.errors ?? ["保留两条需要有效的候选正文"],
+            warnings: keepBothLint?.warnings ?? [],
+          }
+        : { ok: validation.ok, errors: validation.errors, warnings: validation.warnings },
       createdAt: new Date().toISOString(),
     };
   } else {
@@ -90,10 +113,9 @@ export async function buildSuggestion(
         : requested === "keep_both"
           ? "keep_both"
           : "create";
-    const proposedText =
-      finalAction === "reject_duplicate" && usableTarget
-        ? usableTarget.text
-        : queueItem.text;
+    // Show the candidate that will be archived. The target remains visible
+    // through targetId/targetTitle; editing this archived copy is disabled.
+    const proposedText = queueItem.text;
     const lint = lintText({
       title: queueItem.title,
       text: proposedText,
@@ -128,10 +150,13 @@ export async function buildSuggestion(
     };
   }
 
+  const ready = suggestion.validation.ok;
   await deps.store.patchQueue([{ id: queueItem.id, patch: {
     suggestion,
-    suggestionState: "ready",
-    suggestionError: undefined,
+    suggestionState: ready ? "ready" : "failed",
+    suggestionError: ready
+      ? undefined
+      : (suggestion.validation.errors.join("；") || "建议未通过校验"),
   } }]);
   deps.broadcast?.("suggestion.updated", suggestion);
   return suggestion;
@@ -153,7 +178,8 @@ export function isSuggestionReady(item: QueueItem): boolean {
   return Boolean(
     item.suggestion &&
       item.suggestion.validation.ok &&
-      item.suggestionState !== "pending",
+      item.suggestionState !== "pending" &&
+      item.suggestionState !== "failed",
   );
 }
 

@@ -67,11 +67,23 @@ export function projectMap(input: {
 
   const vectors = entries.map((entry) => vectorOf(`${entry.title} ${entry.text}`));
   const coords = pca2(vectors);
-  const nodes: MapNode[] = entries.map((entry, index) => ({
-    ...entry,
-    x: coords[index][0],
-    y: coords[index][1],
-  }));
+  // Build nodes field by field. Spreading `entry` here would put the full
+  // memory body (`text` / shadow `candidate`) on the wire even though MapNode
+  // does not declare it; TypeScript's excess-property check does not catch a
+  // spread, and the HTTP layer serializes the object verbatim.
+  const nodes: MapNode[] = entries.map((entry, index) => {
+    const node: MapNode = {
+      id: entry.id,
+      title: entry.title,
+      kind: entry.kind,
+      scope: entry.scope,
+      status: entry.status,
+      x: coords[index][0],
+      y: coords[index][1],
+    };
+    if (entry.priority !== undefined) node.priority = entry.priority;
+    return node;
+  });
 
   const edges: MapEdge[] = [];
   for (let i = 0; i < entries.length && edges.length < MAX_EDGES; i++) {

@@ -22,7 +22,7 @@ Rules, skills, session-only notes, and review-origin candidates never auto-apply
 - `duplicate < 0.20`;
 - `conflict ≤ 0.50`;
 - `mergeAction` is absent or `create`;
-- `risk < 0.40`;
+- `risk < 0.60`; facts and references additionally require `risk < 0.40`;
 - `strictness` is `preference` / `workflow` / `format` / `unknown`;
 - `safeAuto ≥ 0.88` for project, `≥ 0.92` for global;
 - the target lane is enabled and under its cap;
@@ -58,6 +58,8 @@ apply suggestions, or promote durable memory.
 | identical / near identical | drop or `seenCount++`; no new entry |
 | complementary | canonical + `aliases`; rules need approval |
 | opposite polarity | keep both + conflict finding |
+| changed number/port/version/date | keep both + conflict; never call it a duplicate |
+| same text, different `kind` | classification mismatch; keep it in the queue |
 | different scope (`global` / `project`) | never merge |
 | queue vs item | item is the merge target; queue duplicates are rejected or kept |
 

@@ -5,6 +5,14 @@ import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  classifyDeliveredStatus,
+  classifyJobFailure,
+  isJobExpired,
+  planJobStart,
+  type JobPolicyLimits,
+  type PolicyJob,
+} from "./job-policy.js";
 
 const VERSION = "0.1.0";
 const SERVICE_PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT ?? 0);
@@ -34,11 +42,16 @@ const DATA_DIR = resolveDataDir();
 const MAX_JOB_BODY = 8_000_000;
 const MAX_REQUEST_BODY = 1_000_000;
 const JOB_TTL_MS = 5 * 60_000;
-const JOB_DEDUPE_MS = 60_000;
 const MAX_JOBS = 32;
 const IDLE_MS = Number(process.env.OPENMEM_SERVICE_IDLE_MS ?? 5 * 60_000);
 const FORWARD_TIMEOUT_MS = 15_000;
 const JOB_TIMEOUT_MS = 120_000;
+const JOB_LIMITS: JobPolicyLimits = {
+  terminalTtlMs: JOB_TTL_MS,
+  // Pending jobs are never expired by time; maxJobs bounds memory while a slow
+  // upstream request may outlive any duration-based limit.
+  maxJobs: MAX_JOBS,
+};
 
 if (!SERVICE_PORT || !SERVICE_TOKEN) {
   console.error(
@@ -75,22 +88,20 @@ type ForwardResult = {
   contentType: string;
 };
 
-type JobState = "pending" | "done" | "error";
-
-type Job = {
+type Job = PolicyJob & {
   id: string;
-  key: string;
-  state: JobState;
-  createdAt: number;
   status?: number;
   body?: string;
   error?: string;
+  code?: string;
 };
 
 let cachedUpstream: Upstream | undefined;
 let cachedUpstreamAt = 0;
 let lastActivity = Date.now();
 let pendingJobs = 0;
+// In-memory only. A service restart loses every record, so neither duplicate
+// suppression nor eviction protection survives a restart.
 const jobs = new Map<string, Job>();
 
 async function readJson<T>(file: string): Promise<T | undefined> {
@@ -288,7 +299,7 @@ function isJobRoute(method: string, pathname: string, body: string): boolean {
 
 function pruneJobs(now: number): void {
   for (const [id, job] of jobs) {
-    if (now - job.createdAt > JOB_TTL_MS) jobs.delete(id);
+    if (isJobExpired(job, now, JOB_LIMITS)) jobs.delete(id);
   }
 }
 
@@ -296,15 +307,16 @@ function startJob(method: string, target: string, body: string): Job {
   const now = Date.now();
   pruneJobs(now);
   const key = jobKey(method, target, body);
-  for (const job of jobs.values()) {
-    if (job.key === key && now - job.createdAt < JOB_DEDUPE_MS) return job;
+  const plan = planJobStart(jobs, key, now, JOB_LIMITS);
+  if (plan.action === "reuse") return plan.job;
+  if (plan.action === "reject") {
+    throw new UpstreamError(
+      429,
+      "OPENMEM_JOB_CAPACITY",
+      "后台任务缓存已满（存在进行中、结果未知或保护期内的已完成任务）。请稍后再提交；若为写操作，请先刷新核对结果，避免重复写入。",
+    );
   }
-  if (jobs.size >= MAX_JOBS) {
-    const oldest = [...jobs.entries()].sort(
-      (left, right) => left[1].createdAt - right[1].createdAt,
-    )[0];
-    if (oldest) jobs.delete(oldest[0]);
-  }
+  if (plan.action === "evict") jobs.delete(plan.id);
   const job: Job = {
     id: `job_${randomBytes(8).toString("hex")}`,
     key,
@@ -315,13 +327,19 @@ function startJob(method: string, target: string, body: string): Job {
   pendingJobs += 1;
   void forward(method, target, body, JOB_TIMEOUT_MS)
     .then((result) => {
+      job.settledAt = Date.now();
       job.state = "done";
       job.status = result.status;
       job.body = result.body;
+      job.outcome = classifyDeliveredStatus(result.status);
     })
     .catch((error: unknown) => {
+      job.settledAt = Date.now();
+      const code = error instanceof UpstreamError ? error.code : "OPENMEM_UPSTREAM";
       job.state = "error";
       job.status = error instanceof UpstreamError ? error.status : 502;
+      job.code = code;
+      job.outcome = classifyJobFailure(code);
       job.error = error instanceof Error ? error.message : String(error);
     })
     .finally(() => {
@@ -392,12 +410,18 @@ async function handle(
   }
 
   if (method === "GET" && pathname.startsWith("/jobs/")) {
+    pruneJobs(Date.now());
     const id = pathname.slice("/jobs/".length);
     const job = jobs.get(id);
     if (!job) {
       sendJson(response, 404, {
-        error: "后台任务不存在或已过期。",
+        error:
+          "后台任务记录不存在：可能已被清理、已过期，" +
+          "或扩展服务已重启（任务记录仅保存在内存中）。" +
+          `正常清理窗口为 ${Math.round(JOB_TTL_MS / 60_000)} 分钟，` +
+          "但过期或重启后都无法确认该请求是否已送达；若为写操作请先刷新核对再决定是否重试。",
         code: "OPENMEM_JOB_NOT_FOUND",
+        outcome: "unknown",
       });
       return;
     }
@@ -410,6 +434,8 @@ async function handle(
         state: "error",
         status: job.status,
         error: job.error,
+        code: job.code ?? "OPENMEM_JOB",
+        outcome: job.outcome ?? "unknown",
       });
       return;
     }
@@ -417,6 +443,7 @@ async function handle(
       state: "done",
       status: job.status,
       body: job.body ?? "",
+      ...(job.outcome ? { outcome: job.outcome } : {}),
     });
     return;
   }

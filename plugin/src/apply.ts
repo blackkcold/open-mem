@@ -10,6 +10,9 @@ import { compact, lintText } from "./linter.js";
 import { admitNewItem } from "./capacity.js";
 import { rebuildAutoFiles } from "./rebuild.js";
 import { itemContentVersion } from "./fingerprint.js";
+import { isSuggestionReady } from "./suggestion.js";
+import { validateRewrite } from "./rewrite/validate.js";
+import type { RewriteInput, RewriteOutput } from "./rewrite/types.js";
 
 export interface ApplyEdits {
   title?: string;
@@ -58,8 +61,38 @@ async function applySuggestionUnlocked(
     return { ok: false, error: "skill 需要走 Skill Review 的 draft 流程" };
   }
 
+  const proposedTitle = compact(suggestion.proposedTitle);
+  const proposedText = compact(suggestion.proposedText);
   const title = compact(edits?.title ?? suggestion.proposedTitle);
   const text = compact(edits?.text ?? suggestion.proposedText);
+  const titleEdited = title !== proposedTitle;
+  const textEdited = text !== proposedText;
+  const humanEdited = titleEdited || textEdited;
+  if (suggestion.action === "reject_duplicate" && humanEdited) {
+    return {
+      ok: false,
+      error: "拒绝重复会归档候选原文，不能同时修改标题或正文；请改用保留两条或新建",
+    };
+  }
+
+  // The UI disables apply for invalid suggestions, but the API must enforce
+  // the same rule. Only a body edit is the human-validation lane: renaming a
+  // title must not make an invalid merge body applicable. A body edit still
+  // runs lint, target and scope checks below, but it does not pretend that the
+  // model's validation passed.
+  if (!textEdited && !isSuggestionReady(item)) {
+    if (item.suggestionState === "pending") {
+      return { ok: false, error: "合并建议正在生成，请等待完成或人工修改后再应用" };
+    }
+    if (item.suggestionState === "failed") {
+      return { ok: false, error: "合并建议生成或校验失败，请重新生成或人工修改后再应用" };
+    }
+    return {
+      ok: false,
+      error: `合并建议未通过校验，请重新生成或人工修改后再应用：${suggestion.validation.errors.join("；") || "未知原因"}`,
+    };
+  }
+
   const maxChars =
     item.kind === "rule" ? config.thresholds.ruleMaxChars : config.thresholds.memoryMaxChars;
   const lint = lintText({
@@ -93,6 +126,51 @@ async function applySuggestionUnlocked(
   ) {
     return { ok: false, error: "目标不属于相同范围或项目，请重新生成建议" };
   }
+  // Re-run the deterministic rewrite checks against the current target and
+  // candidate. A suggestion generated before this guard (or before the target
+  // changed) must not bypass validation just because its stored flag says ok.
+  if (!textEdited && (action === "merge_into" || action === "replace")) {
+    if (!target) return { ok: false, error: "合并目标已不存在，请重新生成建议" };
+    const rewriteInput: RewriteInput = {
+      candidate: {
+        id: item.id,
+        title: item.title,
+        text: item.text,
+        kind: item.kind,
+        scope: item.scope,
+      },
+      target: {
+        id: target.id,
+        title: target.title,
+        text: target.text,
+        kind: target.kind,
+        scope: target.scope,
+      },
+      action,
+      maxChars,
+      titleMaxChars: config.thresholds.titleMaxChars,
+      conflict: item.decision?.conflict ?? 0,
+    };
+    const rewriteOutput: RewriteOutput = {
+      action: action === "replace" ? "replace" : "merge",
+      title: suggestion.proposedTitle,
+      text: suggestion.proposedText,
+      preserved: suggestion.preserved,
+      dropped: suggestion.dropped,
+      rationale: suggestion.rationale,
+      source: suggestion.source === "human" ? "composer" : suggestion.source,
+      model: suggestion.model,
+      latencyMs: 0,
+    };
+    const revalidation = validateRewrite(rewriteInput, rewriteOutput);
+    if (!revalidation.ok) {
+      return {
+        ok: false,
+        error: `建议写入前复核失败：${revalidation.errors.join("；")}`,
+      };
+    }
+  }
+
   if ((action === "create" || action === "keep_both") && target?.id === item.id) {
     return { ok: false, error: "合并目标不能是候选自身" };
   }
@@ -109,6 +187,7 @@ async function applySuggestionUnlocked(
     targetID: target?.id,
     before: { target, queue: item },
     after: {},
+    humanEdited: humanEdited || undefined,
   };
   await store.appendJournal(journal);
 
@@ -201,6 +280,7 @@ async function applySuggestionUnlocked(
     targetID: target?.id,
     journalID: journal.id,
     note: edits?.note,
+    humanEdited: humanEdited || undefined,
   });
   await rebuildAutoFiles(store);
   return {

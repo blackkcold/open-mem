@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, formatPercent } from "../api";
 import { confirmAction } from "../extension/confirm";
 import type { MapData, MapNode, Metrics } from "../types";
+import { queueItemLink } from "./audit-links";
 
 interface Props {
   refreshKey: number;
@@ -22,15 +23,26 @@ export function MapView({ refreshKey, onChanged }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const requestSeq = useRef(0);
 
   useEffect(() => {
+    const seq = ++requestSeq.current;
+    setLoading(true);
     Promise.all([api<MapData>("/api/map"), api<Metrics>("/api/metrics")])
       .then(([nextData, nextMetrics]) => {
+        if (seq !== requestSeq.current) return;
         setData(nextData);
         setMetrics(nextMetrics);
         setError("");
       })
-      .catch((caught: unknown) => setError(errorMessage(caught)));
+      .catch((caught: unknown) => {
+        if (seq !== requestSeq.current) return;
+        setError(errorMessage(caught));
+      })
+      .finally(() => {
+        if (seq === requestSeq.current) setLoading(false);
+      });
   }, [refreshKey]);
 
   const visible = useMemo(
@@ -38,7 +50,7 @@ export function MapView({ refreshKey, onChanged }: Props) {
     [data, filter],
   );
   const visibleIds = useMemo(() => new Set(visible.map((node) => node.id)), [visible]);
-  const selected = data?.nodes.find((node) => node.id === selectedId) ?? null;
+  const selected = visible.find((node) => node.id === selectedId) ?? null;
 
   async function markFalsePositive(node: MapNode) {
     const ok = await confirmAction({
@@ -62,10 +74,10 @@ export function MapView({ refreshKey, onChanged }: Props) {
   return (
     <div>
       <div className="kpis">
-        <div className="kpi"><span>Auto applied</span><b className="good">{metrics?.auto ?? 0}</b></div>
-        <div className="kpi"><span>Queue</span><b className="warn">{metrics?.queue ?? 0}</b></div>
-        <div className="kpi"><span>Shadow</span><b>{metrics?.shadow ?? 0}</b></div>
-        <div className="kpi"><span>False positive</span><b className="warn">{formatPercent(metrics?.falsePositiveRate ?? 0)}</b></div>
+        <div className="kpi"><span>Auto applied</span><b className="good">{metrics ? metrics.auto : "—"}</b></div>
+        <div className="kpi"><span>Queue</span><b className="warn">{metrics ? metrics.queue : "—"}</b></div>
+        <div className="kpi"><span>Shadow</span><b>{metrics ? metrics.shadow : "—"}</b></div>
+        <div className="kpi"><span>False positive</span><b className="warn">{metrics ? formatPercent(metrics.falsePositiveRate) : "—"}</b></div>
       </div>
 
       {message ? <div className="banner ok">{message}</div> : null}
@@ -82,6 +94,7 @@ export function MapView({ refreshKey, onChanged }: Props) {
               <button
                 key={status}
                 className={`btn${filter === status ? " primary" : ""}`}
+                aria-pressed={filter === status}
                 onClick={() => setFilter(status)}
                 type="button"
               >
@@ -92,8 +105,12 @@ export function MapView({ refreshKey, onChanged }: Props) {
               {showEdges ? "隐藏关系边" : "显示关系边"}
             </button>
           </div>
-          {visible.length === 0 ? (
-            <div className="empty">No nodes for this filter.</div>
+          {loading && !data ? (
+            <div className="empty" role="status">载入点云…</div>
+          ) : visible.length === 0 ? (
+            <div className="empty">
+              {data ? "当前筛选没有节点。" : "没有可显示的点云数据。"}
+            </div>
           ) : (
             <svg className="map-svg" viewBox={`0 0 ${WIDTH} ${HEIGHT}`} role="group" aria-label="记忆地图，可使用 Tab 选择记忆点">
               {showEdges
@@ -117,26 +134,31 @@ export function MapView({ refreshKey, onChanged }: Props) {
                   })
                 : null}
               {visible.map((node) => (
-                <circle
+                <g
                   key={node.id}
                   data-node-id={node.id}
                   data-status={node.status}
-                  cx={px(node.x)}
-                  cy={py(node.y)}
-                  r={5 + ((node.priority ?? 0) / 100) * 4}
-                  fill={colorOf(node.status)}
-                  fillOpacity={node.status === "shadow" ? 0.35 : 0.85}
-                  stroke={node.id === selectedId ? "var(--text)" : "var(--panel)"}
-                  strokeWidth={node.id === selectedId ? 2 : 1}
-                  onClick={() => setSelectedId(node.id)}
                   role="button"
                   tabIndex={0}
                   aria-label={`${node.title} · ${node.status}`}
+                  onClick={() => setSelectedId(node.id)}
                   onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelectedId(node.id); } }}
                   style={{ cursor: "pointer" }}
                 >
+                  <circle cx={px(node.x)} cy={py(node.y)} r={42} fill="transparent" />
+                  <circle
+                    cx={px(node.x)}
+                    cy={py(node.y)}
+                    r={5 + ((node.priority ?? 0) / 100) * 4}
+                    fill={colorOf(node.status)}
+                    fillOpacity={node.status === "shadow" ? 0.35 : 0.85}
+                    stroke={node.id === selectedId ? "var(--text)" : "var(--panel)"}
+                    strokeWidth={node.id === selectedId ? 2 : 1}
+                    pointerEvents="none"
+                    aria-hidden="true"
+                  />
                   <title>{`${node.title} · ${node.status}`}</title>
-                </circle>
+                </g>
               ))}
             </svg>
           )}
@@ -151,7 +173,7 @@ export function MapView({ refreshKey, onChanged }: Props) {
 
         <aside className="panel">
           {!selected ? (
-            <div className="empty">Click a point to inspect the memory, its status, and Jev reasons.</div>
+            <div className="empty">选择一个记忆点，查看标题、类型、范围和状态。</div>
           ) : (
             <div className="detail-body">
               <h2>{selected.title}</h2>
@@ -164,21 +186,21 @@ export function MapView({ refreshKey, onChanged }: Props) {
                 <span className="chip">priority {selected.priority ?? 0}</span>
               </div>
               <div className="muted" style={{ fontSize: "0.72rem", lineHeight: 1.5 }}>
-                Point cloud is an approximate 2D projection of text vectors. Use it for navigation, not as truth.
+                点云是文本词面向量的近似二维投影，用于探索，不是事实判断。
               </div>
               {selected.status === "shadow" ? (
                 <button className="btn danger" onClick={() => void markFalsePositive(selected)} type="button">
-                  Mark false positive
+                  标记为误报
                 </button>
               ) : null}
               {selected.status === "queue" ? (
-                <p className="muted" style={{ margin: 0, fontSize: "0.72rem" }}>
-                  This item is waiting in the Queue tab for approval.
-                </p>
+                <a className="btn ghost" href={queueItemLink(selected.id)}>
+                  打开审批条目
+                </a>
               ) : null}
               {selected.status === "auto" ? (
                 <p className="muted" style={{ margin: 0, fontSize: "0.72rem" }}>
-                  Auto-applied to AUTO_MEMORY / AUTO_RULES. Promote to curated L0 after review.
+                  已自动写入 AUTO_MEMORY / AUTO_RULES；复核后再晋升为 L0 规则。
                 </p>
               ) : null}
             </div>
@@ -186,7 +208,7 @@ export function MapView({ refreshKey, onChanged }: Props) {
         </aside>
       </div>
       <p className="muted" style={{ fontSize: "0.68rem", marginTop: 10 }}>
-        Queue age p50/p95: {metrics?.queueAgeP50Hours ?? 0}h / {metrics?.queueAgeP95Hours ?? 0}h · Skill drafts: {metrics?.skillDrafts ?? 0} · Audit findings: {metrics?.auditFindings ?? 0}
+        Queue age p50/p95: {metrics ? `${metrics.queueAgeP50Hours}h / ${metrics.queueAgeP95Hours}h` : "—"} · Skill drafts: {metrics ? metrics.skillDrafts : "—"} · Audit findings: {metrics ? metrics.auditFindings : "—"}
       </p>
     </div>
   );

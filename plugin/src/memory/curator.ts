@@ -3,7 +3,7 @@ import path from "node:path";
 import type { AutoMemConfig, Item } from "../types.js";
 import type { Store } from "../store.js";
 import { newId } from "../store.js";
-import { textSimilarity } from "../fingerprint.js";
+import { classifyRelation, isExactRelation } from "../relations.js";
 import { rebuildAutoFiles } from "../rebuild.js";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -123,7 +123,16 @@ export async function runCurator(
       );
       const canonical = { ...group[0] };
       for (const other of group.slice(1)) {
-        if (textSimilarity(canonical.text, other.text) < 0.92) continue;
+        // Same rule as compaction: only exact, same-kind duplicates may be
+        // archived automatically. Similarity alone can erase a changed port,
+        // version, date or negation.
+        const duplicate = isExactRelation(
+          classifyRelation(
+            { text: canonical.text, kind: canonical.kind },
+            { text: other.text, kind: other.kind },
+          ),
+        );
+        if (!duplicate) continue;
         canonical.seenCount = (canonical.seenCount ?? 1) + (other.seenCount ?? 1);
         canonical.sources = [
           ...(canonical.sources ?? [canonical.source]),

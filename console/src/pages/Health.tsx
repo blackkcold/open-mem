@@ -1,7 +1,33 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, formatAge, formatPercent, formatReviewAge } from "../api";
 import { confirmAction } from "../extension/confirm";
 import type { Health, HealthScore, MergeJournal, UsageSummary } from "../types";
+import {
+  buildMergeUndoPreview,
+  canApplyLoadRequest,
+  canClearUnknownLocks,
+  createLoadRequestGate,
+  invalidateLoadRequests,
+  isUnknownOutcome,
+  loadMergeUndoLocks,
+  lockMergeUndoUnknown,
+  reconcileMergeUndoUnknown,
+  resolveMergeUndoLocks,
+  RESUME_UNDO_NOTICE,
+  saveMergeUndoLocks,
+  SESSION_ONLY_UNKNOWN_NOTICE,
+  startLoadRequest,
+  syncMergeUndoLeaveWarning,
+  UNKNOWN_OUTCOME_NOTICE,
+  unlockMergeUndoUnknown,
+  type LoadRequestGate,
+  type MergeJournalLoadState,
+  type MergeUndoLocks,
+  type MergeUndoLeaveTarget,
+  type MergeUndoLockPersistence,
+  type MergeUndoLockStorage,
+  type MergeUndoStatus,
+} from "./undo-preview";
 
 interface Props {
   refreshKey: number;
@@ -22,6 +48,10 @@ interface RetentionPreview {
 }
 
 const HISTORY_LABEL: Record<string, string> = { approve: "批准记忆", deny: "拒绝候选", promote: "提升范围", promote_session_note: "保留会话笔记", compact: "压缩", curator: "自动整理", edit: "编辑", defer: "延后", resume: "取消延后", undo_maintenance: "撤销整理", undo_merge: "撤销合并", restore_queue_action: "恢复候选", create_skill_draft: "生成流程草稿", dismiss_note: "忽略笔记", restore_note: "恢复笔记", capture_blocked: "容量待处理", capture_rejected: "敏感信息拦截" };
+
+let sessionUnknownLocks: MergeUndoLocks = {};
+let sessionUnlockTombstones = new Set<string>();
+let sessionLockPersistence: MergeUndoLockPersistence = "unavailable";
 
 const BREAKDOWN_LABELS: Array<[keyof HealthScore["breakdown"], string]> = [
   ["capacity", "容量"],
@@ -45,12 +75,53 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [retention, setRetention] = useState<RetentionPreview>();
+  const [journalLoadState, setJournalLoadState] = useState<MergeJournalLoadState>("loading");
+  const [unknownLocks, setUnknownLocks] = useState<MergeUndoLocks>(() => initialMergeUndoLocks());
+  const [lockPersistence, setLockPersistence] = useState<MergeUndoLockPersistence>(
+    () => sessionLockPersistence,
+  );
+  const unknownLocksRef = useRef(unknownLocks);
+  const loadGate = useRef<LoadRequestGate>(createLoadRequestGate());
+
+  function updateUnknownLocks(next: MergeUndoLocks) {
+    for (const id of Object.keys(unknownLocksRef.current)) {
+      if (!(id in next)) sessionUnlockTombstones.add(id);
+    }
+    unknownLocksRef.current = next;
+    sessionUnknownLocks = next;
+    setUnknownLocks(next);
+    const persistence = saveMergeUndoLocks(mergeUndoLockStorage(), next);
+    sessionLockPersistence = persistence;
+    setLockPersistence(persistence);
+  }
+
+  useEffect(() => {
+    const gate = loadGate.current;
+    gate.mounted = true;
+    return () => {
+      // In-flight responses must not write state after this page is unmounted.
+      // The session-level beforeunload warning is intentionally left alone.
+      invalidateLoadRequests(gate);
+    };
+  }, []);
 
   useEffect(() => {
     void load();
   }, [refreshKey]);
 
+  useEffect(() => {
+    syncMergeUndoLeaveWarning(
+      mergeUndoLeaveWarningTarget(),
+      Object.keys(unknownLocks).length,
+      lockPersistence,
+    );
+  }, [unknownLocks, lockPersistence]);
+
   async function load() {
+    const gate = loadGate.current;
+    const requestID = startLoadRequest(gate);
+    if (!canApplyLoadRequest(gate, requestID)) return;
+    setJournalLoadState("loading");
     try {
       const [nextHealth, nextUsage, nextJournal, nextInfo, nextHistory] = await Promise.all([
         api<HealthScore>("/api/health-score"),
@@ -59,13 +130,19 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
         api<Health>("/api/health"),
         api<{ items: HistoryEntry[] }>("/api/changelog?limit=50"),
       ]);
+      if (!canApplyLoadRequest(gate, requestID)) return;
       setHealth(nextHealth);
       setUsage(nextUsage);
       setJournal(nextJournal.items);
       setHealthInfo(nextInfo);
       setHistory(nextHistory.items);
+      const reconciled = reconcileMergeUndoUnknown(unknownLocksRef.current, nextJournal.items);
+      if (reconciled !== unknownLocksRef.current) updateUnknownLocks(reconciled);
+      setJournalLoadState("ready");
       setError("");
     } catch (caught: unknown) {
+      if (!canApplyLoadRequest(gate, requestID)) return;
+      setJournalLoadState("failed");
       setError(errorMessage(caught));
     }
   }
@@ -140,11 +217,32 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
     finally { setBusy(false); }
   }
 
-  async function undo(entry: MergeJournal) {
+  async function undo(entry: MergeJournal, mode: "normal" | "resume" = "normal") {
+    const preview = buildMergeUndoPreview(entry, {
+      now: Date.now(),
+      unknownSince: unknownLocksRef.current[entry.id],
+    });
+    if (mode === "resume" ? !preview.canResume : !preview.canUndo) {
+      setError(preview.deadline);
+      return;
+    }
+    const message = mode === "resume"
+      ? [
+          RESUME_UNDO_NOTICE,
+          `服务端会按记录内容处理：${preview.effects.join("；")}。`,
+          preview.deadline,
+          preview.hint,
+        ].join(" ")
+      : [
+          `动作：${preview.actionLabel}（${preview.actionMeaning}）。`,
+          `撤销后会：${preview.effects.join("；")}。`,
+          preview.deadline,
+          preview.hint,
+        ].join(" ");
     const ok = await confirmAction({
-      title: "撤销这次合并？",
-      message: "目标条目会恢复，候选会回到队列。",
-      confirmLabel: "撤销",
+      title: mode === "resume" ? "继续未完成的撤销？" : `撤销${preview.actionLabel}？`,
+      message,
+      confirmLabel: mode === "resume" ? "核对后继续撤销" : "撤销",
       danger: true,
     });
     if (!ok) return;
@@ -153,13 +251,60 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
     setError("");
     try {
       await api(`/api/merge/${encodeURIComponent(entry.id)}/undo`, { method: "POST" });
-      setMessage("已撤销");
+      updateUnknownLocks(unlockMergeUndoUnknown(unknownLocksRef.current, entry.id));
+      setMessage(
+        mode === "resume"
+          ? `已完成未完成的撤销（${preview.actionLabel}）`
+          : `已撤销${preview.actionLabel}`,
+      );
       onChanged();
     } catch (caught: unknown) {
-      setError(errorMessage(caught));
+      if (isUnknownOutcome(caught)) {
+        updateUnknownLocks(
+          lockMergeUndoUnknown(
+            unknownLocksRef.current,
+            entry.id,
+            new Date().toISOString(),
+          ),
+        );
+        setError(UNKNOWN_OUTCOME_NOTICE);
+      } else {
+        setError(errorMessage(caught));
+      }
     } finally {
       setBusy(false);
     }
+  }
+
+  async function acknowledgeUnknown(entryID: string) {
+    if (!await confirmAction({
+      title: "解除“状态未知”标记？",
+      message: "解除后，如果记录仍在撤销窗口内，可以再次发送撤销请求。请先刷新并核对目标条目、候选队列和备份；解除标记本身不会发送任何写操作。",
+      confirmLabel: "我已核对，解除标记",
+    })) return;
+    updateUnknownLocks(unlockMergeUndoUnknown(unknownLocksRef.current, entryID));
+    setError("");
+    setMessage("已解除该条记录的“状态未知”标记；未发送任何撤销或修改请求，请自行核对服务端结果。");
+  }
+
+  async function acknowledgeHiddenUnknown() {
+    if (!canClearUnknownLocks(journalLoadState)) {
+      setError("合并记录尚未成功加载，无法核对并清除更早的“状态未知”标记；请先刷新成功后再试。");
+      return;
+    }
+    const visible = new Set(journal.map((entry) => entry.id));
+    const hidden = Object.keys(unknownLocksRef.current).filter((id) => !visible.has(id));
+    if (hidden.length === 0) return;
+    if (!await confirmAction({
+      title: "确认已人工核对？",
+      message: `将清除 ${hidden.length} 条不在最近合并记录中的“状态未知”标记。此操作不会发送撤销、删除或修改请求；请先核对服务端记录与备份。`,
+      confirmLabel: "我已核对，清除标记",
+    })) return;
+    let next = unknownLocksRef.current;
+    for (const id of hidden) next = unlockMergeUndoUnknown(next, id);
+    updateUnknownLocks(next);
+    setError("");
+    setMessage(`已清除 ${hidden.length} 条更早的“状态未知”标记；未发送任何写操作。`);
   }
 
   const grade = health?.grade ?? "warn";
@@ -167,6 +312,12 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
     grade === "good" ? "健康" : grade === "ok" ? "可用" : grade === "warn" ? "注意" : "需处理";
   const reviewFailureRate =
     usage && usage.reviewCalls > 0 ? usage.reviewFailures / usage.reviewCalls : 0;
+  const now = Date.now();
+  const visibleJournalIDs = new Set(journal.map((entry) => entry.id));
+  const unknownLockCount = Object.keys(unknownLocks).length;
+  const hiddenUnknownCount = Object.keys(unknownLocks).filter(
+    (id) => !visibleJournalIDs.has(id),
+  ).length;
 
   return (
     <div className="health">
@@ -351,36 +502,212 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
         </tbody></table></div> : <div className="empty">暂无操作记录。</div>}
       </section>
 
-      <section className="panel" style={{ marginTop: 12 }}>
-        <div className="panel-head"><h2>最近合并</h2><span className="meta">24h 内可撤销</span></div>
+      <section className="panel" style={{ marginTop: 12 }} aria-label="最近合并与撤销">
+        <div className="panel-head">
+          <h2>最近合并</h2>
+          <span className="meta">24h 内可撤销 · 本地估算，服务端校验为准</span>
+        </div>
+        {unknownLockCount ? (
+          <div className="banner error" role="status">
+            <div>
+              <strong>{unknownLockCount} 条撤销请求结果未知</strong>
+              ：可能已经提交。请先刷新并核对目标条目与候选队列；确认前不会再次发送撤销。
+            </div>
+            <div className="muted small">
+              只有记录显示“已撤销”才会自动清除标记；一次刷新没有显示，不代表没有提交。
+            </div>
+            {lockPersistence === "unavailable" ? (
+              <div className="sev-error small" role="alert">
+                <strong>{SESSION_ONLY_UNKNOWN_NOTICE}</strong>
+              </div>
+            ) : null}
+            {hiddenUnknownCount && !canClearUnknownLocks(journalLoadState) ? (
+              <div className="muted small">
+                合并记录尚未成功加载，无法核对更早的未知标记；请先刷新成功后再清除。
+              </div>
+            ) : null}
+            <div className="actions">
+              <button
+                className="btn"
+                disabled={busy}
+                onClick={() => void load()}
+                type="button"
+              >
+                刷新核对
+              </button>
+              {hiddenUnknownCount ? (
+                <button
+                  className="btn ghost"
+                  disabled={busy || !canClearUnknownLocks(journalLoadState)}
+                  onClick={() => void acknowledgeHiddenUnknown()}
+                  type="button"
+                >
+                  {canClearUnknownLocks(journalLoadState)
+                    ? `我已核对，清除 ${hiddenUnknownCount} 条更早标记`
+                    : "合并记录未加载，无法清除"}
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
         {journal.length === 0 ? (
           <div className="empty">还没有合并记录。</div>
         ) : (
           <div className="table-wrap">
             <table>
               <thead>
-                <tr><th>时间</th><th>动作</th><th>目标</th><th>状态</th><th /></tr>
+                <tr><th>时间</th><th>动作</th><th>影响</th><th>状态</th><th>操作</th></tr>
               </thead>
               <tbody>
                 {journal.map((entry) => {
-                  const undoable =
-                    !entry.undone &&
-                    Date.now() - new Date(entry.at).getTime() <= 24 * 60 * 60 * 1000;
+                  const preview = buildMergeUndoPreview(entry, {
+                    now,
+                    unknownSince: unknownLocks[entry.id],
+                  });
+                  const locked = Boolean(unknownLocks[entry.id]);
                   return (
                     <tr key={entry.id}>
                       <td className="muted">{formatAge(entry.at)}</td>
-                      <td><span className="badge">{entry.action}</span></td>
-                      <td className="muted">{entry.targetID ?? "—"}</td>
-                      <td>{entry.undone ? <span className="badge">已撤销</span> : <span className="badge success">已应用</span>}</td>
                       <td>
-                        <button
-                          className="btn"
-                          disabled={!undoable || busy}
-                          onClick={() => void undo(entry)}
-                          type="button"
-                        >
-                          撤销
-                        </button>
+                        <span className={`badge ${preview.safe ? "" : "warning"}`}>
+                          {preview.actionLabel}
+                        </span>
+                        <div className="muted small">
+                          <code>{entry.action}</code> · {preview.actionMeaning}
+                        </div>
+                      </td>
+                      <td>
+                        {preview.safe ? (
+                          <>
+                            <div>
+                              <span className="muted small">候选</span>{" "}
+                              {preview.candidate?.title ?? "—"}
+                            </div>
+                            {preview.targetBefore || preview.targetAfter ? (
+                              <div className="muted small">
+                                目标：{preview.targetBefore?.title ?? "—"} →{" "}
+                                {preview.targetAfter?.title ?? "—"}
+                              </div>
+                            ) : null}
+                            {preview.created ? (
+                              <div className="muted small">新建：{preview.created.title}</div>
+                            ) : null}
+                            <div className="muted small">撤销影响：{preview.summary}</div>
+                            <details>
+                              <summary className="muted small">查看实际前后内容</summary>
+                              <div className="small" style={{ whiteSpace: "pre-wrap" }}>
+                                {preview.candidate ? (
+                                  <p>
+                                    候选（操作前）：标题「{preview.candidate.title}」；正文：
+                                    {preview.candidate.text}
+                                  </p>
+                                ) : null}
+                                {preview.targetBefore ? (
+                                  <p>
+                                    目标（操作前）：标题「{preview.targetBefore.title}」；正文：
+                                    {preview.targetBefore.text}
+                                  </p>
+                                ) : null}
+                                {preview.targetAfter ? (
+                                  <p>
+                                    目标（操作后）：标题「{preview.targetAfter.title}」；正文：
+                                    {preview.targetAfter.text}
+                                  </p>
+                                ) : null}
+                                {preview.created ? (
+                                  <p>
+                                    本次新建：标题「{preview.created.title}」；正文：
+                                    {preview.created.text}
+                                  </p>
+                                ) : null}
+                                <p>{preview.deadline}</p>
+                                <p className="muted">{preview.hint}</p>
+                              </div>
+                            </details>
+                          </>
+                        ) : (
+                          <div className="muted small">
+                            缺少完整快照，不能安全预测恢复/归档对象；请核对备份或服务端记录。
+                            {preview.missing.length ? (
+                              <div>缺失字段：{preview.missing.join("、")}</div>
+                            ) : null}
+                            {preview.candidate ||
+                            preview.targetBefore ||
+                            preview.targetAfter ||
+                            preview.created ? (
+                              <details>
+                                <summary>查看已记录字段（不构成恢复保证）</summary>
+                                <div style={{ whiteSpace: "pre-wrap" }}>
+                                  {preview.candidate ? (
+                                    <p>
+                                      候选（操作前）：标题「{preview.candidate.title}」；正文：
+                                      {preview.candidate.text}
+                                    </p>
+                                  ) : null}
+                                  {preview.targetBefore ? (
+                                    <p>
+                                      目标（操作前）：标题「{preview.targetBefore.title}」；正文：
+                                      {preview.targetBefore.text}
+                                    </p>
+                                  ) : null}
+                                  {preview.targetAfter ? (
+                                    <p>
+                                      目标（操作后）：标题「{preview.targetAfter.title}」；正文：
+                                      {preview.targetAfter.text}
+                                    </p>
+                                  ) : null}
+                                  {preview.created ? (
+                                    <p>
+                                      本次新建：标题「{preview.created.title}」；正文：
+                                      {preview.created.text}
+                                    </p>
+                                  ) : null}
+                                </div>
+                              </details>
+                            ) : null}
+                          </div>
+                        )}
+                      </td>
+                      <td>
+                        <span className={`badge ${statusBadgeClass(preview.status)}`}>
+                          {preview.statusLabel}
+                        </span>
+                        {locked && preview.status !== "unknown" ? (
+                          <span className="badge warning" style={{ marginLeft: 4 }}>
+                            状态未知
+                          </span>
+                        ) : null}
+                        <div className="muted small">{preview.deadline}</div>
+                      </td>
+                      <td>
+                        {locked ? (
+                          <button
+                            className="btn ghost"
+                            disabled={busy}
+                            onClick={() => void acknowledgeUnknown(entry.id)}
+                            type="button"
+                          >
+                            我已核对，解除标记
+                          </button>
+                        ) : preview.canResume ? (
+                          <button
+                            className="btn"
+                            disabled={busy}
+                            onClick={() => void undo(entry, "resume")}
+                            type="button"
+                          >
+                            核对后继续撤销
+                          </button>
+                        ) : (
+                          <button
+                            className="btn"
+                            disabled={!preview.canUndo || busy}
+                            onClick={() => void undo(entry)}
+                            type="button"
+                          >
+                            {preview.canUndo ? "撤销" : preview.statusLabel}
+                          </button>
+                        )}
                       </td>
                     </tr>
                   );
@@ -403,6 +730,62 @@ function Bar({ label, value }: { label: string; value: number }) {
       <span>{Math.round(value * 100)}</span>
     </div>
   );
+}
+
+function statusBadgeClass(status: MergeUndoStatus): string {
+  switch (status) {
+    case "undoable":
+      return "success";
+    case "undone":
+      return "";
+    case "expired":
+    case "in-progress":
+    case "unsafe":
+      return "warning";
+    case "unknown":
+      return "error";
+  }
+}
+
+let leaveWarningTarget: MergeUndoLeaveTarget | undefined;
+
+function mergeUndoLeaveWarningTarget(): MergeUndoLeaveTarget | undefined {
+  if (leaveWarningTarget) return leaveWarningTarget;
+  if (typeof window === "undefined") return undefined;
+  leaveWarningTarget = {
+    addEventListener(type, listener) {
+      window.addEventListener(type, listener);
+    },
+    removeEventListener(type, listener) {
+      window.removeEventListener(type, listener);
+    },
+  };
+  return leaveWarningTarget;
+}
+
+function mergeUndoLockStorage(): MergeUndoLockStorage | undefined {
+  try {
+    return window.localStorage;
+  } catch {
+    return undefined;
+  }
+}
+
+function initialMergeUndoLocks(): MergeUndoLocks {
+  const storage = mergeUndoLockStorage();
+  const loaded = loadMergeUndoLocks(storage);
+  sessionLockPersistence = loaded.persistence;
+  // Read-only storage can still contain valid unknown markers. Keep them, but
+  // let this session's explicit unlocks suppress stale copies via tombstones.
+  sessionUnknownLocks = resolveMergeUndoLocks(
+    loaded,
+    sessionUnknownLocks,
+    sessionUnlockTombstones,
+  );
+  if (loaded.persistence === "available") {
+    sessionLockPersistence = saveMergeUndoLocks(storage, sessionUnknownLocks);
+  }
+  return sessionUnknownLocks;
 }
 
 function errorMessage(error: unknown): string {

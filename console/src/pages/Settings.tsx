@@ -1,37 +1,239 @@
-import { useEffect, useState } from "react";
-import { api } from "../api";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ApiError, api } from "../api";
 import { confirmAction } from "../extension/confirm";
 import { isExtension } from "../extension/mode";
 import type { Config, Health } from "../types";
+import { applyLoad, applySaveResult, isDraftDirty, newLoadTicket } from "./draft-state";
+import type { LoadOutcome } from "./draft-state";
+import {
+  buildSavePlan,
+  buildSettingsOverwritePreview,
+  evaluateLoadedConfig,
+  isConfigRevisionConflict,
+  readConfigSnapshot,
+  sameSaveIntent,
+  settingsSaveBody,
+  settingsSaveConfirmation,
+  settingsSaveIntent,
+} from "./settings-diff";
+import type {
+  ConfigWithRevision,
+  LoadedConfigDecision,
+  PersistedSettings,
+} from "./settings-diff";
 
 interface Props {
   refreshKey: number;
   onChanged: () => void;
+  onDirtyChange: (dirty: boolean) => void;
 }
 
-export function SettingsPage({ refreshKey, onChanged }: Props) {
+type ConfigLoadResult =
+  | { kind: "stale" }
+  | { kind: "failed" }
+  | { kind: "loaded"; outcome: LoadOutcome; decision: LoadedConfigDecision };
+
+export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
   const [config, setConfig] = useState<Config>();
   const [health, setHealth] = useState<Health>();
   const [savedSnapshot, setSavedSnapshot] = useState("");
   const [message, setMessage] = useState("");
+  const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [reloading, setReloading] = useState(false);
+  const [baselineRevision, setBaselineRevision] = useState<string | null>(null);
+  const [revisionBlocked, setRevisionBlocked] = useState(false);
+  const [metadataBlocked, setMetadataBlocked] = useState(false);
+  const [conflictBlocked, setConflictBlocked] = useState(false);
+  const [concurrentRevision, setConcurrentRevision] = useState<string | null>(null);
 
-  useEffect(() => {
-    Promise.all([api<Config>("/api/config"), api<Health>("/api/health")])
-      .then(([nextConfig, nextHealth]) => {
+  // Async load/save callbacks must decide against the draft as it is when the
+  // response arrives, not against the render that started the request.
+  const configRef = useRef<Config | undefined>(undefined);
+  const baselineRef = useRef<Config | undefined>(undefined);
+  const savedRef = useRef("");
+  const loadSeq = useRef(0);
+  const revisionRef = useRef<string | null>(null);
+  const persistedSettingsRef = useRef<PersistedSettings | null>(null);
+  const saveContextSeq = useRef(0);
+
+  useLayoutEffect(() => {
+    configRef.current = config;
+  }, [config]);
+  useLayoutEffect(() => {
+    savedRef.current = savedSnapshot;
+  }, [savedSnapshot]);
+
+  /**
+   * Accept a server config as the form baseline. The revision and the
+   * persistedSettings snapshot are stored next to the baseline, never inside
+   * the config value or the dirty JSON.
+   */
+  const acceptBaseline = useCallback(
+    (
+      nextConfig: Config,
+      revision: string | null,
+      metadata: PersistedSettings | null,
+      adoptDraft: boolean,
+    ) => {
+      baselineRef.current = nextConfig;
+      revisionRef.current = revision;
+      persistedSettingsRef.current = metadata;
+      setMetadataBlocked(metadata === null);
+      setBaselineRevision(revision);
+      savedRef.current = JSON.stringify(nextConfig);
+      setSavedSnapshot(savedRef.current);
+      if (adoptDraft) {
+        configRef.current = nextConfig;
         setConfig(nextConfig);
+      }
+    },
+    [],
+  );
+
+  const loadConfig = useCallback(
+    async (explicit: boolean): Promise<ConfigLoadResult> => {
+      const ticket = newLoadTicket(++loadSeq.current, draftOf(configRef.current));
+      try {
+        const [response, nextHealth] = await Promise.all([
+          api<ConfigWithRevision>("/api/config"),
+          api<Health>("/api/health"),
+        ]);
+        const snapshot = readConfigSnapshot(response);
+        const nextConfig = snapshot.config;
+        const incomingRevision = snapshot.revision;
+        const incomingMetadata = snapshot.persistedSettings;
+        const outcome = applyLoad({
+          ticket,
+          latestTicketId: loadSeq.current,
+          draft: draftOf(configRef.current),
+          saved: savedRef.current,
+          loaded: JSON.stringify(nextConfig),
+          explicit,
+        });
+        const decision = evaluateLoadedConfig({
+          requestId: ticket.id,
+          latestRequestId: loadSeq.current,
+          applied: outcome.applied,
+          baselineRevision: revisionRef.current,
+          incomingRevision,
+        });
+        if (decision.kind === "stale") return { kind: "stale" };
+
+        // Any completed refresh changes the state a pending shadow
+        // confirmation was based on, so that attempt must be re-confirmed.
+        saveContextSeq.current += 1;
         setHealth(nextHealth);
-        setSavedSnapshot(JSON.stringify(nextConfig));
         setError("");
-      })
-      .catch((caught: unknown) => setError(errorMessage(caught)));
-  }, [refreshKey]);
+
+        if (decision.kind === "invalid-revision") {
+          setRevisionBlocked(true);
+          setConcurrentRevision(null);
+          // Show the config if the form accepted it, but never pretend to
+          // have a usable version (or metadata) for an atomic save.
+          if (outcome.applied) {
+            acceptBaseline(nextConfig, null, incomingMetadata, true);
+          } else {
+            setMetadataBlocked(
+              incomingMetadata === null || persistedSettingsRef.current === null,
+            );
+          }
+          return { kind: "loaded", outcome, decision };
+        }
+
+        setRevisionBlocked(false);
+
+        if (decision.kind === "baseline") {
+          setConflictBlocked(false);
+          setConcurrentRevision(null);
+          acceptBaseline(nextConfig, decision.revision, incomingMetadata, true);
+          return { kind: "loaded", outcome, decision };
+        }
+
+        // A valid revision arrived, but the dirty form did not accept the
+        // baseline. Keep the old baseline and its old metadata; only fail when
+        // there is no usable metadata to preview with.
+        setRevisionBlocked(revisionRef.current === null);
+        setMetadataBlocked(
+          incomingMetadata === null || persistedSettingsRef.current === null,
+        );
+
+        if (decision.kind === "concurrent") {
+          // Keep the dirty draft, the saved snapshot, the accepted revision
+          // and the accepted metadata. The warning tells the user a merge
+          // needs a reload.
+          setConcurrentRevision(decision.revision);
+        } else {
+          setConflictBlocked(false);
+          setConcurrentRevision(null);
+        }
+        return { kind: "loaded", outcome, decision };
+      } catch (caught: unknown) {
+        if (ticket.id !== loadSeq.current) return { kind: "stale" };
+        setError(errorMessage(caught));
+        return { kind: "failed" };
+      }
+    },
+    [acceptBaseline],
+  );
 
   useEffect(() => {
-    if (config && savedSnapshot && JSON.stringify(config) !== savedSnapshot) {
-      setMessage("");
+    void loadConfig(false);
+  }, [refreshKey, loadConfig]);
+
+  const dirty = config !== undefined && isDraftDirty(JSON.stringify(config), savedSnapshot);
+  const saveBlocked =
+    baselineRevision === null || revisionBlocked || metadataBlocked || conflictBlocked;
+
+  useEffect(() => {
+    onDirtyChange(dirty);
+  }, [dirty, onDirtyChange]);
+
+  useEffect(() => {
+    // Unmounting (disconnect, token gate, error screen) must clear the
+    // registration so a stale dirty flag cannot warn about a gone draft.
+    return () => {
+      onDirtyChange(false);
+    };
+  }, [onDirtyChange]);
+
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+
+  async function reloadConfig() {
+    if (dirty) {
+      const ok = await confirmAction({
+        title: "放弃未保存的修改？",
+        message: "重新加载会用服务端最新配置覆盖当前草稿。",
+        confirmLabel: "重新加载",
+      });
+      if (!ok) return;
     }
+    setReloading(true);
+    setError("");
+    setMessage("");
+    setNotice("");
+    const result = await loadConfig(true);
+    if (result.kind === "stale") {
+      setNotice("重新加载被后台刷新抢占，未按本次操作应用；请重试确认最新配置。");
+    } else if (result.kind === "loaded" && !result.outcome.applied) {
+      setNotice("重新加载期间有新的编辑，已保留当前草稿。");
+    }
+    setReloading(false);
+  }
+
+  useEffect(() => {
+    if (!config || !savedSnapshot) return;
+    if (JSON.stringify(config) !== savedSnapshot) setMessage("");
+    else setNotice("");
   }, [config, savedSnapshot]);
 
   function setThreshold(key: keyof Config["thresholds"], value: number) {
@@ -103,36 +305,176 @@ export function SettingsPage({ refreshKey, onChanged }: Props) {
 
   async function save() {
     if (!config) return;
-    const previous = JSON.parse(savedSnapshot || "{}") as Partial<Config>;
-    if (previous.shadow === true && config.shadow === false) {
-      const ok = await confirmAction({ title: "开启真实自动写入？", message: "关闭 Shadow 后，符合条件的事实和偏好会写入长期记忆；规则仍需人工确认。", confirmLabel: "开启自动写入" });
-      if (!ok) return;
+    if (saveBlocked) {
+      if (baselineRevision === null) setRevisionBlocked(true);
+      return;
     }
+
+    const baseline = baselineRef.current;
+    if (!baseline) {
+      setError("缺少配置基线，请重新加载后再保存。");
+      return;
+    }
+    let draft = configRef.current ?? config;
+    const initial = buildSavePlan({
+      baseline,
+      draft,
+      revision: revisionRef.current,
+    });
+    if (!initial.ok) {
+      if (initial.reason === "missing-revision") {
+        setRevisionBlocked(true);
+      } else if (initial.reason === "missing-baseline") {
+        setError("缺少配置基线，请重新加载后再保存。");
+      } else {
+        setNotice("没有需要保存的修改。");
+      }
+      return;
+    }
+
+    const metadata = persistedSettingsRef.current;
+    if (!metadata) {
+      setMetadataBlocked(true);
+      return;
+    }
+    const preview = buildSettingsOverwritePreview({
+      baseline,
+      patch: initial.plan.patch,
+      persistedSettings: metadata,
+    });
+    if (!preview.ok) {
+      if (preview.reason === "missing-field") {
+        setMetadataBlocked(true);
+        setError(
+          `persistedSettings 缺少本次修改字段：${preview.paths.join("、")}；请重新加载。`,
+        );
+      } else if (preview.reason === "invalid-baseline") {
+        setError("配置基线缺少可编辑字段，请重新加载。");
+      } else {
+        setMetadataBlocked(true);
+      }
+      return;
+    }
+
+    let plan = initial.plan;
+    const turningOffShadow =
+      baseline.shadow === true && initial.plan.patch.shadow === false;
+    const confirmation = settingsSaveConfirmation({
+      shadowOff: turningOffShadow,
+      entries: preview.entries,
+    });
+    if (confirmation) {
+      const intent = settingsSaveIntent(initial.plan, baseline, draft, metadata);
+      const context = saveContextSeq.current;
+      const ok = await confirmAction({
+        title: confirmation.title,
+        message: confirmation.message,
+        confirmLabel: confirmation.confirmLabel,
+        cancelLabel: "取消",
+        danger: confirmation.danger,
+      });
+      if (!ok) return;
+      // The confirmed dialog must describe the exact request that is sent: a
+      // refresh, a field edit, a baseline/revision change or a metadata change
+      // during the dialog cancels this attempt and asks again.
+      if (saveContextSeq.current !== context) {
+        setNotice("确认期间配置或服务端状态已刷新，未提交；请重新确认后再保存。");
+        return;
+      }
+      draft = configRef.current ?? draft;
+      const afterBaseline = baselineRef.current;
+      const afterMetadata = persistedSettingsRef.current;
+      const after = buildSavePlan({
+        baseline: afterBaseline,
+        draft,
+        revision: revisionRef.current,
+      });
+      if (!after.ok || !afterBaseline || !afterMetadata) {
+        setNotice("确认期间基线、版本或差异数据已变化，未提交；请重新确认后再保存。");
+        return;
+      }
+      if (
+        !sameSaveIntent(
+          intent,
+          settingsSaveIntent(after.plan, afterBaseline, draft, afterMetadata),
+        )
+      ) {
+        setNotice(
+          "确认期间基线、版本、差异数据或草稿已变化，未提交；请重新确认后再保存。",
+        );
+        return;
+      }
+      plan = after.plan;
+    }
+
+    const submitted = JSON.stringify(draft);
+    // Drop responses from loads issued before this save; they may carry the
+    // pre-save snapshot and would otherwise look clean when they return.
+    loadSeq.current += 1;
     setBusy(true);
     setError("");
     setMessage("");
+    setNotice("");
     try {
-      const next = await api<Config>("/api/config", {
+      // Only changed editable fields plus the accepted baseline revision.
+      const response = await api<ConfigWithRevision>("/api/config", {
         method: "PATCH",
-        body: JSON.stringify({
-          shadow: config.shadow,
-          autoMemory: config.autoMemory,
-          autoRules: config.autoRules,
-          decision: config.decision,
-          rewrite: config.rewrite,
-          review: config.review,
-          digest: config.digest,
-          thresholds: config.thresholds,
-          caps: config.caps,
-        }),
+        body: JSON.stringify(settingsSaveBody(plan)),
       });
-      setConfig(next);
-      setSavedSnapshot(JSON.stringify(next));
-      setMessage("已保存。下一轮 session.idle 生效；模型/端口类变更建议重启实例。");
+      const snapshot = readConfigSnapshot(response);
+      const outcome = applySaveResult({
+        ok: true,
+        submitted,
+        currentDraft: draftOf(configRef.current),
+        savedBefore: savedRef.current,
+        responseSaved: JSON.stringify(snapshot.config),
+      });
+      acceptBaseline(
+        snapshot.config,
+        snapshot.revision,
+        snapshot.persistedSettings,
+        outcome.adoptResponse,
+      );
+      setConflictBlocked(false);
+      setConcurrentRevision(null);
+      setRevisionBlocked(snapshot.revision === null);
+      if (outcome.keptNewerEdits) {
+        setMessage("");
+        setNotice("已保存上一版；保存期间的新修改仍未保存。");
+      } else if (snapshot.revision === null) {
+        setMessage("已保存；但服务端未返回新的配置版本，已禁止继续保存。");
+      } else if (snapshot.persistedSettings === null) {
+        setMessage("已保存；但服务端未返回完整的 persistedSettings，已禁止继续保存。");
+      } else {
+        setNotice("");
+        setMessage("已保存。下一轮 session.idle 生效；模型/端口类变更建议重启实例。");
+      }
       onChanged();
     } catch (caught: unknown) {
-      setError(errorMessage(caught));
+      if (caught instanceof ApiError && isConfigRevisionConflict(caught.status)) {
+        // Atomic revision check failed: preserve the draft, the accepted
+        // baseline, metadata and the old revision exactly. No automatic retry.
+        setConflictBlocked(true);
+        setError("");
+        setNotice("");
+      } else {
+        // A failed save keeps both the draft and the previous baseline.
+        const outcome = applySaveResult({
+          ok: false,
+          submitted,
+          currentDraft: draftOf(configRef.current),
+          savedBefore: savedRef.current,
+          responseSaved: savedRef.current,
+        });
+        savedRef.current = outcome.saved;
+        setSavedSnapshot(outcome.saved);
+        setNotice("");
+        setError(errorMessage(caught));
+      }
     } finally {
+      // A load issued while the request was in flight may have read the server
+      // before it persisted this change; never let it replace the draft.
+      loadSeq.current += 1;
       setBusy(false);
     }
   }
@@ -142,7 +484,6 @@ export function SettingsPage({ refreshKey, onChanged }: Props) {
   }
 
   const keySource = health?.decision.keySource ?? "missing";
-  const dirty = Boolean(config) && JSON.stringify(config) !== savedSnapshot;
   const keyLabel =
     keySource === "env"
       ? "环境变量 OLLAMA_API_KEY"
@@ -604,6 +945,31 @@ export function SettingsPage({ refreshKey, onChanged }: Props) {
         </div>
       </section>
 
+      {revisionBlocked || metadataBlocked || conflictBlocked || concurrentRevision ? (
+        <div style={{ gridColumn: "1 / -1", display: "grid", gap: 8 }}>
+          {revisionBlocked ? (
+            <div className="banner error" role="alert" style={{ margin: 0 }}>
+              当前没有可用于安全保存的配置版本（configRevision），保存已禁用。请点击“重新加载”获取最新配置；若仍出现，请升级控制台/插件。
+            </div>
+          ) : null}
+          {metadataBlocked ? (
+            <div className="banner error" role="alert" style={{ margin: 0 }}>
+              服务端未返回完整且有效的 persistedSettings，无法安全预览跨实例差异，保存已禁用。请点击“重新加载”；若仍出现，请升级控制台/插件。
+            </div>
+          ) : null}
+          {conflictBlocked ? (
+            <div className="banner error" role="alert" style={{ margin: 0 }}>
+              保存未写入（配置冲突）：服务端保存的配置版本已变化。当前草稿和保存基线已原样保留；请先复制需要的修改，再点击“重新加载”读取最新配置（会覆盖草稿）。
+            </div>
+          ) : null}
+          {concurrentRevision ? (
+            <div className="banner" role="status" style={{ margin: 0 }}>
+              服务端保存的配置版本已变化；当前草稿和保存基线已保留，未自动合并。保存会用已接受的旧版本做冲突检查；如需采用服务端版本，请先复制修改再重新加载。
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
       <div
         style={{
           gridColumn: "1 / -1",
@@ -613,9 +979,18 @@ export function SettingsPage({ refreshKey, onChanged }: Props) {
           flexWrap: "wrap",
         }}
       >
-        <button className="btn primary" disabled={busy} onClick={() => void save()} type="button">
+        <button className="btn primary" disabled={busy || reloading || saveBlocked} onClick={() => void save()} type="button">
           {busy ? "Saving…" : "Save settings"}
         </button>
+        <button className="btn" disabled={busy || reloading} onClick={() => void reloadConfig()} type="button">
+          {reloading ? "Reloading…" : "重新加载"}
+        </button>
+        {dirty ? (
+          <span className="muted small">
+            有未保存的修改；后台刷新不会覆盖草稿。“重新加载”会放弃修改并读取服务端配置。
+          </span>
+        ) : null}
+        {notice ? <span className="muted small">{notice}</span> : null}
         {message ? (
           <div className="banner ok" role="status" style={{ margin: 0 }}>
             {message}
@@ -633,4 +1008,8 @@ export function SettingsPage({ refreshKey, onChanged }: Props) {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function draftOf(config: Config | undefined): string {
+  return config === undefined ? "" : JSON.stringify(config);
 }

@@ -1,8 +1,9 @@
 import type { AutoMemConfig, HealthScore } from "./types.js";
 import type { Store } from "./store.js";
 import { capacityStatus } from "./capacity.js";
-import { textSimilarity } from "./fingerprint.js";
 import { ageDays } from "./priority.js";
+import { sameScopeAndProject } from "./memory/scope.js";
+import { classifyRelation } from "./relations.js";
 
 export async function computeHealth(
   store: Store,
@@ -23,7 +24,12 @@ export async function computeHealth(
   const duplicateIds = new Set<string>();
   for (let left = 0; left < active.length; left++) {
     for (let right = left + 1; right < active.length; right++) {
-      if (textSimilarity(active[left].text, active[right].text) >= 0.92) {
+      if (!sameScopeAndProject(active[left], active[right])) continue;
+      const relation = classifyRelation(
+        { text: active[left].text, kind: active[left].kind },
+        { text: active[right].text, kind: active[right].kind },
+      );
+      if (relation.relation === "exact" || relation.relation === "covered") {
         duplicateIds.add(active[left].id);
         duplicateIds.add(active[right].id);
       }
@@ -33,7 +39,7 @@ export async function computeHealth(
 
   const titles = new Map<string, Set<string>>();
   for (const item of active) {
-    const key = item.title.trim().toLowerCase();
+    const key = `${item.scope}|${item.projectKey ?? ""}|${item.title.trim().toLowerCase()}`;
     const texts = titles.get(key) ?? new Set<string>();
     texts.add(item.text.trim());
     titles.set(key, texts);

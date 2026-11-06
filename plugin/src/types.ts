@@ -227,6 +227,18 @@ export interface QueueItem extends Item {
   suggestion?: Suggestion;
   suggestionState?: "pending" | "ready" | "failed";
   suggestionError?: string;
+  /**
+   * Derived at read time from curated L0/L2 files. Never persisted with the
+   * queue row and never part of its decision/version snapshot.
+   */
+  coverage?: Array<{
+    source: string;
+    sourceId: string;
+    heading: string;
+    line: number;
+    relation: string;
+    score: number;
+  }>;
 }
 
 export interface ShadowRecord {
@@ -336,6 +348,8 @@ export interface AuditFinding {
   kind:
     | "duplicate"
     | "conflict"
+    | "classification"
+    | "coverage"
     | "stale"
     | "capacity"
     | "secret"
@@ -575,6 +589,8 @@ export interface MergeJournal {
   /** A started undo can safely resume after a crash between file writes. */
   undoing?: boolean;
   undone?: boolean;
+  /** The user changed the proposed title/text before applying. */
+  humanEdited?: boolean;
 }
 
 export interface HealthScore {

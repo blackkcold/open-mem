@@ -82,6 +82,49 @@ describe("session review integration", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+  it("keeps a project candidate as a session note when no project identity is available", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-review-int-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const text = "本项目统一使用 pnpm";
+      const input: ReviewInput = {
+        sessionID: "s1",
+        items: [],
+        chars: 0,
+        hash: "no-project",
+        truncated: false,
+        userCount: 1,
+        toolCount: 0,
+        rawToolChars: 0,
+        sources: { m1: { user: text, tools: [] } },
+      };
+      const result: ReviewRunResult = {
+        summary: [],
+        openQuestions: [],
+        model: "test",
+        candidates: [
+          {
+            type: "preference",
+            text,
+            scope: "project",
+            confidence: 0.9,
+            evidence: [{ messageID: "m1", quote: text, kind: "user" }],
+          },
+        ],
+      };
+      const accepted = await acceptReviewCandidates(input, result, "review-no-project", {
+        store,
+        config: DEFAULT_CONFIG,
+      });
+      expect(accepted.created).toBe(0);
+      expect(accepted.sessionNotes).toHaveLength(1);
+      expect(await store.listHooks()).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("queues a review candidate even when the same verdict would auto-write", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-review-int-"));
     try {

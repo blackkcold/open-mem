@@ -49,6 +49,7 @@ if (undoID) {
 
 const preview = await request("/api/migrations/scopes/preview");
 const proposals = Array.isArray(preview.proposals) ? preview.proposals : [];
+const previewID = typeof preview.previewID === "string" ? preview.previewID : "";
 console.log(`data: ${dataDir}`);
 console.log(`mode: ${flag("--apply") ? "APPLY" : "dry-run"}`);
 console.log(`summary: ${JSON.stringify(preview.summary ?? {})}`);
@@ -62,10 +63,14 @@ if (!flag("--apply")) {
   console.log("\nDry run only. Re-run with --apply to write the migration.");
   process.exit(0);
 }
+if (!previewID) {
+  console.log("\nNo changes to apply.");
+  process.exit(0);
+}
 
 const applied = await request("/api/migrations/scopes/apply", {
   method: "POST",
-  body: JSON.stringify({ confirmedByUser: true }),
+  body: JSON.stringify({ confirmedByUser: true, previewID }),
 });
 if (!applied.id) {
   console.log("\nNo changes to apply.");

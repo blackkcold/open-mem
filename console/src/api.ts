@@ -28,6 +28,11 @@ export class ApiError extends Error {
   }
 }
 
+/** A lost write response cannot establish whether the server committed it. */
+export function unknownWriteOutcome(): ApiError {
+  return new ApiError(504, "操作结果未知，可能已提交。请先刷新核对，勿直接重试。", "OPENMEM_OUTCOME_UNKNOWN");
+}
+
 function readStoredToken(): string {
   try {
     return localStorage.getItem(TOKEN_KEY) ?? "";
@@ -107,14 +112,19 @@ async function standaloneTransport(
   let response: Response;
   try {
     response = await fetch(path, { ...init, headers });
+    const body = await response.text();
+    return { status: response.status, body };
   } catch {
+    if ((init.method ?? "GET").toUpperCase() !== "GET") throw unknownWriteOutcome();
     throw new ApiError(0, "无法连接 OpenMem 控制台。请确认它正在运行。");
   }
-  return { status: response.status, body: await response.text() };
 }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const result = await transport(path, init);
+  if (result.status >= 500 && (init.method ?? "GET").toUpperCase() !== "GET") {
+    throw unknownWriteOutcome();
+  }
   let data: unknown;
   if (result.body) {
     try {
