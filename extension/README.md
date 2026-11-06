@@ -48,6 +48,10 @@ service proxy tests. CI uses the same command, without live credentials or model
 The build is an IIFE for the three UI surfaces and a Node ESM bundle for the
 service, because OpenChamber extension iframes cannot load ES modules.
 
+Packaged builds derive the extension version from `console/package.json` and append
+`+build.<UTC timestamp>`. The OpenChamber extension card and the console footer show
+the same build, so two builds of the same semantic version are distinguishable.
+
 ## Install
 
 ### Option A — install the zip (recommended for a normal deployment)

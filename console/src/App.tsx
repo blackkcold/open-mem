@@ -290,7 +290,10 @@ export function App() {
         <div className="sidebar-foot">
           <span className="shadow-pill">{health?.shadow ? "SHADOW ON" : "SHADOW OFF"}</span>
           <span className="sidebar-mode">{extension ? "OpenChamber 扩展" : "localhost + token"}</span>
-          <span className="sidebar-version">v0.5.0</span>
+          <span className="sidebar-version">v{__APP_VERSION__}</span>
+          <span className="sidebar-build" title={__BUILD_TIME__}>
+            构建 {__BUILD_TIME__.replace("T", " ").replace(/\.\d+Z$/, " UTC")}
+          </span>
         </div>
       </aside>
 
