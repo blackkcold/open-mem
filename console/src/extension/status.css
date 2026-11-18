@@ -167,3 +167,42 @@ body {
   .st[data-state="loading"] .st-dot { animation: none; }
   .st-bar i { transition: none; }
 }
+
+/* P05: read-only 88px status; three independent axes. */
+.st { min-width: 0; }
+.st-pill {
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.st-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.st-axis {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+  color: var(--oc-muted);
+  font-size: 0.62rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.st-axis.success { color: var(--oc-success-text); }
+.st-axis.warning { color: var(--oc-warning-text); }
+.st-axis.info { color: var(--oc-info-text); }
+.st-sub {
+  overflow: hidden;
+  color: var(--oc-muted);
+  font-size: 0.58rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.st-axis,
+.st-sub { font-size: 0.7rem; }

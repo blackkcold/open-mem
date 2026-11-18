@@ -13,7 +13,7 @@ import type {
   SourceRef,
 } from "./types.js";
 import { Store, newId } from "./store.js";
-import { autoThreshold } from "./config.js";
+import { autoThreshold, mergeConfig } from "./config.js";
 import { compact, lintText } from "./linter.js";
 import { computePriority } from "./priority.js";
 import {
@@ -30,11 +30,16 @@ import { classifyScope, sameScopeAndProject } from "./memory/scope.js";
 import { findWriteConflicts } from "./memory/write-guard.js";
 import { classifyRelation, isExactRelation, relationLabel } from "./relations.js";
 import { redactText } from "./redact.js";
+import { newChangeID, recordChange } from "./changes.js";
+import { isSuppressed, suppressionTextHash } from "./memory/suppression.js";
+import { isSourceRetired } from "./memory/lifecycle.js";
 
 export interface ConsolidationDeps {
   store: Store;
   decision: DecisionProvider;
   config: AutoMemConfig;
+  /** A deliberate, protected manual review may remain available while off. */
+  allowLegacyManual?: boolean;
   readMessages: (sessionID: string) => Promise<SessionMessage[]>;
   project?: string;
   projectKey?: string;
@@ -96,7 +101,27 @@ export async function runConsolidation(
     shadowed: 0,
     skipped: 0,
   };
+  const modeAtStart = deps.config.automation.mode;
+  const revisionAtStart = deps.config.automation.revision;
+  const automationModeCurrent = async (): Promise<boolean> => {
+    if (modeAtStart === "off" && !deps.allowLegacyManual) return false;
+    if (
+      deps.config.automation.mode !== modeAtStart ||
+      deps.config.automation.revision !== revisionAtStart
+    ) return false;
+    const persisted = await deps.store.readConfig().catch(() => undefined);
+    if (!persisted) return false;
+    // A v0.5.0 config has no automation object/mode/revision. Normalize it so
+    // legacy manual consolidation is compared against the same defaults the
+    // in-memory config was merged with, instead of aborting on `undefined`.
+    const stored = mergeConfig(persisted).automation;
+    return stored.mode === modeAtStart &&
+      (stored.revision ?? 0) === (revisionAtStart ?? 0) &&
+      (modeAtStart !== "off" || deps.allowLegacyManual === true);
+  };
+  if (!await automationModeCurrent()) return result;
   const messages = await deps.readMessages(sessionID);
+  if (!await automationModeCurrent()) return result;
   const previous = await deps.store.readSession(sessionID);
   const lastID = messages[messages.length - 1]?.id;
   const users = messages.filter(isUserAuthored);
@@ -111,6 +136,7 @@ export async function runConsolidation(
     newUsers[0]?.id ?? previous?.lastTurnID ?? lastID ?? newId("turn");
 
   if (messages.length > 0) {
+    if (!await automationModeCurrent()) return result;
     result.captured = await captureHooks(deps, sessionID, newUsers, turnID);
     if (result.captured > 0) {
       deps.broadcast?.("hooks.updated", {
@@ -128,6 +154,7 @@ export async function runConsolidation(
     sessionID,
     Math.max(1, deps.config.turn?.maxCandidates ?? 12),
   );
+  if (!await automationModeCurrent()) return result;
 
   if (pending.length === 0) {
     if (messages.length > 0) {
@@ -170,6 +197,32 @@ export async function runConsolidation(
       hook.text = redacted.text;
       hook.title = compact(redacted.text).slice(0, 30);
       await saveHook(hook, "ignored", { error: "敏感信息已拦截，不会发送给模型" });
+      result.skipped += 1;
+      continue;
+    }
+    if (await isSourceRetired(deps.store, hook.sessionID, hook.messageID, hook.source.observedAt)) {
+      await saveHook(hook, "ignored", { error: "retired_source" });
+      await deps.store.appendChangelog({
+        action: "retired_source_skipped",
+        sessionID,
+        messageID: hook.messageID,
+        origin: hook.origin ?? "turn",
+      });
+      result.skipped += 1;
+      continue;
+    }
+    // A stopped/reverted memory must not be re-learned from the same source.
+    // The key embeds session+message+text hash, so a new (correcting) message
+    // is still allowed to teach the opposite.
+    if (await isSuppressed(deps.store, hook.key, suppressionTextHash(hook.text))) {
+      await saveHook(hook, "ignored", { error: "suppressed_after_revert" });
+      await deps.store.appendChangelog({
+        action: "suppressed_after_revert",
+        hookID: hook.id,
+        sessionID,
+        messageID: hook.messageID,
+        origin: hook.origin ?? "turn",
+      });
       result.skipped += 1;
       continue;
     }
@@ -227,6 +280,7 @@ export async function runConsolidation(
   );
   const outcomes = await mapPool(prepared, parallel, async (entry) => {
     try {
+      if (!await automationModeCurrent()) return { entry, cancelled: true as const };
       const decision =
         entry.hook.decision && entry.hook.error?.startsWith("capacity:")
           ? entry.hook.decision
@@ -251,6 +305,14 @@ export async function runConsolidation(
   for (const outcome of outcomes) {
     const hook = outcome.entry.hook;
     try {
+    if ("cancelled" in outcome && outcome.cancelled) {
+      await saveHook(hook, "pending", {
+        attempts: Math.max(0, hook.attempts - 1),
+        error: undefined,
+      });
+      result.skipped += 1;
+      continue;
+    }
     const belongsToHook = (entry: { scope: Scope; projectKey?: string }): boolean => sameScopeAndProject(entry, hook);
     if (outcome.error || !outcome.decision) {
       await saveHook(hook, "failed", {
@@ -468,9 +530,16 @@ export async function runConsolidation(
         seenCount: 1,
         lastSeenAt: now,
         sources: [hook.source],
+        changeID: newChangeID(),
       };
       const written = await deps.store.transaction(async () => {
+      if (!await automationModeCurrent()) return "mode-changed" as const;
       if (!await deps.store.ownsClaim(outcome.entry.reservationKey, outcome.entry.reservationToken)) return "blocked" as const;
+      if (await isSourceRetired(deps.store, hook.sessionID, hook.messageID, hook.source.observedAt)) {
+        await saveHook(hook, "ignored", { error: "retired_source" });
+        await deps.store.appendChangelog({ action: "retired_source_skipped", sessionID, messageID: hook.messageID });
+        return "retired" as const;
+      }
       const [freshItems, freshQueue] = await Promise.all([
         deps.store.listItems(),
         deps.store.listQueue(),
@@ -521,6 +590,22 @@ export async function runConsolidation(
       }
       admission = await admitAutoWrite(deps.store, deps.config, kind);
       if (!admission.ok) return "blocked" as const;
+      const budget = await deps.store.consumeWriteBudget({
+        sessionID,
+        dailyWrites: deps.config.automation.dailyWrites,
+        maxWritesPerSession: deps.config.automation.maxWritesPerSession,
+      });
+      if (!budget.ok) {
+        // Keep the hook retryable instead of dropping the candidate; capture
+        // and the remaining candidates keep running.
+        await saveHook(hook, "blocked", {
+          decision: base,
+          error: "capacity: write-budget",
+          attempts: Math.max(0, hook.attempts - 1),
+        });
+        await deps.store.appendChangelog({ action: "capture_blocked", hookID: hook.id, reason: "write-budget" });
+        return "budget-blocked" as const;
+      }
       if (kind === "rule") {
         await deps.store.appendAutoRule(hook.text, {
           id: item.id,
@@ -539,6 +624,18 @@ export async function runConsolidation(
         });
       }
       await deps.store.appendItem(item);
+      await recordChange(deps.store, {
+        kind: "add",
+        actor: "auto",
+        itemID: item.id,
+        item,
+        source: hook.source,
+        origin: hook.origin === "session-review" ? "session-review" : "turn",
+        reason: "auto",
+      });
+      await deps.store.updateAutomationState({
+        lastSuccess: { at: now, kind: item.kind, itemID: item.id, action: "add" },
+      });
       await deps.store.appendChangelog({
         action: "auto",
         itemID: item.id,
@@ -553,6 +650,18 @@ export async function runConsolidation(
       return "written" as const;
       });
       if (written === "duplicate") {
+        result.skipped += 1;
+        continue;
+      }
+      if (written === "retired") {
+        result.skipped += 1;
+        continue;
+      }
+      if (written === "mode-changed") {
+        result.skipped += 1;
+        continue;
+      }
+      if (written === "budget-blocked") {
         result.skipped += 1;
         continue;
       }
@@ -665,7 +774,13 @@ export async function runConsolidation(
       reviewID: hook.reviewID,
     };
     const queued = await deps.store.transaction(async () => {
+    if (!await automationModeCurrent()) return "mode-changed" as const;
     if (!await deps.store.ownsClaim(outcome.entry.reservationKey, outcome.entry.reservationToken)) return false;
+    if (await isSourceRetired(deps.store, hook.sessionID, hook.messageID, hook.source.observedAt)) {
+      await saveHook(hook, "ignored", { error: "retired_source" });
+      await deps.store.appendChangelog({ action: "retired_source_skipped", sessionID, messageID: hook.messageID });
+      return "retired" as const;
+    }
     const fresh = await admitQueueItem(deps.store, deps.config);
     if (!fresh.ok) {
       await saveHook(hook, "blocked", { decision: base, error: `capacity: ${fresh.reason}`, attempts: Math.max(0, hook.attempts - 1) });
@@ -683,8 +798,10 @@ export async function runConsolidation(
       decision: base,
       queueID: queueItem.id,
     });
-    return true;
+    return "queued" as const;
     });
+    if (queued === "retired") { result.skipped += 1; continue; }
+    if (queued === "mode-changed") { result.skipped += 1; continue; }
     if (!queued) { result.skipped += 1; continue; }
     queue = [...queue, queueItem];
     result.queued += 1;
@@ -866,6 +983,9 @@ export function extractCandidates(
         sessionID,
         messageID: message.id,
         role: "user",
+        ...(Number.isFinite(message.time?.created ?? message.time?.completed)
+          ? { observedAt: message.time?.created ?? message.time?.completed }
+          : {}),
       },
     });
   };

@@ -26,3 +26,17 @@ export function isUserAuthored(message: SessionMessage): boolean {
   if (!isUser) return false;
   return !isKeepAliveText(message.text);
 }
+
+/**
+ * Only an actual native assistant/tool message can carry tool execution
+ * evidence. A user/system part merely shaped like a tool part, or a synthetic
+ * message, never receives a native tool role.
+ */
+export function nativeToolMessageRole(
+  message: SessionMessage,
+): "assistant" | "tool" | undefined {
+  if (isSyntheticMessage(message)) return undefined;
+  if (message.type === "user" || message.type === "system") return undefined;
+  const role = message.role;
+  return role === "assistant" || role === "tool" ? role : undefined;
+}

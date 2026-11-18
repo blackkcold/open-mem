@@ -13,34 +13,118 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { queueItemSnapshotVersion } from "./fingerprint.js";
+import { queueItemSnapshotVersion, itemContentVersion } from "./fingerprint.js";
 import type {
   AuditReport,
   AutoMemConfig,
+  ChangeEvent,
+  ChangeJournal,
+  ExtractPendingWork,
+  ExtractQuarantineRecord,
+  GlobalCandidate,
+  GlobalCandidateState,
   HookRecord,
   Item,
   MergeJournal,
   Metrics,
   PersistedState,
+  PersistedAutomationState,
   QueueItem,
+  RetiredSource,
+  RetiredSourceState,
   ReviewRecord,
   ReviewSessionNote,
   SessionState,
   ShadowRecord,
   SkillDraft,
   SourceRef,
+  Suppression,
   UsageRecord,
 } from "./types.js";
 import { DEFAULT_CONFIG } from "./config.js";
 import { withFileLock } from "./util/lock.js";
 import { commitFileBatch, recoverFileBatch, safeStorePath, type FileBatch } from "./util/transaction.js";
+import { sha16 } from "./util/text.js";
 
 const nowIso = () => new Date().toISOString();
+export const EXTRACT_PENDING_MAX_ROWS = 50;
+export const EXTRACT_PENDING_MAX_BYTES = 200 * 1024;
+export const EXTRACT_PENDING_TTL_MS = 72 * 60 * 60 * 1000;
+const MAX_EXPIRED_EXTRACT_WINDOW_HASHES = 16;
+const MODEL_REQUEST_DAY_MS = 24 * 60 * 60 * 1000;
+const MODEL_REQUEST_HOUR_MS = 60 * 60 * 1000;
+const EXTRACT_FAIRNESS_DELAY_MS = 15 * 60 * 1000;
+const REVIEW_STARVATION_MS = 2 * MODEL_REQUEST_HOUR_MS;
+const DAY_MODEL_REQUEST_LIMIT = 40;
 type Reservation = number | { expiresAt: number; token?: string };
 // Legacy timestamps have no stored TTL. Keep them conservatively for ten
 // minutes; new claims always carry their own expiry, independent of the caller.
 const reservationExpiry = (value: Reservation, legacyTtl = 10 * 60_000): number =>
   typeof value === "number" ? value + legacyTtl : value?.expiresAt;
+
+function expiredExtractWindowHashes(session: SessionState): string[] {
+  return (session.extractExpiredWindowHashes ?? [])
+    .filter((hash): hash is string => typeof hash === "string" && hash.length > 0 && hash.length <= 128)
+    .slice(-MAX_EXPIRED_EXTRACT_WINDOW_HASHES);
+}
+
+function rememberExpiredExtractWindow(
+  session: SessionState,
+  windowHash: string | undefined,
+): { session: SessionState; added: boolean } {
+  const hashes = expiredExtractWindowHashes(session);
+  const validHash = typeof windowHash === "string" && windowHash.length > 0 && windowHash.length <= 128
+    ? windowHash
+    : undefined;
+  if (!validHash || hashes.includes(validHash)) {
+    return {
+      session: hashes.length > 0 ? { ...session, extractExpiredWindowHashes: hashes } : session,
+      added: false,
+    };
+  }
+  return {
+    session: {
+      ...session,
+      extractExpiredWindowHashes: [...hashes, validHash].slice(-MAX_EXPIRED_EXTRACT_WINDOW_HASHES),
+    },
+    added: true,
+  };
+}
+
+function expireExtractPending(session: SessionState): { session: SessionState; newlyExpired: boolean } {
+  const windowHash = session.extractPending?.windowHash;
+  const { extractPending: _expired, ...rest } = session;
+  const terminal = rememberExpiredExtractWindow(rest, windowHash);
+  const hasValidHash = typeof windowHash === "string" && windowHash.length > 0 && windowHash.length <= 128;
+  return {
+    session: terminal.session,
+    // Hashless legacy markers still count once when removed; hashed repeats are idempotent.
+    newlyExpired: !hasValidHash || terminal.added,
+  };
+}
+
+function extractPendingEntries(
+  state: PersistedState,
+  now?: number,
+): Array<[string, ExtractPendingWork]> {
+  return Object.entries(state.sessions).flatMap(([sessionID, session]) => {
+    const pending = session.extractPending;
+    if (!pending) return [];
+    if (now !== undefined) {
+      const createdAt = Date.parse(pending.createdAt ?? pending.updatedAt);
+      if (!Number.isFinite(createdAt) || now - createdAt >= EXTRACT_PENDING_TTL_MS) return [];
+    }
+    return [[sessionID, pending] as [string, ExtractPendingWork]];
+  });
+}
+
+function extractPendingBytes(entries: Array<[string, ExtractPendingWork]>): number {
+  return entries.reduce(
+    (total, [sessionID, pending]) => total + Buffer.byteLength(JSON.stringify([sessionID, pending]), "utf8") + 1,
+    0,
+  );
+}
+
 export const newId = (prefix: string) =>
   `${prefix}_${Date.now().toString(36)}_${crypto.randomBytes(4).toString("hex")}`;
 
@@ -74,6 +158,7 @@ export class Store {
   private writeChain: Promise<void> = Promise.resolve();
   private readonly pending = new AsyncLocalStorage<FileBatch>();
   private readonly claims = new Map<string, string>();
+  private versionCache?: { key: string; version: string; nextExpiry: number | null };
 
   constructor(dataDir: string) {
     this.dataDir = dataDir;
@@ -142,6 +227,30 @@ export class Store {
   get journalPath() {
     return path.join(this.dataDir, "merge-journal.jsonl");
   }
+  get changesPath() {
+    return path.join(this.dataDir, "changes.jsonl");
+  }
+  get suppressionsPath() {
+    return path.join(this.dataDir, "suppressions.jsonl");
+  }
+  get retiredSourcesPath() {
+    return path.join(this.dataDir, "retired-sources.jsonl");
+  }
+  get retiredSourceStatePath() {
+    return path.join(this.dataDir, "retired-source-state.json");
+  }
+  get globalCandidatesPath() {
+    return path.join(this.dataDir, "global-candidates.jsonl");
+  }
+  get globalCandidateStatePath() {
+    return path.join(this.dataDir, "global-candidate-state.json");
+  }
+  get extractQuarantinePath() {
+    return path.join(this.dataDir, "extract-quarantine.jsonl");
+  }
+  get changeJournalDir() {
+    return path.join(this.dataDir, "change-journal");
+  }
   get decisionUsagePath() {
     return path.join(this.dataDir, "decision-usage.jsonl");
   }
@@ -169,6 +278,18 @@ export class Store {
     await ensureFile(this.reviewsPath, "");
     await ensureFile(this.changelogPath, "");
     await ensureFile(this.journalPath, "");
+    await ensureFile(this.changesPath, "");
+    await ensureFile(this.suppressionsPath, "");
+    await ensureFile(this.retiredSourcesPath, "");
+    await ensureFile(this.globalCandidatesPath, "");
+    await ensureFile(this.extractQuarantinePath, "");
+    if (!existsSync(this.retiredSourceStatePath)) {
+      await this.writeJson(this.retiredSourceStatePath, { epoch: 0 });
+    }
+    if (!existsSync(this.globalCandidateStatePath)) {
+      await this.writeJson(this.globalCandidateStatePath, { epoch: 0, blocked: false });
+    }
+    await mkdir(this.changeJournalDir, { recursive: true });
     await ensureFile(this.decisionUsagePath, "");
     await ensureFile(this.rewriteUsagePath, "");
     await ensureFile(this.autoMemoryPath, "# AUTO_MEMORY\n\n");
@@ -186,8 +307,12 @@ export class Store {
     if (!existsSync(this.statsPath)) await this.writeJson(this.statsPath, {});
   }
 
-  async withLock<T>(fn: () => Promise<T>): Promise<T> {
-    const previous = this.writeChain;
+  /** True while a `transaction()` file batch is open on this call stack. */
+  get inTransaction(): boolean {
+    return Boolean(this.pending.getStore());
+  }
+
+  async withLock<T>(fn: () => Promise<T>): Promise<T> {    const previous = this.writeChain;
     let release!: () => void;
     this.writeChain = new Promise<void>((resolve) => {
       release = resolve;
@@ -311,6 +436,40 @@ export class Store {
     await this.writeText(file, rows.length > 0 ? `${rows.map((row) => JSON.stringify(row)).join("\n")}\n` : "");
   }
 
+  /** Transaction-aware directory listing for staged journal/checkpoint hashes. */
+  async listDataDirectory(relative: string): Promise<string[]> {
+    const base = path.resolve(this.dataDir, relative);
+    const names = new Set<string>();
+    try {
+      for (const entry of await readdir(base, { withFileTypes: true })) {
+        if (entry.isFile()) names.add(entry.name);
+      }
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+    const batch = this.pending.getStore();
+    if (batch) {
+      for (const [file, text] of batch) {
+        const rel = path.relative(base, file);
+        if (!rel || rel.startsWith(`..${path.sep}`) || rel === ".." || path.isAbsolute(rel) || rel.includes(path.sep)) continue;
+        if (text === null) names.delete(rel);
+        else names.add(rel);
+      }
+    }
+    return [...names].sort();
+  }
+
+  /** Transaction-aware raw read for migration hash/checkpoint verification. */
+  async readDataText(relative: string): Promise<string | undefined> {
+    const full = await safeStorePath(this.dataDir, path.join(this.dataDir, relative));
+    try {
+      return await this.readText(full);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
   async readConfig(): Promise<AutoMemConfig> {
     return this.readJson<AutoMemConfig>(this.configPath, DEFAULT_CONFIG);
   }
@@ -338,6 +497,22 @@ export class Store {
       items[index] = next;
       await this.writeItemsFile(items);
       return next;
+    });
+  }
+
+  /**
+   * Replace one row with an exact item, without merging the previous fields.
+   * Version restore/deactivate must not keep fields that only the current
+   * version had; a partial merge would rewrite more than the user chose.
+   */
+  async replaceItem(item: Item): Promise<Item | undefined> {
+    return this.withWriteLock(async () => {
+      const items = await this.listItems();
+      const index = items.findIndex((entry) => entry.id === item.id);
+      if (index === -1) return undefined;
+      items[index] = item;
+      await this.writeItemsFile(items);
+      return item;
     });
   }
 
@@ -408,7 +583,17 @@ export class Store {
 
   async appendShadow(record: ShadowRecord, max = DEFAULT_CONFIG.caps.shadow): Promise<void> {
     await this.withWriteLock(async () => {
-      await this.appendJsonl(this.shadowPath, record);
+      const records = await this.listShadow();
+      const existing = record.hookID
+        ? records.find((entry) => entry.hookID === record.hookID)
+        : records.find((entry) => entry.id === record.id);
+      if (!existing) {
+        await this.appendJsonl(this.shadowPath, record);
+      } else {
+        await this.writeJsonl(this.shadowPath, records.map((entry) => entry.id === existing.id
+          ? { ...entry, ...record, id: existing.id, createdAt: existing.createdAt }
+          : entry));
+      }
       await this.trimShadow(max);
     });
   }
@@ -630,18 +815,131 @@ export class Store {
     });
   }
 
-  /** Atomically reserve one review model call inside a rolling window. */
-  async takeModelSlot(kind: "decision" | "rewrite" | "review", max: number, at = Date.now()): Promise<boolean> {
+  /** Atomically reserve a review/extract request against shared rolling budgets. */
+  async reserveModelRequest(
+    kind: "decision" | "rewrite" | "review",
+    maxPerHour: number,
+    at = Date.now(),
+    options: { purpose?: "review" | "extract"; dailyLimit?: number } = {},
+  ): Promise<{ ok: boolean; retryAt?: number; window?: "hour" | "day" }> {
     return this.withStateLock(async () => {
       const state = await this.readState();
-      const requests = state.modelRequests ?? {};
-      const times = (requests[kind] ?? []).filter((entry) => entry >= at - 60 * 60 * 1000);
-      if (times.length >= max) return false;
-      times.push(at);
-      requests[kind] = times;
-      await this.writeJson(this.statePath, { ...state, modelRequests: requests });
-      return true;
+      const requests = { ...(state.modelRequests ?? {}) };
+      if (kind === "review") {
+        const purpose = options.purpose ?? "review";
+        const hourLimit = Math.max(0, Math.floor(maxPerHour));
+        const dayLimit = Math.min(
+          DAY_MODEL_REQUEST_LIMIT,
+          Math.max(0, Math.floor(options.dailyLimit ?? DAY_MODEL_REQUEST_LIMIT)),
+        );
+        const dayTimes = (requests.review ?? []).filter((entry) => entry >= at - MODEL_REQUEST_DAY_MS);
+        const hourTimes = dayTimes.filter((entry) => entry >= at - MODEL_REQUEST_HOUR_MS);
+        const purposes = (state.modelRequestPurposes ?? [])
+          .filter((entry) => entry.at >= at - MODEL_REQUEST_DAY_MS)
+          .slice(-DAY_MODEL_REQUEST_LIMIT);
+        const hourlyPurposes = purposes.filter((entry) => entry.at >= at - MODEL_REQUEST_HOUR_MS);
+        const unclassifiedDayRequests = Math.max(0, dayTimes.length - purposes.length);
+        const unclassifiedHourRequests = Math.max(0, hourTimes.length - hourlyPurposes.length);
+        const reviewDayRequests = purposes.filter((entry) => entry.purpose === "review").length +
+          unclassifiedDayRequests;
+        const reviewHourRequests = hourlyPurposes.filter((entry) => entry.purpose === "review").length +
+          unclassifiedHourRequests;
+        const pending = extractPendingEntries(state, at);
+        const pendingCreatedAt = pending
+          .map(([, entry]) => Date.parse(entry.createdAt ?? entry.updatedAt))
+          .filter((created) => Number.isFinite(created));
+        const oldestPendingAt = pendingCreatedAt.length > 0
+          ? Math.min(...pendingCreatedAt)
+          : undefined;
+        const agedPending = oldestPendingAt !== undefined &&
+          at - oldestPendingAt >= EXTRACT_FAIRNESS_DELAY_MS;
+        const dueReviews = Object.values(state.sessions)
+          .flatMap((session) => {
+            if (session.reviewStatus !== "scheduled" || !session.reviewDueAt) return [];
+            const dueAt = Date.parse(session.reviewDueAt);
+            return Number.isFinite(dueAt) && dueAt <= at ? [dueAt] : [];
+          });
+        const oldestDueReview = dueReviews.length > 0 ? Math.min(...dueReviews) : undefined;
+        const latestReviewRequest = purposes
+          .filter((entry) => entry.purpose === "review")
+          .reduce<number | undefined>((latest, entry) => latest === undefined || entry.at > latest ? entry.at : latest, undefined);
+        const latestPurpose = purposes.at(-1)?.purpose;
+        const reviewStarved = oldestDueReview !== undefined &&
+          at - oldestDueReview >= REVIEW_STARVATION_MS &&
+          (latestReviewRequest === undefined || at - latestReviewRequest >= REVIEW_STARVATION_MS);
+
+        const retryForHour = (): { ok: false; window: "hour"; retryAt: number } => ({
+          ok: false,
+          window: "hour",
+          retryAt: (hourTimes[0] ?? at) + MODEL_REQUEST_HOUR_MS + 1000,
+        });
+        const retryForDay = (): { ok: false; window: "day"; retryAt: number } => ({
+          ok: false,
+          window: "day",
+          retryAt: (dayTimes[0] ?? at) + MODEL_REQUEST_DAY_MS + 1000,
+        });
+
+        if (hourTimes.length >= hourLimit) return retryForHour();
+        if (dayTimes.length >= dayLimit) return retryForDay();
+
+        if (purpose === "review" && agedPending) {
+          const reviewHourShare = Math.max(0, hourLimit - Math.min(1, hourLimit));
+          const reviewDayShare = Math.max(0, dayLimit - Math.min(8, dayLimit));
+          // With more than one hourly slot, reserve one for aged Extract work.
+          // At a one-slot cap, choose the older of the pending Extract and due
+          // Review; a two-hour-starved Review still gets the next available slot.
+          if (hourLimit > 1 && reviewHourRequests >= reviewHourShare && !(reviewStarved && hourTimes.length < hourLimit)) {
+            return retryForHour();
+          }
+          if (hourLimit <= 1 && reviewHourRequests >= reviewHourShare && oldestDueReview === undefined && !reviewStarved) {
+            return retryForHour();
+          }
+          if (reviewDayRequests >= reviewDayShare && !(reviewStarved && dayTimes.length < dayLimit)) {
+            return retryForDay();
+          }
+        }
+
+        if (agedPending && hourLimit <= 1 && oldestDueReview !== undefined) {
+          // A single shared hourly slot cannot be statically split. Prefer the
+          // older outstanding obligation, alternate ties, and never let an
+          // aged due Review wait more than the starvation override above.
+          const reviewHasPriority = reviewStarved ||
+            oldestDueReview < (oldestPendingAt ?? Number.POSITIVE_INFINITY) ||
+            (oldestDueReview === oldestPendingAt && latestPurpose === "extract");
+          if (purpose !== (reviewHasPriority ? "review" : "extract")) {
+            return retryForHour();
+          }
+        }
+
+        dayTimes.push(at);
+        requests.review = dayTimes;
+        state.modelRequestPurposes = [
+          ...purposes,
+          { at, purpose },
+        ].slice(-DAY_MODEL_REQUEST_LIMIT);
+        await this.writeJson(this.statePath, { ...state, modelRequests: requests });
+        return { ok: true };
+      }
+      {
+        const times = (requests[kind] ?? []).filter((entry) => entry >= at - MODEL_REQUEST_HOUR_MS);
+        if (times.length >= maxPerHour) {
+          return {
+            ok: false,
+            window: "hour",
+            retryAt: (times[0] ?? at) + MODEL_REQUEST_HOUR_MS + 1000,
+          };
+        }
+        times.push(at);
+        requests[kind] = times;
+        await this.writeJson(this.statePath, { ...state, modelRequests: requests });
+        return { ok: true };
+      }
     });
+  }
+
+  /** Boolean compatibility for existing decision/rewrite call sites. */
+  async takeModelSlot(kind: "decision" | "rewrite" | "review", max: number, at = Date.now()): Promise<boolean> {
+    return (await this.reserveModelRequest(kind, max, at)).ok;
   }
 
   /** Atomically reserve one review model run inside a rolling window. */
@@ -688,6 +986,196 @@ export class Store {
       state.sessions[sessionID] = { ...previous, ...patch, lastActiveAt: nowIso() };
       await this.writeJson(this.statePath, state);
       return state.sessions[sessionID];
+    });
+  }
+
+  async isExpiredExtractWindow(sessionID: string, windowHash: string): Promise<boolean> {
+    const session = await this.readSession(sessionID);
+    return session ? expiredExtractWindowHashes(session).includes(windowHash) : false;
+  }
+
+  /** Bounded, transcript-free durable extract marker. */
+  async setExtractPending(
+    sessionID: string,
+    pending: ExtractPendingWork | undefined,
+    now = Date.now(),
+  ): Promise<boolean> {
+    return this.withStateLock(async () => {
+      const state = await this.readState();
+      state.sessions ??= {};
+      const expiredIDs: string[] = [];
+      for (const [id, session] of Object.entries(state.sessions)) {
+        const entry = session.extractPending;
+        if (!entry) continue;
+        const createdAt = Date.parse(entry.createdAt ?? entry.updatedAt);
+        if (!Number.isFinite(createdAt) || now - createdAt >= EXTRACT_PENDING_TTL_MS) {
+          const expired = expireExtractPending(session);
+          if (expired.newlyExpired) expiredIDs.push(id);
+          state.sessions[id] = expired.session;
+        }
+      }
+      const previous = state.sessions[sessionID] ?? {};
+      let expiredWindowBlocked = false;
+      if (pending) {
+        const windowHash = typeof pending.windowHash === "string" &&
+          pending.windowHash.length > 0 && pending.windowHash.length <= 128
+          ? pending.windowHash
+          : undefined;
+        if (windowHash && expiredExtractWindowHashes(previous).includes(windowHash)) {
+          const { extractPending: _blocked, ...rest } = previous;
+          state.sessions[sessionID] = { ...rest, lastActiveAt: nowIso() };
+          expiredWindowBlocked = true;
+        } else {
+          const firstSeen = previous.extractPending?.createdAt ??
+            previous.extractPending?.updatedAt ?? pending.createdAt ?? pending.updatedAt;
+          const firstSeenAt = firstSeen ? Date.parse(firstSeen) : Number.NaN;
+          if (!Number.isFinite(firstSeenAt) || now - firstSeenAt >= EXTRACT_PENDING_TTL_MS) {
+            // A caller holding an expired marker must not resurrect it and reset its TTL.
+            const { extractPending: _expired, ...rest } = previous;
+            const terminal = rememberExpiredExtractWindow(rest, windowHash);
+            if (windowHash && terminal.added) expiredIDs.push(sessionID);
+            state.sessions[sessionID] = { ...terminal.session, lastActiveAt: nowIso() };
+            expiredWindowBlocked = true;
+          } else {
+            const nextPending: ExtractPendingWork = { ...pending, createdAt: firstSeen };
+            const entries = extractPendingEntries(state).filter(([id]) => id !== sessionID);
+            const candidate = [...entries, [sessionID, nextPending] as [string, ExtractPendingWork]];
+            const bytes = extractPendingBytes(candidate);
+            if (candidate.length > EXTRACT_PENDING_MAX_ROWS || bytes > EXTRACT_PENDING_MAX_BYTES) {
+              const current = extractPendingEntries(state);
+              const expiries = current.map(([, entry]) => Date.parse(entry.createdAt ?? entry.updatedAt) + EXTRACT_PENDING_TTL_MS)
+                .filter(Number.isFinite);
+              state.automation = {
+                ...state.automation,
+                pendingFull: (state.automation?.pendingFull ?? 0) + 1,
+                pendingCapacityBlocked: true,
+                ...(expiries.length > 0
+                  ? { capacityBlockedUntil: new Date(Math.min(...expiries)).toISOString() }
+                  : {}),
+                ...(expiredIDs.length > 0
+                  ? { expiredUnlearned: (state.automation?.expiredUnlearned ?? 0) + expiredIDs.length }
+                  : {}),
+              };
+              await this.writeJson(this.statePath, state);
+              return false;
+            }
+            state.sessions[sessionID] = { ...previous, extractPending: nextPending, lastActiveAt: nowIso() };
+          }
+        }
+      } else {
+        const { extractPending: _cleared, ...rest } = previous;
+        state.sessions[sessionID] = { ...rest, lastActiveAt: nowIso() };
+      }
+
+      const entries = extractPendingEntries(state);
+      const bytes = extractPendingBytes(entries);
+      const capacityBlocked = entries.length >= EXTRACT_PENDING_MAX_ROWS || bytes >= EXTRACT_PENDING_MAX_BYTES;
+      const expiries = entries.map(([, entry]) => Date.parse(entry.createdAt ?? entry.updatedAt) + EXTRACT_PENDING_TTL_MS)
+        .filter(Number.isFinite);
+      state.automation = {
+        ...state.automation,
+        pendingCapacityBlocked: capacityBlocked,
+        ...(capacityBlocked && expiries.length > 0
+          ? { capacityBlockedUntil: new Date(Math.min(...expiries)).toISOString() }
+          : { capacityBlockedUntil: undefined }),
+        ...(expiredIDs.length > 0
+          ? { expiredUnlearned: (state.automation?.expiredUnlearned ?? 0) + expiredIDs.length }
+          : {}),
+      };
+      await this.writeJson(this.statePath, state);
+      return !expiredWindowBlocked;
+    });
+  }
+
+  /** Prune expired pending details and keep only the aggregate unlearned count. */
+  async maintainExtractPending(now = Date.now()): Promise<{
+    expired: number;
+    pending: number;
+    bytes: number;
+    capacityBlocked: boolean;
+  }> {
+    return this.withStateLock(async () => {
+      const state = await this.readState();
+      state.sessions ??= {};
+      let expired = 0;
+      for (const [sessionID, session] of Object.entries(state.sessions)) {
+        const entry = session.extractPending;
+        if (!entry) continue;
+        const createdAt = Date.parse(entry.createdAt ?? entry.updatedAt);
+        if (Number.isFinite(createdAt) && now - createdAt < EXTRACT_PENDING_TTL_MS) continue;
+        const terminal = expireExtractPending(session);
+        state.sessions[sessionID] = terminal.session;
+        if (terminal.newlyExpired) expired += 1;
+      }
+      const entries = extractPendingEntries(state);
+      const bytes = extractPendingBytes(entries);
+      const capacityBlocked = entries.length >= EXTRACT_PENDING_MAX_ROWS || bytes >= EXTRACT_PENDING_MAX_BYTES;
+      const expiries = entries.map(([, entry]) => Date.parse(entry.createdAt ?? entry.updatedAt) + EXTRACT_PENDING_TTL_MS)
+        .filter(Number.isFinite);
+      state.automation = {
+        ...state.automation,
+        pendingCapacityBlocked: capacityBlocked,
+        ...(capacityBlocked && expiries.length > 0
+          ? { capacityBlockedUntil: new Date(Math.min(...expiries)).toISOString() }
+          : { capacityBlockedUntil: undefined }),
+        ...(expired > 0
+          ? { expiredUnlearned: (state.automation?.expiredUnlearned ?? 0) + expired }
+          : {}),
+      };
+      await this.writeJson(this.statePath, state);
+      return { expired, pending: entries.length, bytes, capacityBlocked };
+    });
+  }
+
+  async updateAutomationState(
+    patch: Partial<PersistedAutomationState>,
+  ): Promise<PersistedAutomationState> {
+    return this.withStateLock(async () => {
+      const state = await this.readState();
+      const automation = { ...(state.automation ?? {}), ...patch };
+      state.automation = automation;
+      await this.writeJson(this.statePath, state);
+      return automation;
+    });
+  }
+
+  /**
+   * Spend one automatic item-write slot for `sessionID`.
+   *
+   * The counter lives in state.json and is written through the transaction
+   * batch, so a rolled-back write does not spend a slot. It is meant to be
+   * called inside the caller's `transaction()`: the file lock is reentrant
+   * there and serializes two Store instances on the same dataDir, so they
+   * cannot oversell the same UTC day.
+   */
+  async consumeWriteBudget(input: {
+    sessionID: string;
+    dailyWrites?: number;
+    maxWritesPerSession?: number;
+    /** Injected clock; the day key is always UTC. */
+    now?: number;
+  }): Promise<
+    | { ok: true; used: number; sessionUsed: number }
+    | { ok: false; reason: "write-budget"; used: number; sessionUsed: number }
+  > {
+    const dailyWrites = Math.max(0, Math.floor(input.dailyWrites ?? 40));
+    const maxWritesPerSession = Math.max(0, Math.floor(input.maxWritesPerSession ?? 5));
+    const day = new Date(input.now ?? Date.now()).toISOString().slice(0, 10);
+    return this.withStateLock(async () => {
+      const state = await this.readState();
+      const stored = state.automation?.writeBudget;
+      const budget = stored && stored.day === day
+        ? { day, count: stored.count, sessions: { ...stored.sessions } }
+        : { day, count: 0, sessions: {} as Record<string, number> };
+      const sessionUsed = budget.sessions[input.sessionID] ?? 0;
+      if (budget.count >= dailyWrites || sessionUsed >= maxWritesPerSession) {
+        return { ok: false as const, reason: "write-budget" as const, used: budget.count, sessionUsed };
+      }
+      budget.count += 1;
+      budget.sessions[input.sessionID] = sessionUsed + 1;
+      state.automation = { ...(state.automation ?? {}), writeBudget: budget };
+      await this.writeJson(this.statePath, state);
+      return { ok: true as const, used: budget.count, sessionUsed: sessionUsed + 1 };
     });
   }
 
@@ -868,6 +1356,34 @@ export class Store {
     });
   }
 
+  /**
+   * Atomic cooldown for bounded retention scans. This is deliberately separate
+   * from `claim`: the lease only covers concurrent overlap, while this gate
+   * persists the next allowed attempt even after a failed/zero-reclaim run.
+   */
+  async tryReserveRetentionRun(
+    now = Date.now(),
+    cooldownMs = 5 * 60_000,
+  ): Promise<{ ok: true } | { ok: false; retryAt: string }> {
+    return this.withStateLock(async () => {
+      const state = await this.readState();
+      const gate = state.automation?.retentionGate;
+      const next = gate ? Date.parse(gate.nextAttemptAt) : Number.NaN;
+      if (Number.isFinite(next) && next > now) {
+        return { ok: false, retryAt: new Date(next).toISOString() };
+      }
+      state.automation = {
+        ...(state.automation ?? {}),
+        retentionGate: {
+          lastAttemptAt: new Date(now).toISOString(),
+          nextAttemptAt: new Date(now + cooldownMs).toISOString(),
+        },
+      };
+      await this.writeJson(this.statePath, state);
+      return { ok: true };
+    });
+  }
+
   async releaseReservation(key: string, token = this.claims.get(key)): Promise<void> {
     await this.withWriteLock(async () => {
       const data = await this.readJson<Record<string, Reservation>>(this.reservationsPath, {});
@@ -990,6 +1506,134 @@ export class Store {
     return this.readJsonl<Record<string, unknown>>(this.changelogPath);
   }
 
+  async appendChange(event: ChangeEvent): Promise<void> {
+    await this.withWriteLock(() => this.appendJsonl(this.changesPath, event));
+  }
+
+  async listChanges(
+    filter: { itemID?: string; limit?: number } = {},
+  ): Promise<ChangeEvent[]> {
+    const rows = await this.readJsonl<ChangeEvent>(this.changesPath);
+    const filtered = filter.itemID
+      ? rows.filter((row) => row.itemID === filter.itemID)
+      : rows;
+    return filter.limit !== undefined && filter.limit > 0
+      ? filtered.slice(-filter.limit)
+      : filtered;
+  }
+
+  async writeChangeJournal(journal: ChangeJournal): Promise<void> {
+    await this.withWriteLock(() =>
+      this.writeJson(path.join(this.changeJournalDir, `${journal.id}.json`), journal),
+    );
+  }
+
+  async readChangeJournal(id: string): Promise<ChangeJournal | undefined> {
+    if (!/^change_[A-Za-z0-9_]+$/.test(id)) return undefined;
+    return this.readJson<ChangeJournal | undefined>(
+      path.join(this.changeJournalDir, `${id}.json`),
+      undefined,
+    );
+  }
+
+  async listSuppressions(): Promise<Suppression[]> {
+    return this.readJsonl<Suppression>(this.suppressionsPath);
+  }
+
+  async appendSuppression(record: Suppression): Promise<void> {
+    await this.withWriteLock(() => this.appendJsonl(this.suppressionsPath, record));
+  }
+
+  async writeSuppressions(rows: Suppression[]): Promise<void> {
+    await this.withWriteLock(() => this.writeJsonl(this.suppressionsPath, rows));
+  }
+
+  async listRetiredSources(): Promise<RetiredSource[]> {
+    return this.readJsonl<RetiredSource>(this.retiredSourcesPath);
+  }
+
+  async writeRetiredSources(rows: RetiredSource[]): Promise<void> {
+    await this.withWriteLock(() => this.writeJsonl(this.retiredSourcesPath, rows));
+  }
+
+  async readRetiredSourceState(): Promise<RetiredSourceState> {
+    return this.readJson<RetiredSourceState>(this.retiredSourceStatePath, { epoch: 0 });
+  }
+
+  async writeRetiredSourceState(state: RetiredSourceState): Promise<void> {
+    await this.withWriteLock(() => this.writeJson(this.retiredSourceStatePath, state));
+  }
+
+  async listGlobalCandidates(): Promise<GlobalCandidate[]> {
+    return this.readJsonl<GlobalCandidate>(this.globalCandidatesPath);
+  }
+
+  async writeGlobalCandidates(rows: GlobalCandidate[]): Promise<void> {
+    await this.withWriteLock(() => this.writeJsonl(this.globalCandidatesPath, rows));
+  }
+
+  async readGlobalCandidateState(): Promise<GlobalCandidateState> {
+    return this.readJson<GlobalCandidateState>(this.globalCandidateStatePath, {
+      epoch: 0,
+      blocked: false,
+    });
+  }
+
+  async writeGlobalCandidateState(state: GlobalCandidateState): Promise<void> {
+    await this.withWriteLock(() => this.writeJson(this.globalCandidateStatePath, state));
+  }
+
+  async listExtractQuarantine(): Promise<ExtractQuarantineRecord[]> {
+    return this.readJsonl<ExtractQuarantineRecord>(this.extractQuarantinePath);
+  }
+
+  async writeExtractQuarantine(rows: ExtractQuarantineRecord[]): Promise<void> {
+    await this.withWriteLock(() => this.writeJsonl(this.extractQuarantinePath, rows));
+  }
+
+  /**
+   * Version of the injectable memory: sorted active rows, expired count and
+   * the nearest future expiry. A write-free clock crossing an `expiresAt`
+   * must change it, so the cache is keyed by file identity *and* guarded by
+   * the next expiry boundary; mtime/size alone would freeze it forever.
+   */
+  async memoryVersion(now: number = Date.now()): Promise<string> {
+    const inTransaction = Boolean(this.pending.getStore());
+    let key = "missing";
+    if (!inTransaction) {
+      try {
+        const info = await stat(this.itemsPath);
+        key = `${info.mtimeMs}:${info.size}:${info.ino}`;
+      } catch {
+        key = "missing";
+      }
+      const cached = this.versionCache;
+      if (cached && cached.key === key && (cached.nextExpiry === null || now < cached.nextExpiry)) {
+        return cached.version;
+      }
+    }
+    const rows: string[][] = [];
+    let expiredCount = 0;
+    let nextExpiry: number | null = null;
+    for (const item of await this.listItems()) {
+      if (item.status !== "auto" && item.status !== "promoted") continue;
+      const expiry = item.expiresAt ? Date.parse(item.expiresAt) : Number.NaN;
+      if (Number.isFinite(expiry) && expiry <= now) {
+        expiredCount += 1;
+        continue;
+      }
+      if (item.invalidatedBy) continue;
+      if (Number.isFinite(expiry) && (nextExpiry === null || expiry < nextExpiry)) {
+        nextExpiry = expiry;
+      }
+      rows.push([item.id, itemContentVersion(item), item.expiresAt ?? ""]);
+    }
+    rows.sort((left, right) => left[0].localeCompare(right[0]));
+    const version = sha16(JSON.stringify({ rows, expiredCount, nextExpiry }));
+    if (!inTransaction) this.versionCache = { key, version, nextExpiry };
+    return version;
+  }
+
   async appendUsage(record: UsageRecord): Promise<void> {
     const file = record.kind === "decision" ? this.decisionUsagePath : this.rewriteUsagePath;
     await this.withWriteLock(() => this.appendJsonl(file, record));
@@ -1010,6 +1654,39 @@ export class Store {
         .slice(-maxLines);
       await this.writeJsonl(file, kept);
     });
+  }
+
+  /** Cheap row count for a JSONL ledger; no parse, transaction-aware. */
+  async countJsonlRows(file: string): Promise<number> {
+    try {
+      const raw = await this.readText(file);
+      return raw.split("\n").filter((line) => line.trim().length > 0).length;
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return 0;
+      throw error;
+    }
+  }
+
+  /** Count regular files in a data-dir subdirectory (journals, migrations). */
+  async countFiles(relative: string, extension = ".json"): Promise<number> {
+    try {
+      const entries = await readdir(path.join(this.dataDir, relative), { withFileTypes: true });
+      return entries.filter((entry) => entry.isFile() && (!extension || entry.name.endsWith(extension))).length;
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return 0;
+      throw error;
+    }
+  }
+
+  /** Count subdirectories, e.g. checkpoint backups under `backup/`. */
+  async countDirectories(relative: string, prefix = ""): Promise<number> {
+    try {
+      const entries = await readdir(path.join(this.dataDir, relative), { withFileTypes: true });
+      return entries.filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix)).length;
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return 0;
+      throw error;
+    }
   }
 
   async dirSize(): Promise<number> {

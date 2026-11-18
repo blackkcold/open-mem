@@ -9,25 +9,62 @@
 import type { MemoryGraphView } from "../types";
 import { isMemoryGraphView } from "./memory-graph";
 
-export type RouteTab =
-  | "queue"
-  | "skills"
-  | "map"
-  | "audit"
-  | "health"
-  | "settings";
+/** The three first-level destinations of the formal console. */
+export type MainTab = "memory" | "activity" | "settings";
 
-const ROUTE_TABS: ReadonlySet<string> = new Set<RouteTab>([
+/** Legacy hashes stay parseable so old links can be redirected, not 404'd. */
+export type LegacyTab = "queue" | "skills" | "map" | "audit" | "health";
+
+export type RouteTab = MainTab | LegacyTab;
+
+export type AdvancedSection =
+  | "review"
+  | "health"
+  | "audit"
+  | "graph"
+  | "skills"
+  | "history"
+  | "backup";
+
+const MAIN_TABS: ReadonlySet<string> = new Set<MainTab>([
+  "memory",
+  "activity",
+  "settings",
+]);
+
+const LEGACY_TABS: ReadonlySet<string> = new Set<LegacyTab>([
   "queue",
   "skills",
   "map",
   "audit",
   "health",
-  "settings",
 ]);
+
+const ADVANCED_SECTIONS: ReadonlySet<string> = new Set<AdvancedSection>([
+  "review",
+  "health",
+  "audit",
+  "graph",
+  "skills",
+  "history",
+  "backup",
+]);
+
+export function isAdvancedSection(value: string): value is AdvancedSection {
+  return ADVANCED_SECTIONS.has(value);
+}
 
 export interface ConsoleRoute {
   tab: RouteTab;
+  /** #memory/<itemID> */
+  memoryItemID?: string;
+  /** #activity/event/<changeID> */
+  activityEventID?: string;
+  /** #settings/advanced/<section> */
+  advanced?: AdvancedSection;
+  /** Selected legacy review target under #settings/advanced/review/<id>. */
+  reviewItemID?: string;
+  /** Legacy queue alias; kept for existing queue tests and link builders. */
   queueItemID?: string;
   auditFindingID?: string;
   /** Report generation the finding belongs to; guards against reused finding ids. */
@@ -79,7 +116,55 @@ export function parseRouteHash(hash: string): ConsoleRoute | null {
   if (!raw) return null;
   const segments = raw.split("/");
   const tab = segments[0];
-  if (!ROUTE_TABS.has(tab)) return null;
+
+  if (MAIN_TABS.has(tab)) {
+    if (tab === "memory") {
+      if (segments.length === 1) return { tab: "memory" };
+      if (segments.length !== 2 || segments[1] === "") return null;
+      const memoryItemID = decode(segments[1]);
+      if (memoryItemID === null || memoryItemID === "") return null;
+      return { tab: "memory", memoryItemID };
+    }
+    if (tab === "activity") {
+      if (segments.length === 1) return { tab: "activity" };
+      if (segments.length !== 3 || segments[1] !== "event" || segments[2] === "") {
+        return null;
+      }
+      const activityEventID = decode(segments[2]);
+      if (activityEventID === null || activityEventID === "") return null;
+      return { tab: "activity", activityEventID };
+    }
+    // settings
+    if (segments.length === 1) return { tab: "settings" };
+    if (segments[1] !== "advanced" || segments.length < 3) return null;
+    const section = decode(segments[2]);
+    if (section === null || !isAdvancedSection(section)) return null;
+    if (segments.length === 3) return { tab: "settings", advanced: section };
+    if (section === "review" && segments.length === 4 && segments[3] !== "") {
+      const reviewItemID = decode(segments[3]);
+      if (reviewItemID === null) return null;
+      return { tab: "settings", advanced: section, reviewItemID };
+    }
+    if (section === "audit" && segments[3] === "finding" && segments.length >= 5) {
+      if (segments.length > 6) return null;
+      const auditFindingID = decode(segments[4]);
+      if (auditFindingID === null || auditFindingID === "") return null;
+      if (segments.length === 5) {
+        return { tab: "settings", advanced: section, auditFindingID };
+      }
+      const auditReportAt = decode(segments[5]);
+      if (auditReportAt === null) return null;
+      return { tab: "settings", advanced: section, auditFindingID, auditReportAt };
+    }
+    if (section === "graph" && segments.length === 4 && segments[3] !== "") {
+      const view = decode(segments[3]);
+      if (view === null || !isMemoryGraphView(view)) return null;
+      return { tab: "settings", advanced: section, graphView: view };
+    }
+    return null;
+  }
+
+  if (!LEGACY_TABS.has(tab)) return null;
 
   if (tab === "map") {
     if (segments.length === 1) return { tab };
@@ -110,6 +195,67 @@ export function parseRouteHash(hash: string): ConsoleRoute | null {
   }
 
   return { tab: tab as RouteTab };
+}
+
+/** Canonical hash for a parsed route. Legacy tabs map to settings › advanced. */
+export function canonicalHash(route: ConsoleRoute): string {
+  if (route.tab === "memory") {
+    return route.memoryItemID
+      ? `#memory/${encodeURIComponent(route.memoryItemID)}`
+      : "#memory";
+  }
+  if (route.tab === "activity") {
+    return route.activityEventID
+      ? `#activity/event/${encodeURIComponent(route.activityEventID)}`
+      : "#activity";
+  }
+  if (route.tab === "settings") {
+    if (!route.advanced) return "#settings";
+    const base = `#settings/advanced/${route.advanced}`;
+    if (route.advanced === "review" && route.reviewItemID) {
+      return `${base}/${encodeURIComponent(route.reviewItemID)}`;
+    }
+    if (route.advanced === "audit" && route.auditFindingID) {
+      return route.auditReportAt
+        ? `${base}/finding/${encodeURIComponent(route.auditFindingID)}/${encodeURIComponent(route.auditReportAt)}`
+        : `${base}/finding/${encodeURIComponent(route.auditFindingID)}`;
+    }
+    if (route.advanced === "graph" && route.graphView) {
+      return `${base}/${route.graphView}`;
+    }
+    return base;
+  }
+  if (route.tab === "queue") {
+    return route.queueItemID
+      ? `#settings/advanced/review/${encodeURIComponent(route.queueItemID)}`
+      : "#settings/advanced/review";
+  }
+  if (route.tab === "audit") {
+    const base = "#settings/advanced/audit";
+    if (!route.auditFindingID) return base;
+    return route.auditReportAt
+      ? `${base}/finding/${encodeURIComponent(route.auditFindingID)}/${encodeURIComponent(route.auditReportAt)}`
+      : `${base}/finding/${encodeURIComponent(route.auditFindingID)}`;
+  }
+  if (route.tab === "map") {
+    return route.graphView
+      ? `#settings/advanced/graph/${route.graphView}`
+      : "#settings/advanced/graph";
+  }
+  if (route.tab === "health") return "#settings/advanced/health";
+  return "#settings/advanced/skills";
+}
+
+export function memoryItemLink(id: string): string {
+  return `#memory/${encodeURIComponent(id)}`;
+}
+
+export function activityEventLink(id: string): string {
+  return `#activity/event/${encodeURIComponent(id)}`;
+}
+
+export function advancedLink(section: AdvancedSection): string {
+  return `#settings/advanced/${section}`;
 }
 
 export function queueItemLink(id: string): string {

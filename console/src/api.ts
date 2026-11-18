@@ -1,4 +1,12 @@
 import { isExtension } from "./extension/mode";
+import type {
+  AutomationMode,
+  AutomationStatus,
+  ChangeEvent,
+  MemoryItem,
+  RecallResult,
+  RevertOutcome,
+} from "./types";
 
 const TOKEN_KEY = "openmem.token";
 
@@ -32,6 +40,30 @@ export class ApiError extends Error {
 }
 
 /** A lost write response cannot establish whether the server committed it. */
+export interface ConflictDetails {
+  code: string;
+  message: string;
+  version?: string;
+}
+
+/** A 409 is a real conflict only when the server said so; other HTTP stays generic. */
+export function conflictFromError(error: unknown): ConflictDetails | null {
+  if (!(error instanceof ApiError) || error.status !== 409) return null;
+  const details =
+    typeof error.details === "object" && error.details !== null
+      ? (error.details as Record<string, unknown>)
+      : undefined;
+  return {
+    code:
+      typeof details?.code === "string"
+        ? details.code
+        : error.code ?? "conflict",
+    message: error.message,
+    version:
+      typeof details?.version === "string" ? details.version : undefined,
+  };
+}
+
 export function unknownWriteOutcome(): ApiError {
   return new ApiError(504, "操作结果未知，可能已提交。请先刷新核对，勿直接重试。", "OPENMEM_OUTCOME_UNKNOWN");
 }
@@ -194,4 +226,60 @@ export function priorityClass(priority: number | undefined): string {
   if (value >= 75) return "high";
   if (value >= 50) return "mid";
   return "low";
+}
+
+/** Typed reads for the formal memory/activity/settings UI. */
+export async function fetchMemoryItems(
+  params: { includeArchived?: boolean } = {},
+): Promise<MemoryItem[]> {
+  const query = params.includeArchived ? "?includeArchived=true" : "";
+  const result = await api<{ items: MemoryItem[] }>(
+    `/api/memory/items${query}`,
+  );
+  return result.items;
+}
+
+export async function fetchChanges(limit = 200): Promise<ChangeEvent[]> {
+  const result = await api<{ changes: ChangeEvent[] }>(
+    `/api/changes?limit=${Math.max(1, Math.min(500, Math.floor(limit)))}`,
+  );
+  return result.changes;
+}
+
+export async function fetchItemChanges(id: string): Promise<ChangeEvent[]> {
+  const result = await api<{ changes: ChangeEvent[] }>(
+    `/api/items/${encodeURIComponent(id)}/changes`,
+  );
+  return result.changes;
+}
+
+export async function fetchRecall(query: string, limit = 5): Promise<RecallResult> {
+  const params = new URLSearchParams({ q: query.slice(0, 400), limit: String(limit) });
+  return api<RecallResult>(`/api/recall?${params.toString()}`);
+}
+
+export async function fetchAutomationStatus(): Promise<AutomationStatus> {
+  return api<AutomationStatus>("/api/automation/status");
+}
+
+export async function postItemAction(
+  id: string,
+  action: "deactivate" | "reactivate" | "revert" | "restore",
+  body: { expectedVersion: string; changeID?: string; reason?: string },
+): Promise<RevertOutcome> {
+  return api<RevertOutcome>(
+    `/api/items/${encodeURIComponent(id)}/${action}`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+/** Atomic single-write mode switch; configRevision is a string, not mode.revision. */
+export async function setAutomationMode(
+  mode: AutomationMode,
+  expectedConfigRevision: string,
+): Promise<{ mode?: string; effectiveMode?: string; configRevision?: string }> {
+  return api(`/api/automation/mode`, {
+    method: "POST",
+    body: JSON.stringify({ mode, expectedConfigRevision }),
+  });
 }

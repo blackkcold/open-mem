@@ -81,7 +81,18 @@ export function normalizeSessionMessage(entry: unknown): SessionMessage | undefi
       parts: parts.filter(isRecord).map((part) => ({
         type: typeof part.type === "string" ? part.type : "text",
         text: typeof part.text === "string" ? part.text : undefined,
-        tool: typeof part.tool === "string" ? part.tool : undefined,
+        tool: typeof part.tool === "string"
+          ? part.tool
+          : typeof part.name === "string"
+            ? part.name
+            : undefined,
+        callID: typeof part.callID === "string"
+          ? part.callID
+          : typeof part.callId === "string"
+            ? part.callId
+            : typeof part.id === "string"
+              ? part.id
+              : undefined,
         state: isRecord(part.state) ? part.state : undefined,
       })),
     };
@@ -101,7 +112,18 @@ export function normalizeSessionMessage(entry: unknown): SessionMessage | undefi
       parts: parts.filter(isRecord).map((part) => ({
         type: typeof part.type === "string" ? part.type : "text",
         text: typeof part.text === "string" ? part.text : undefined,
-        tool: typeof part.tool === "string" ? part.tool : undefined,
+        tool: typeof part.tool === "string"
+          ? part.tool
+          : typeof part.name === "string"
+            ? part.name
+            : undefined,
+        callID: typeof part.callID === "string"
+          ? part.callID
+          : typeof part.callId === "string"
+            ? part.callId
+            : typeof part.id === "string"
+              ? part.id
+              : undefined,
         state: isRecord(part.state) ? part.state : undefined,
       })),
     };

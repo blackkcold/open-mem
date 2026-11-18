@@ -7,8 +7,22 @@ import { SessionReader } from "../src/session/reader.js";
 import { DigestCache } from "../src/digest/cache.js";
 import { ReviewInputBuilder } from "../src/review/input.js";
 import { ReviewOrchestrator } from "../src/review/orchestrator.js";
-import { mergeConfig } from "../src/config.js";
+import { ReviewBudgetError, ReviewRetryAfterError } from "../src/review/provider.js";
+import { ExtractRequestError } from "../src/extract/provider.js";
+import { DEFAULT_CONFIG, mergeConfig } from "../src/config.js";
 import type { SessionMessage } from "../src/types.js";
+
+/**
+ * Automatic reviews require the persisted mode/revision to match the live
+ * config (`automaticConfigCurrent`). Persist the same explicit automation
+ * block the orchestrator is constructed with, instead of a legacy shape whose
+ * normalized `mode: undefined` can never match the stored default `off`.
+ */
+const AUTOMATION = {
+  enabled: true,
+  mode: "autonomous" as const,
+  revision: 0,
+};
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -70,7 +84,9 @@ async function harness(options: {
   }, { maxMessages: 100 });
   const digestCache = new DigestCache(store, { maxEntries: 20 });
   await digestCache.load();
-  const config = mergeConfig({
+  await store.writeConfig(mergeConfig(DEFAULT_CONFIG, { automation: AUTOMATION }));
+  const config = mergeConfig(DEFAULT_CONFIG, {
+    automation: AUTOMATION,
     review: {
       idleMs: 50,
       minNewUserMessages: 1,
@@ -429,6 +445,225 @@ describe("ReviewOrchestrator", () => {
       const stats = h.orchestrator.stats();
       expect(stats.scheduled).toBe(0);
       expect(stats.nextReviewAt).toBeUndefined();
+    } finally {
+      await h.orchestrator.dispose();
+      await cleanup(h.dir);
+    }
+  });
+});
+
+describe("review project ownership and deferral", () => {
+  async function ownedHarness(options: {
+    projectKey?: string;
+    runModel?: () => Promise<never>;
+    now?: () => number;
+    onAccepted?: () => Promise<{ created: number; skipped: number }>;
+  } = {}) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-orch-p02-"));
+    const store = new Store(dir);
+    await store.init();
+    const reader = new SessionReader(async () => [user("m1", "以后回复都用中文，并且先给结论")], {
+      maxMessages: 100,
+    });
+    const digestCache = new DigestCache(store, { maxEntries: 20 });
+    await digestCache.load();
+    await store.writeConfig(mergeConfig(DEFAULT_CONFIG, { automation: AUTOMATION }));
+    const config = mergeConfig(DEFAULT_CONFIG, {
+      automation: AUTOMATION,
+      review: { idleMs: 50, maxPerHour: 10 },
+    });
+    const builder = new ReviewInputBuilder({ config, digestCache });
+    let calls = 0;
+    const buildInput = (sessionID: string, messages: SessionMessage[], from?: string) =>
+      builder.build(sessionID, messages, from);
+    const createOrchestrator = () => new ReviewOrchestrator({
+      store,
+      config,
+      reader,
+      buildInput,
+      ...(options.projectKey !== undefined ? { projectKey: options.projectKey } : {}),
+      ...(options.now ? { now: options.now } : {}),
+      runModel: async () => {
+        calls += 1;
+        if (options.runModel) return options.runModel();
+        return {
+          summary: [],
+          openQuestions: [],
+          model: "test",
+          candidates: [],
+        };
+      },
+      onAccepted: options.onAccepted ?? (async () => ({ created: 0, skipped: 0 })),
+    });
+    return { dir, store, reader, config, buildInput, createOrchestrator, orchestrator: createOrchestrator(), calls: () => calls };
+  }
+
+  it("recovers only the instance project and never repairs foreign sessions", async () => {
+    const h = await ownedHarness({ projectKey: "A" });
+    const now = Date.now();
+    const past = new Date(now - 1_000).toISOString();
+    const future = new Date(now + 60_000).toISOString();
+    try {
+      await h.store.updateSession("own", {
+        contextProjectKey: "A",
+        reviewStatus: "scheduled",
+        reviewDueAt: future,
+      });
+      await h.store.updateSession("foreign", {
+        contextProjectKey: "B",
+        reviewStatus: "running",
+        reviewStartedAt: new Date(now - 60_000).toISOString(),
+      });
+      await h.store.updateSession("legacy-own", {
+        reviewStatus: "scheduled",
+        reviewDueAt: future,
+      });
+      await h.store.updateSession("unknown", {
+        reviewStatus: "scheduled",
+        reviewDueAt: past,
+      });
+      await h.store.appendReview({
+        id: "r1",
+        sessionID: "legacy-own",
+        projectKey: "A",
+        status: "ready",
+        createdAt: new Date(now - 120_000).toISOString(),
+        candidates: 0,
+        dropped: 0,
+      });
+
+      await h.orchestrator.recover();
+
+      expect((await h.store.readSession("foreign"))?.reviewStatus).toBe("running");
+      expect((await h.store.readSession("unknown"))?.reviewDueAt).toBe(past);
+      expect((await h.store.readSession("legacy-own"))?.reviewStatus).toBe("scheduled");
+      expect(h.orchestrator.stats().scheduled).toBe(2);
+    } finally {
+      await h.orchestrator.dispose();
+      await cleanup(h.dir);
+    }
+  });
+
+  it("does not schedule or run a foreign session", async () => {
+    const h = await ownedHarness({ projectKey: "A" });
+    try {
+      await h.store.updateSession("foreign", {
+        contextProjectKey: "B",
+        lastActiveAt: new Date().toISOString(),
+      });
+      await h.orchestrator.schedule("foreign");
+      expect((await h.store.readSession("foreign"))?.reviewStatus).toBeUndefined();
+      expect(await h.orchestrator.runNow("foreign", "manual")).toBeUndefined();
+      expect(h.calls()).toBe(0);
+    } finally {
+      await h.orchestrator.dispose();
+      await cleanup(h.dir);
+    }
+  });
+
+  it("defers a far Retry-After to the full deadline without a failure", async () => {
+    const now = 1_000_000;
+    const retryAt = now + 120_000;
+    const h = await ownedHarness({
+      projectKey: "A",
+      now: () => now,
+      runModel: async () => {
+        throw new ReviewRetryAfterError("上游限流", retryAt, 1);
+      },
+    });
+    try {
+      await h.store.updateSession("own", { contextProjectKey: "A" });
+      await h.orchestrator.runNow("own", "auto");
+      const state = await h.store.readSession("own");
+      expect(state?.reviewStatus).toBe("scheduled");
+      expect(Date.parse(state?.reviewDueAt ?? "")).toBeGreaterThanOrEqual(retryAt);
+      expect(state?.reviewAttempts ?? 0).toBe(0);
+      expect(await h.store.listReviews()).toHaveLength(0);
+      expect((await h.store.readState()).reviewRuns).toHaveLength(1);
+    } finally {
+      await h.orchestrator.dispose();
+      await cleanup(h.dir);
+    }
+  });
+
+  it("releases the run slot only when a budget error dispatched no request", async () => {
+    const now = 1_000_000;
+    const zero = await ownedHarness({
+      projectKey: "A",
+      now: () => now,
+      runModel: async () => {
+        throw new ReviewBudgetError("无预算", 0, now + 60_000);
+      },
+    });
+    const one = await ownedHarness({
+      projectKey: "A",
+      now: () => now,
+      runModel: async () => {
+        throw new ReviewBudgetError("无预算", 1, now + 60_000);
+      },
+    });
+    try {
+      await zero.store.updateSession("own", { contextProjectKey: "A" });
+      await zero.orchestrator.runNow("own", "auto");
+      expect((await zero.store.readState()).reviewRuns ?? []).toHaveLength(0);
+      expect((await zero.store.readSession("own"))?.reviewStatus).toBe("scheduled");
+      expect((await zero.store.readSession("own"))?.reviewAttempts ?? 0).toBe(0);
+
+      await one.store.updateSession("own", { contextProjectKey: "A" });
+      await one.orchestrator.runNow("own", "auto");
+      expect((await one.store.readState()).reviewRuns ?? []).toHaveLength(1);
+      expect((await one.store.readSession("own"))?.reviewAttempts ?? 0).toBe(0);
+    } finally {
+      await zero.orchestrator.dispose();
+      await one.orchestrator.dispose();
+      await cleanup(zero.dir);
+      await cleanup(one.dir);
+    }
+  });
+
+  it("defers extract budget exhaustion without marking the window reviewed and recovers it after restart", async () => {
+    const now = 1_000_000;
+    const retryAt = now + 120_000;
+    let acceptedCalls = 0;
+    const h = await ownedHarness({
+      projectKey: "A",
+      now: () => now,
+      onAccepted: async () => {
+        acceptedCalls += 1;
+        if (acceptedCalls === 1) {
+          const error = new ExtractRequestError("extract request budget exhausted", "budget");
+          Object.assign(error, { requestsMade: 0, retryAt });
+          throw error;
+        }
+        return { created: 0, skipped: 0 };
+      },
+    });
+    try {
+      await h.store.updateSession("own", { contextProjectKey: "A" });
+      await h.orchestrator.runNow("own", "auto");
+      const deferred = await h.store.readSession("own");
+      expect(deferred?.reviewStatus).toBe("scheduled");
+      expect(deferred?.reviewedHash).toBeUndefined();
+      expect(deferred?.reviewAttempts ?? 0).toBe(0);
+      expect(Date.parse(deferred?.reviewDueAt ?? "")).toBeGreaterThanOrEqual(retryAt);
+      expect(await h.store.listReviews()).toHaveLength(0);
+      // The review model already succeeded; only the later extract request
+      // was budget-refused, so this run slot remains consumed.
+      expect((await h.store.readState()).reviewRuns ?? []).toHaveLength(1);
+
+      await h.orchestrator.dispose();
+      await h.store.updateSession("own", {
+        reviewStatus: "scheduled",
+        reviewDueAt: new Date(now - 1_000).toISOString(),
+      });
+      const restarted = h.createOrchestrator();
+      await restarted.recover();
+      await waitFor(async () =>
+        (await h.store.readSession("own"))?.reviewStatus === "ready" ? true : undefined,
+      );
+      expect(acceptedCalls).toBe(2);
+      expect((await h.store.readSession("own"))?.reviewedHash).toBeTruthy();
+      await restarted.dispose();
     } finally {
       await h.orchestrator.dispose();
       await cleanup(h.dir);

@@ -9,8 +9,19 @@ import { ReviewInputBuilder, type ReviewInput } from "../src/review/input.js";
 import { ReviewOrchestrator } from "../src/review/orchestrator.js";
 import { ReviewRequestError } from "../src/review/provider.js";
 import { acceptReviewCandidates } from "../src/review/accept.js";
-import { mergeConfig } from "../src/config.js";
+import { DEFAULT_CONFIG, mergeConfig } from "../src/config.js";
 import type { ReviewRunResult, SessionMessage } from "../src/types.js";
+
+/**
+ * `automaticConfigCurrent` compares the persisted automation mode/revision
+ * with the live config. Persist the same explicit block the harness uses so
+ * automatic runs are not rejected as a config mismatch.
+ */
+const AUTOMATION = {
+  enabled: true,
+  mode: "autonomous" as const,
+  revision: 0,
+};
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -88,7 +99,9 @@ async function makeHarness(options: {
   }, { maxMessages: 100 });
   const cache = new DigestCache(store, { maxEntries: 20 });
   await cache.load();
-  const config = mergeConfig({
+  await store.writeConfig(mergeConfig(DEFAULT_CONFIG, { automation: AUTOMATION }));
+  const config = mergeConfig(DEFAULT_CONFIG, {
+    automation: AUTOMATION,
     review: {
       idleMs: 60_000,
       minNewUserMessages: 1,

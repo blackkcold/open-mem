@@ -4,11 +4,33 @@ export type Scope = "session" | "project" | "global";
 export type MergeAction = "create" | "merge_into" | "replace" | "keep_both" | "reject_duplicate";
 export type ReviewType = "fact" | "preference" | "rule" | "decision" | "learning" | "skill";
 export type ReviewStatus = "scheduled" | "running" | "ready" | "failed" | "skipped";
+export type AutomationMode = "off" | "shadow" | "autonomous";
+
+export interface ExtractPendingWork {
+  origin: "turn" | "session-review";
+  /** First persisted time; retries do not extend the 72h retention window. */
+  createdAt?: string;
+  projectKey?: string;
+  windowHash?: string;
+  /** Non-secret fingerprint of extraction-relevant mode/model settings. */
+  configHash?: string;
+  reason: "in-flight" | "configuration" | "owner" | "request-budget" | "retry-after" | "transport" | "circuit" | "format" | "capacity";
+  /** Provider/budget eligibility time, including waits that are not timer-driven. */
+  retryAt?: string;
+  dueAt?: string;
+  /** Cumulative provider requests actually dispatched for this window, including Retry-After responses. */
+  dispatches?: number;
+  /** Failed non-waiting request count; the dispatch cap is tracked separately. */
+  attempts: number;
+  updatedAt: string;
+}
 
 export interface ReviewEvidence {
   messageID: string;
   quote: string;
   kind: "user" | "tool";
+  /** Native message creation time for the retired-source overflow barrier. */
+  observedAt?: number;
 }
 
 export interface ReviewCandidate {
@@ -46,13 +68,27 @@ export interface ReviewRecord {
   inputHash?: string;
   chars?: number;
   candidates: number;
-  /** Hooks actually created after accept-time dedupe. */
+  /** Hooks actually created after accept-time dedupe (protected rule/skill lane). */
   queued?: number;
+  /** Ordinary review-origin items written by the single P01 writer. */
+  learned?: number;
+  /** Existing items updated by verified ordinary evidence. */
+  updated?: number;
+  /** Would-write records produced in shadow mode; never active items. */
+  shadowed?: number;
+  /** Failing-tool learning candidates skipped with a recorded local reason. */
+  learningSkipped?: number;
+  /** Protected rule/skill candidates routed to the legacy hook lane. */
+  protectedCandidates?: number;
+  /** Visible reason when ordinary learning was deferred rather than skipped. */
+  learningDeferred?: string;
   dropped: number;
   durationMs?: number;
   model?: string;
   usage?: { inputTokens: number; outputTokens: number };
   error?: string;
+  /** Machine-readable failure class for status/tests. */
+  errorKind?: "transport" | "http" | "empty" | "format" | "budget" | "config" | "cache" | "retry-after";
   /** Why a run was skipped, when status is "skipped". */
   note?: string;
   summary?: string[];
@@ -83,6 +119,8 @@ export interface SessionState {
   parentChecked?: boolean;
   reviewDueAt?: string;
   reviewStatus?: ReviewStatus;
+  /** Why the last window was deferred (not failed). */
+  reviewDeferredReason?: "request-budget" | "retry-after" | "extract-state" | "extract-transport";
   reviewAttempts?: number;
   reviewDeferrals?: number;
   reviewUserIDAtSchedule?: string;
@@ -97,28 +135,195 @@ export interface SessionState {
   reviewSkipHash?: string;
   reviewSkipAt?: string;
   pendingReview?: boolean;
+  /** Durable extract retry marker; contains hashes/metadata, never transcript text. */
+  extractPending?: ExtractPendingWork;
+  /** Last 16 distinct expired material hashes; hash-only terminal history survives config changes/restarts. */
+  extractExpiredWindowHashes?: string[];
   /** Rendered memory pinned for this session; new memory waits for a new session. */
   contextBlock?: AutopilotContext;
   contextHash?: string;
   contextProjectKey?: string;
+  /**
+   * Native host session directory captured from `session.created` or
+   * `session.get`. Automatic collection/review requires this evidence; the
+   * contextProjectKey alone is only a hint and must not prove ownership.
+   */
+  sessionDirectory?: string;
+  /** Memory version the pinned block was built from; drives per-request invalidation. */
+  contextVersion?: string;
 }
+
 
 export interface PersistedState {
   sessions: Record<string, SessionState>;
+  automation?: PersistedAutomationState;
   lastAuditAt?: string;
   /** Last deterministic curator pass; used for the 24h gate. */
   lastCuratedAt?: string;
   /** Timestamps of review model calls in the last hour, shared across restarts. */
   reviewRuns?: number[];
-  /** Actual attempted model requests, including repairs/retries, shared by processes. */
+  /** Review/extract request timestamps retained for the shared rolling-day quota. */
   modelRequests?: Partial<Record<"decision" | "rewrite" | "review", number[]>>;
+  /** Purpose labels for the shared review/extract request timestamps. */
+  modelRequestPurposes?: Array<{ at: number; purpose: "review" | "extract" }>;
+}
+
+export interface RetentionHistorySnapshot {
+  at: string;
+  deleted: { changes: number; journals: number; suppressions: number; quarantine: number };
+  reclaimedBytes: number;
+  /** Safe derived-history bytes still removable after this run (0 if none). */
+  remainingReclaimableBytes: number;
+  protected: { changes: number; journals: number; suppressions: number };
+  blocked: boolean;
+  blockedReasons: string[];
+  notes: string[];
+  /** Only set when blocked: the next interval tick may retry. */
+  nextAttemptAt?: string;
+}
+
+export interface PersistedAutomationState {
+  /** Number of capture attempts rejected while the pending ledger was full. */
+  pendingFull?: number;
+  pendingCapacityBlocked?: boolean;
+  expiredUnlearned?: number;
+  lastExtractAt?: string;
+  capacityBlockedUntil?: string;
+  lastSuccess?: {
+    at: string;
+    kind: ItemKind;
+    itemID: string;
+    action: "add" | "update";
+  };
+  lastMaintenanceAt?: string;
+  /** Last bounded derived-history reclaim; read-only UI/status snapshot. */
+  retention?: RetentionHistorySnapshot;
+  /** Persistent cooldown for both automatic retention paths (not a lease). */
+  retentionGate?: { lastAttemptAt: string; nextAttemptAt: string };
+  /**
+   * Successful automatic item writes for the current UTC day. The counter is
+   * written inside the write transaction, so a rollback does not spend a slot.
+   */
+  writeBudget?: {
+    day: string;
+    count: number;
+    sessions: Record<string, number>;
+  };
 }
 
 export interface SourceRef {
   sessionID?: string;
   project?: string;
   messageID?: string;
-  role?: "user" | "assistant" | "system";
+  role?: "user" | "assistant" | "system" | "tool";
+  /** Native source time; absent values remain fail-closed behind a barrier. */
+  observedAt?: number;
+}
+
+/** Hash-only pointer into a user message or a failing native tool part. */
+export interface EvidenceRef {
+  sessionID: string;
+  messageID: string;
+  role: "user" | "tool";
+  /** Explicit observed authority; model output never fills this field. */
+  observedRole?: "user" | "assistant" | "tool";
+  /** Offset space of start/end: user canonical text or a tool projection. */
+  offsetSpace?: "user-canonical" | "tool-projection";
+  /** UTF-16 offsets into the canonical concatenated message text. */
+  start: number;
+  end: number;
+  quoteHash: string;
+  canonicalHash: string;
+  partsHash: string;
+  sourceKey: string;
+  /** Native tool identity for failing-tool learning; hashes only, never raw args/output. */
+  tool?: string;
+  toolCallID?: string;
+  partIndex?: number;
+  digestHash?: string;
+  rawHash?: string;
+  /** Local, hash-only claim metadata; excluded from itemContentVersion. */
+  claimKey?: string;
+  claimSubject?: string;
+  claimPredicate?: string;
+  claimValue?: string;
+  claimQualifiers?: string[];
+  claimPolarity?: "positive" | "negative";
+  claimIntent?: "ordinary" | "additive" | "replacement";
+  claimOldValue?: string;
+  claimProjectRelative?: boolean;
+  repoIdentity?: string;
+  originProjectKey?: string;
+  explicitGlobal?: boolean;
+  observedAt?: number;
+}
+
+export interface RetiredSourceItem {
+  itemID: string;
+  changeID: string;
+  reason: "deactivate" | "revert" | "undo";
+  claimKey?: string;
+}
+
+/** Durable message-level learning tombstone. It intentionally has no TTL. */
+export interface RetiredSource {
+  sessionID: string;
+  messageID: string;
+  items: RetiredSourceItem[];
+  quoteHashes: string[];
+  firstRetiredAt: string;
+  lastRetiredAt: string;
+  version: number;
+}
+
+/** Bounded overflow barrier; epoch never decreases or disappears on mode changes. */
+export interface RetiredSourceState {
+  epoch: number;
+  blockedAt?: number;
+  reason?: "retired-source-capacity";
+}
+
+/** No transcript or rawQuote is permitted in this cross-project ledger. */
+export interface GlobalCandidate {
+  claimKey: string;
+  evidenceRefID: string;
+  quoteHash: string;
+  repoIdentity: string;
+  originProjectKey: string;
+  createdAt: string;
+}
+
+export interface GlobalCandidateState {
+  epoch: number;
+  blocked: boolean;
+  reason?: "global-candidate-capacity";
+}
+
+/** Short-lived, non-approval holding area for ambiguous ordinary relations. */
+export interface ExtractQuarantineRecord {
+  id: string;
+  at: string;
+  expiresAt: string;
+  text: string;
+  title: string;
+  kind: ItemKind;
+  scope: Scope;
+  projectKey?: string;
+  source: SourceRef;
+  reason: string;
+  claimKey?: string;
+}
+
+export interface LifecycleStatus {
+  retiredSources: number;
+  retiredBytes: number;
+  retiredLearningBlocked: boolean;
+  retiredBlockReason?: "retired-source-capacity";
+  globalCandidates: number;
+  globalCandidateBytes: number;
+  globalPromotionBlocked: boolean;
+  quarantine: number;
+  oldestQuarantineExpiry?: string;
 }
 
 export type Strictness =
@@ -195,7 +400,19 @@ export interface Item {
   origin?: "turn" | "session-review";
   reviewType?: ReviewType;
   evidence?: ReviewEvidence[];
+  evidenceRefs?: EvidenceRef[];
+  /** Local link for a transactional project→global promotion group. */
+  linkGroupID?: string;
+  /** Claim key whose implicit cross-project evidence manages this global row. */
+  implicitGlobalClaimKey?: string;
   reviewID?: string;
+  /** Most recent change event that produced this version. */
+  changeID?: string;
+  /** Set when an upstream item/change made this row stop being injected. */
+  invalidatedBy?: string;
+  invalidatedAt?: string;
+  /** Upstream item ids this row was derived from. */
+  derivedFrom?: string[];
 }
 
 export interface Suggestion {
@@ -263,6 +480,7 @@ export interface ShadowRecord {
   wouldApply: number;
   /** What the candidate would have done if shadow were off. */
   wouldRoute?: "auto" | "queue";
+  wouldAction?: "add" | "update" | "seen";
   turnID?: string;
   hookID?: string;
   decision?: DecisionResult;
@@ -377,6 +595,8 @@ export interface AuditFinding {
 
 export interface AuditReport {
   generatedAt: string;
+  /** Set only by runAudit; absent means no audit has run (auditAgeMs = null). */
+  auditRunAt?: string;
   findings: AuditFinding[];
   summary: { error: number; warning: number; info: number };
 }
@@ -437,6 +657,8 @@ export interface DigestConfig {
 
 export interface ReviewConfig {
   enabled: boolean;
+  /** Review transport; independent from rewrite.transport. Missing = ollama. */
+  transport?: "opencode" | "ollama";
   /** Quiet period after the last turn before a session review runs. */
   idleMs: number;
   minNewUserMessages: number;
@@ -447,6 +669,8 @@ export interface ReviewConfig {
   maxCandidates: number;
   minConfidence: number;
   maxPerHour: number;
+  /** Request budget; missing = max(maxPerHour, maxPerHour*(1+repairAttempts)*2). */
+  maxRequestsPerHour?: number;
   /** Upper bound for the model's JSON reply; keeps zero-candidate runs cheap. */
   maxOutputTokens: number;
   transcript: "user" | "user+tools";
@@ -457,6 +681,33 @@ export interface ReviewConfig {
   model: ModelRef;
   /** Extra quiet periods granted while the user keeps typing. */
   maxDeferrals: number;
+}
+
+/** Bounded per-request recall. `enabled` is optional and inherits automation. */
+export interface RecallConfig {
+  /** Absent = inherit `automation.enabled`; explicit false still filters stale prefixes. */
+  enabled?: boolean;
+  limit: number;
+  tokenBudget: number;
+  apiLimit: number;
+  apiTokenBudget: number;
+}
+
+/** Narrow opt-in gate for the create-only autonomous extract lane. */
+export interface AutomationConfig {
+  enabled: boolean;
+  /** Absent on old configurations; absence preserves the legacy behavior. */
+  mode?: AutomationMode;
+  /** Monotonic mode-switch revision; initialized by the mode endpoint. */
+  revision?: number;
+  /** Shared daily review/extract request ceiling; never raised above 40. */
+  dailyModelCalls?: number;
+  /** Content updates rewrite an existing body; false quarantines them. */
+  autoUpdate?: boolean;
+  /** Successful automatic item writes allowed per UTC day. */
+  dailyWrites?: number;
+  /** Successful automatic item writes allowed per session per UTC day. */
+  maxWritesPerSession?: number;
 }
 
 export interface AutoMemConfig {
@@ -475,7 +726,13 @@ export interface AutoMemConfig {
   decision: DecisionConfig;
   rewrite: RewriteConfig;
   review: ReviewConfig;
+  /** Missing in older persisted configs; mergeConfig supplies disabled. */
+  automation: AutomationConfig;
+  /** Missing in older persisted configs; merged defaults never enable it. */
+  recall: RecallConfig;
   digest: DigestConfig;
+  /** Undo/version-retention policy. Deactivate is never time limited. */
+  undo: UndoConfig;
   turn: {
     /** Maximum hooks processed in one turn batch. */
     maxCandidates: number;
@@ -520,8 +777,8 @@ export interface SessionMessage {
   text?: string;
   /** Raw message metadata; synthetic/warming markers live here on V2. */
   metadata?: unknown;
-  content?: Array<{ type: string; text?: string; tool?: string; state?: unknown }>;
-  parts?: Array<{ type: string; text?: string; tool?: string; state?: unknown }>;
+  content?: Array<{ type: string; text?: string; tool?: string; callID?: string; state?: unknown }>;
+  parts?: Array<{ type: string; text?: string; tool?: string; callID?: string; state?: unknown }>;
   time?: { created?: number; completed?: number };
 }
 
@@ -602,6 +859,90 @@ export interface MergeJournal {
   /** The user changed the proposed title/text before applying. */
   humanEdited?: boolean;
 }
+
+export type ChangeKind =
+  | "add"
+  | "update"
+  | "merge"
+  | "replace"
+  | "archive"
+  | "revert"
+  | "restore"
+  | "deactivate"
+  | "expire"
+  | "invalidate"
+  | "promote"
+  | "migration";
+
+export type ChangeActor = "auto" | "user" | "curator" | "migration" | "system";
+
+/**
+ * Lossless full snapshot. Restoring it must bring back identity, status,
+ * provenance and derivation, not only the body text.
+ */
+export type ItemSnapshot = Item;
+
+export interface ChangeEvent {
+  id: string;
+  at: string;
+  kind: ChangeKind;
+  actor: ChangeActor;
+  itemID: string;
+  /** post-change content version; absent when the item is gone */
+  itemVersion?: string;
+  before?: ItemSnapshot;
+  after?: ItemSnapshot;
+  source: SourceRef;
+  origin?: "turn" | "session-review" | "curator" | "migration" | "user";
+  /** other change ids this event depends on (merge inputs, supersede chain) */
+  dependsOn?: string[];
+  /** upstream item ids */
+  derivedFrom?: string[];
+  linkGroupID?: string;
+  reason: string;
+  /** change being reverted, for kind=revert */
+  reverts?: string;
+  revertible: boolean;
+}
+
+/** On-disk redo/undo record for one change event. */
+export interface ChangeJournal {
+  id: string;
+  at: string;
+  itemID: string;
+  kind: ChangeKind;
+  before?: ItemSnapshot;
+  after?: ItemSnapshot;
+  reverts?: string;
+  undoing?: boolean;
+  undone?: boolean;
+}
+
+export interface Suppression {
+  id: string;
+  at: string;
+  /** exact hook key, e.g. turn|session|message|textHash or review|... */
+  hookKey: string;
+  textHash: string;
+  itemID: string;
+  reason: "reverted" | "deactivated";
+  /** only same-source re-learning is suppressed; a new message is not */
+  until?: string;
+}
+
+export interface UndoConfig {
+  /** Version restore window; deactivate/reactivate are never time limited. */
+  retainDays: number;
+}
+
+export type RevertResult =
+  | { ok: true; event: ChangeEvent; invalidated: string[] }
+  | {
+      ok: false;
+      code: "not_found" | "version_mismatch" | "not_revertible" | "conflict";
+      message: string;
+    };
+
 
 export interface HealthScore {
   score: number;

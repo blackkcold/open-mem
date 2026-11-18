@@ -178,6 +178,36 @@ describe("HTTP API", () => {
     expect(response.status).toBe(400);
     expect((await response.json() as { error: string }).error).toContain("caps.queue");
   });
+  it("rejects an invalid review transport and optional request budget without writing", async () => {
+    const before = await store.readConfig();
+    const badTransport = await fetch(api("/api/config"), {
+      method: "PATCH",
+      body: JSON.stringify({ review: { transport: "carrier-pigeon" } }),
+    });
+    expect(badTransport.status).toBe(400);
+    const badBudget = await fetch(api("/api/config"), {
+      method: "PATCH",
+      body: JSON.stringify({ review: { maxRequestsPerHour: 0 } }),
+    });
+    expect(badBudget.status).toBe(400);
+    const after = await store.readConfig();
+    expect(after.review.transport).toBe(before.review.transport);
+    expect(after.review.maxRequestsPerHour).toBe(before.review.maxRequestsPerHour);
+  });
+  it("persists a valid review transport and request budget", async () => {
+    const response = await fetch(api("/api/config"), {
+      method: "PATCH",
+      body: JSON.stringify({ review: { transport: "opencode", maxRequestsPerHour: 7 } }),
+    });
+    expect(response.status).toBe(200);
+    const config = await store.readConfig();
+    expect(config.review.transport).toBe("opencode");
+    expect(config.review.maxRequestsPerHour).toBe(7);
+    await fetch(api("/api/config"), {
+      method: "PATCH",
+      body: JSON.stringify({ review: { transport: "ollama" } }),
+    });
+  });
   it("requires confirmation for compaction and supports a read-only preview", async () => {
     const response = await fetch(api("/api/compact"), { method: "POST" });
     expect(response.status).toBe(400);
@@ -373,20 +403,41 @@ describe("HTTP API", () => {
     expect(data.falsePositive).toBeGreaterThanOrEqual(1);
   });
 
-  it("patches config and reads it back", async () => {
-    const patch = await fetch(api("/api/config"), {
-      method: "PATCH",
+  it("patches automation mode and reads it back", async () => {
+    const initial = (await (await fetch(api("/api/config"))).json()) as {
+      configRevision: string;
+    };
+    const patch = await fetch(api("/api/automation/mode"), {
+      method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ shadow: false }),
+      body: JSON.stringify({
+        mode: "autonomous",
+        expectedConfigRevision: initial.configRevision,
+      }),
     });
     expect(patch.status).toBe(200);
-    const config = (await patch.json()) as { shadow: boolean };
-    expect(config.shadow).toBe(false);
+    const patched = (await patch.json()) as {
+      shadow: boolean;
+      automation: { mode: string; revision: number };
+      configRevision: string;
+    };
+    expect(patched.shadow).toBe(false);
+    expect(patched.automation.mode).toBe("autonomous");
 
-    const restore = await fetch(api("/api/config"), {
-      method: "PATCH",
+    const read = (await (await fetch(api("/api/config"))).json()) as {
+      shadow: boolean;
+      automation: { mode: string };
+    };
+    expect(read.shadow).toBe(false);
+    expect(read.automation.mode).toBe("autonomous");
+
+    const restore = await fetch(api("/api/automation/mode"), {
+      method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ shadow: true }),
+      body: JSON.stringify({
+        mode: "shadow",
+        expectedConfigRevision: patched.configRevision,
+      }),
     });
     expect(restore.status).toBe(200);
   });
@@ -889,7 +940,7 @@ describe("HTTP API", () => {
         {
           method: "PATCH",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ shadow: false }),
+          body: JSON.stringify({ caps: { queue: 60 } }),
         },
       );
       expect(first.status).toBe(200);
@@ -899,19 +950,19 @@ describe("HTTP API", () => {
         {
           method: "PATCH",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ shadow: false }),
+          body: JSON.stringify({ caps: { queue: 60 } }),
         },
       );
       expect(second.status).toBe(200);
       const live = (await (
         await fetch(`http://127.0.0.1:${serverB.port}/api/config?token=test-token`)
-      ).json()) as { shadow: boolean };
-      expect(live.shadow).toBe(false);
+      ).json()) as { caps: { queue: number } };
+      expect(live.caps.queue).toBe(60);
       const added = (await storeB.listChangelog()).slice(beforeSecond);
       const entry = added.find((row) => row.action === "config_update");
-      expect(entry?.fields).toEqual(["shadow"]);
+      expect(entry?.fields).toEqual(["caps.queue"]);
       expect(entry?.source).toBe("local-token-api");
-      expect(entry && "shadow" in entry).toBe(false);
+      expect(entry && "caps" in entry).toBe(false);
     } finally {
       await serverA?.close();
       await serverB?.close();
@@ -1292,10 +1343,40 @@ describe("HTTP API", () => {
           { value: string | number | boolean | null; differsFromLive: boolean }
         >;
       };
-      expect(Object.keys(body.persistedSettings)).toHaveLength(40);
+      expect(Object.keys(body.persistedSettings)).toHaveLength(47);
       expect(body.persistedSettings["decision.endpoint"]).toEqual({
         value: null,
         differsFromLive: true,
+      });
+      // Newly exposed review/recall settings keep their persisted values and
+      // optional fields stay null instead of leaking arbitrary config.
+      expect(body.persistedSettings["review.transport"]).toEqual({
+        value: "ollama",
+        differsFromLive: false,
+      });
+      expect(body.persistedSettings["review.maxRequestsPerHour"]).toEqual({
+        value: null,
+        differsFromLive: false,
+      });
+      expect(body.persistedSettings["recall.enabled"]).toEqual({
+        value: null,
+        differsFromLive: false,
+      });
+      expect(body.persistedSettings["recall.limit"]).toEqual({
+        value: 5,
+        differsFromLive: false,
+      });
+      expect(body.persistedSettings["recall.tokenBudget"]).toEqual({
+        value: 600,
+        differsFromLive: false,
+      });
+      expect(body.persistedSettings["recall.apiLimit"]).toEqual({
+        value: 8,
+        differsFromLive: false,
+      });
+      expect(body.persistedSettings["recall.apiTokenBudget"]).toEqual({
+        value: 1200,
+        differsFromLive: false,
       });
       expect(body.persistedSettings["rewrite.model.variant"]).toEqual({
         value: DEFAULT_CONFIG.rewrite.model.variant,

@@ -14,6 +14,14 @@ import { toolParts } from "../digest/tool.js";
 import { isUserAuthored } from "../session/filters.js";
 import { sha16 } from "../util/text.js";
 import type { ReviewInput } from "./input.js";
+import { ReviewBudgetError, ReviewRetryAfterError } from "./provider.js";
+import { ExtractRequestError } from "../extract/provider.js";
+
+export type NativeOwnershipStatus =
+  | "owned"
+  | "foreign"
+  | "mismatch"
+  | "unavailable";
 
 export interface ReviewOrchestratorDeps {
   store: Store;
@@ -29,6 +37,19 @@ export interface ReviewOrchestratorDeps {
   knownTitles?: () => Promise<string[] | undefined>;
   /** Stable project identity for session-note promotion. */
   projectKey?: string;
+  /**
+   * Native host evidence for ownership. Automatic paths require "owned";
+   * manual accepts "unavailable" only after its existing hint guard.
+   */
+  ownsNative?: (
+    sessionID: string,
+    session: SessionState,
+  ) => NativeOwnershipStatus | Promise<NativeOwnershipStatus>;
+  /** Prevents deferred extract work from falling through to legacy auto-review while disabled/unowned. */
+  canResumeExtractPending?: (
+    sessionID: string,
+    session: SessionState,
+  ) => boolean | Promise<boolean>;
   runModel: (input: ReviewInput) => Promise<ReviewRunResult>;
   /** Deterministic evidence gate; runs before anything is accepted. */
   validate?: (
@@ -39,9 +60,17 @@ export interface ReviewOrchestratorDeps {
     input: ReviewInput,
     result: ReviewRunResult,
     reviewID: string,
+    projectKey?: string,
+    reason?: "auto" | "manual",
   ) => Promise<{
     created: number;
     skipped: number;
+    learned?: number;
+    updated?: number;
+    shadowed?: number;
+    learningSkipped?: number;
+    protectedCandidates?: number;
+    learningDeferred?: string;
     sessionNotes?: ReviewSessionNote[];
   } | void>;
   broadcast?: (event: string, payload: unknown) => void;
@@ -57,6 +86,8 @@ export interface ReviewOrchestratorStats {
   paused: boolean;
   lastRunAt?: string;
   lastError?: string;
+  lastFailureKind?: NonNullable<ReviewRecord["errorKind"]>;
+  lastDeferred?: { reason: "request-budget" | "retry-after"; at: string };
   /** Earliest armed timer, for truthful "next review" copy. */
   nextReviewAt?: string;
 }
@@ -65,6 +96,7 @@ const HOUR = 60 * 60 * 1000;
 const STALE_DUE = 24 * 60 * 60 * 1000;
 const CHECKPOINT_DELAY = 1500;
 const CAP_RETRY_MIN = 30_000;
+const MAX_TIMER_DELAY = 2_147_483_647;
 /**
  * Consecutive failed review runs before auto review stops for a session. Every
  * cause counts (content, transport, provider circuit, infrastructure), so the
@@ -94,6 +126,8 @@ export class ReviewOrchestrator {
   private paused = false;
   private lastRunAt?: string;
   private lastError?: string;
+  private lastFailureKind?: NonNullable<ReviewRecord["errorKind"]>;
+  private lastDeferred?: { reason: "request-budget" | "retry-after"; at: string };
 
   constructor(private readonly deps: ReviewOrchestratorDeps) {}
 
@@ -101,7 +135,12 @@ export class ReviewOrchestrator {
     if (!this.active()) return;
     const state = await this.deps.store.readState();
     const session = await this.deps.store.readSession(sessionID) ?? {};
+    if (!await this.autoOwns(sessionID, session)) return;
     if (session.parentSessionID) return;
+    if (
+      session.reviewDeferredReason === "extract-state" &&
+      (!this.deps.config.automation.enabled || this.deps.config.automation.mode === "off")
+    ) return;
     // Auto review is terminal for this session until new material can be
     // proven. Re-arming would retry a window whose identity is unknown.
     if (retryExhausted(session)) return;
@@ -137,6 +176,25 @@ export class ReviewOrchestrator {
     }
     const window = windowKey(messages);
 
+    // A far Retry-After is a persisted not-before deadline. New user turns must
+    // not pull it earlier: keep the existing dueAt and only refresh the tail id.
+    if (session.reviewDeferredReason === "retry-after") {
+      const deferredDue = session.reviewDueAt
+        ? Date.parse(session.reviewDueAt)
+        : Number.NaN;
+      if (Number.isFinite(deferredDue) && deferredDue > this.now()) {
+        await this.deps.store.updateSession(sessionID, {
+          reviewStatus: "scheduled",
+          reviewDueAt: new Date(deferredDue).toISOString(),
+          reviewUserIDAtSchedule: lastUserID,
+          reviewDeferrals: 0,
+          reviewStartedAt: undefined,
+        });
+        this.arm(sessionID, deferredDue - this.now());
+        return;
+      }
+    }
+
     // Warming/keep-alive pings (assistant-only or synthetic deltas) must not
     // re-arm a review: material is the only signal that a review can add value.
     if (!failed) {
@@ -170,6 +228,7 @@ export class ReviewOrchestrator {
       reviewStatus: "scheduled",
       reviewUserIDAtSchedule: lastUserID,
       reviewDeferrals: 0,
+      reviewDeferredReason: undefined,
       reviewStartedAt: undefined,
       reviewSkipToMessageID: undefined,
       reviewSkipHash: undefined,
@@ -185,8 +244,10 @@ export class ReviewOrchestrator {
     const state = await this.deps.store.readState();
     const now = this.now();
     this.runs = (state.reviewRuns ?? []).filter((at) => at >= now - HOUR);
+    const latestProject = await this.latestReviewProjects();
 
     let index = 0;
+    let unowned = 0;
     for (const [sessionID, session] of Object.entries(state.sessions)) {
       // A ready/skipped session with a leftover dueAt must not be re-armed.
       if (
@@ -196,9 +257,30 @@ export class ReviewOrchestrator {
       ) {
         continue;
       }
+      const hasExtractPending = session.extractPending?.origin === "session-review";
+      if (
+        hasExtractPending &&
+        this.deps.canResumeExtractPending &&
+        !await this.deps.canResumeExtractPending(sessionID, session)
+      ) {
+        continue;
+      }
+      // Cheap terminal check before a native ownership read.
+      if (session.reviewStatus !== "running" && !session.reviewDueAt && !hasExtractPending) continue;
+      if (this.deps.ownsNative) {
+        if (await this.deps.ownsNative(sessionID, session) !== "owned") continue;
+      } else if (!this.recoverOwns(sessionID, session, latestProject)) {
+        if (session.contextProjectKey === undefined) unowned += 1;
+        continue;
+      }
       // A crash can leave a running record without a dueAt; always repair it.
       if (session.reviewStatus === "running") {
         await this.deps.store.updateSession(sessionID, { reviewStatus: "scheduled" });
+        this.arm(sessionID, index * 50);
+        index += 1;
+        continue;
+      }
+      if (hasExtractPending && !session.reviewDueAt) {
         this.arm(sessionID, index * 50);
         index += 1;
         continue;
@@ -220,6 +302,9 @@ export class ReviewOrchestrator {
       this.arm(sessionID, index * 50);
       index += 1;
     }
+    if (unowned > 0) {
+      this.deps.log?.(`review recover skipped ${unowned} unowned sessions`);
+    }
   }
 
   pause(): void {
@@ -233,6 +318,13 @@ export class ReviewOrchestrator {
   resume(): void {
     this.paused = false;
     void this.recover();
+  }
+
+  /** Stop automatic timers without disabling explicitly requested reviews. */
+  pauseAutomatic(): void {
+    for (const timer of this.timers.values()) clearTimeout(timer);
+    this.timers.clear();
+    this.dueAt.clear();
   }
 
   /**
@@ -275,7 +367,22 @@ export class ReviewOrchestrator {
     sessionID: string,
     reason: "auto" | "manual",
   ): Promise<ReviewRecord | undefined> {
-    if (!this.active()) return undefined;
+    if (!this.active(reason)) return undefined;
+    const modeAtStart = this.deps.config.automation.mode;
+    const revisionAtStart = this.deps.config.automation.revision;
+    if (reason === "auto" && !await this.automaticConfigCurrent(modeAtStart, revisionAtStart)) {
+      return undefined;
+    }
+    const early = await this.deps.store.readSession(sessionID) ?? {};
+    if (!await this.ownsFor(sessionID, early, reason)) return undefined;
+    if (
+      reason === "auto" &&
+      early.extractPending?.origin === "session-review" &&
+      this.deps.canResumeExtractPending &&
+      !await this.deps.canResumeExtractPending(sessionID, early)
+    ) {
+      return undefined;
+    }
     if (this.running.has(sessionID)) {
       await this.deps.store.updateSession(sessionID, { pendingReview: true });
       return undefined;
@@ -293,6 +400,7 @@ export class ReviewOrchestrator {
     let slotAt: number | undefined;
     let attemptedHash: string | undefined;
     let modelStarted = false;
+    let modelCompleted = false;
 
     try {
       const state = await this.deps.store.readState();
@@ -396,12 +504,26 @@ export class ReviewOrchestrator {
         return undefined;
       }
 
+      if (
+        reason === "auto" &&
+        !await this.automaticConfigCurrent(modeAtStart, revisionAtStart)
+      ) {
+        await this.releaseSlot(slotAt);
+        slotAt = undefined;
+        await this.deps.store.updateSession(sessionID, {
+          reviewStatus: "scheduled",
+          reviewStartedAt: undefined,
+        });
+        return undefined;
+      }
+
       await this.deps.store.updateSession(sessionID, {
         reviewStatus: "running",
         reviewStartedAt: new Date(this.now()).toISOString(),
       });
       modelStarted = true;
       const result = await this.deps.runModel(input);
+      modelCompleted = true;
       if (this.paused) {
         // The call already happened; keep its slot until the hour expires.
         await this.deps.store.updateSession(sessionID, {
@@ -417,6 +539,19 @@ export class ReviewOrchestrator {
         // The call already happened; the slot expires with the rolling hour.
         return undefined;
       }
+      if (
+        reason === "auto" &&
+        !await this.automaticConfigCurrent(modeAtStart, revisionAtStart)
+      ) {
+        // The dispatched result belongs to the previous automation mode. Keep
+        // the due window durable for a later explicit re-enable, but never let
+        // an old mode write an item, change or ordinary approval.
+        await this.deps.store.updateSession(sessionID, {
+          reviewStatus: "scheduled",
+          reviewStartedAt: undefined,
+        });
+        return undefined;
+      }
       if (!await this.deps.store.ownsClaim(lease, leaseToken)) return undefined;
       const validated = this.deps.validate
         ? this.deps.validate(input, result.candidates)
@@ -426,6 +561,8 @@ export class ReviewOrchestrator {
         input,
         { ...result, candidates },
         reviewID,
+        this.deps.projectKey,
+        reason,
       );
       const queued =
         accepted && typeof accepted.created === "number"
@@ -453,12 +590,23 @@ export class ReviewOrchestrator {
         ...(result.usage ? { usage: result.usage } : {}),
         summary: result.summary,
         openQuestions: result.openQuestions,
+        ...(typeof accepted?.learned === "number" ? { learned: accepted.learned } : {}),
+        ...(typeof accepted?.updated === "number" ? { updated: accepted.updated } : {}),
+        ...(typeof accepted?.shadowed === "number" ? { shadowed: accepted.shadowed } : {}),
+        ...(typeof accepted?.learningSkipped === "number"
+          ? { learningSkipped: accepted.learningSkipped }
+          : {}),
+        ...(typeof accepted?.protectedCandidates === "number"
+          ? { protectedCandidates: accepted.protectedCandidates }
+          : {}),
+        ...(accepted?.learningDeferred ? { learningDeferred: accepted.learningDeferred } : {}),
         ...(accepted?.sessionNotes?.length
           ? { sessionNotes: accepted.sessionNotes }
           : {}),
       };
       this.lastRunAt = record.createdAt;
       this.lastError = undefined;
+      this.lastFailureKind = undefined;
 
       await this.deps.store.appendReview(record as unknown as Record<string, unknown>);
       await this.deps.store.updateSession(sessionID, {
@@ -469,6 +617,7 @@ export class ReviewOrchestrator {
         reviewAttempts: 0,
         reviewAttemptedHash: undefined,
         reviewDeferrals: 0,
+        reviewDeferredReason: undefined,
         reviewStartedAt: undefined,
         reviewSkipToMessageID: undefined,
         reviewSkipHash: undefined,
@@ -483,18 +632,57 @@ export class ReviewOrchestrator {
       });
       return record;
     } catch (error: unknown) {
-      // Release only when the model call provably never started. Once it
-      // started, delivery is unknown (timeout, network loss) and a returned
-      // call already happened, so keep the slot until the rolling hour expires.
-      if (slotAt !== undefined && !modelStarted) await this.releaseSlot(slotAt);
+      const deferred = deferralOf(error);
+      if (deferred) {
+        const requestsMade = deferred.requestsMade;
+        // A P02 budget rejection before a successful review call returns its
+        // run slot. Extract deferral happens after P02 completed and must not
+        // refund a review run that actually dispatched.
+        if (slotAt !== undefined && requestsMade === 0 && !modelCompleted) {
+          await this.releaseSlot(slotAt);
+        }
+        const now = this.now();
+        const current = await this.deps.store.readSession(sessionID) ?? {};
+        const dueAt = deferred.waitForSignal
+          ? undefined
+          : Math.max(now + CAP_RETRY_MIN, deferred.retryAt ?? now + CAP_RETRY_MIN);
+        await this.deps.store.updateSession(sessionID, {
+          reviewStatus: "scheduled",
+          reviewDueAt: dueAt === undefined ? undefined : new Date(dueAt).toISOString(),
+          reviewDeferredReason: deferred.reason,
+          reviewStartedAt: undefined,
+          reviewSkipToMessageID: undefined,
+          reviewSkipHash: undefined,
+          reviewSkipAt: undefined,
+        });
+        if (deferred.reason === "request-budget" || deferred.reason === "retry-after") {
+          this.lastDeferred = { reason: deferred.reason, at: new Date(now).toISOString() };
+        }
+        if (dueAt !== undefined) this.arm(sessionID, dueAt - now);
+        this.deps.broadcast?.("review.skipped", {
+          sessionID,
+          reason: deferred.reason,
+          ...(dueAt !== undefined ? { dueAt: new Date(dueAt).toISOString() } : {}),
+        });
+        return undefined;
+      }
+      // Release when nothing was dispatched, even if runModel was entered.
+      if (
+        slotAt !== undefined &&
+        (requestsMadeOf(error) === 0 || (requestsMadeOf(error) === undefined && !modelStarted))
+      ) {
+        await this.releaseSlot(slotAt);
+      }
       if (this.disposed) return undefined;
       const message = error instanceof Error ? error.message : String(error);
       this.lastError = message;
+      const errorKind = failureKind(error);
+      this.lastFailureKind = errorKind;
       // Transport/provider failures keep their label in the record, but every
       // failed run consumes the same strict budget. `countsAsAttempt` is not a
       // retry gate anymore: a permanent 401/circuit would otherwise retry on
       // every turn forever. A thrown null/undefined must not break this catch.
-      const transportFailure = isTransportFailure(error);
+      const transportFailure = errorKind === "transport";
       const current = await this.deps.store.readSession(sessionID) ?? {};
       // Strict upper bound: a permanently failing session cannot grow this
       // counter (and therefore its retries) without limit.
@@ -505,6 +693,7 @@ export class ReviewOrchestrator {
       await this.deps.store.updateSession(sessionID, {
         reviewStatus: "failed",
         reviewDueAt: undefined,
+        reviewDeferredReason: undefined,
         reviewAttempts: attempts,
         // Never overwrite a known failed window with an unknown one; the next
         // run would otherwise read "unknown" as proof of new material.
@@ -518,6 +707,7 @@ export class ReviewOrchestrator {
         sessionID,
         error: message,
         attempts,
+        kind: errorKind,
       });
       this.deps.log?.("session review failed", error);
       // No model call was attempted, so this is not a review call. Publish the
@@ -532,6 +722,7 @@ export class ReviewOrchestrator {
         dropped: 0,
         durationMs: this.now() - startedAt,
         error: message,
+        errorKind,
         ...(transportFailure ? { note: "transport failure" } : {}),
       };
       await this.deps.store.appendReview(record as unknown as Record<string, unknown>);
@@ -571,13 +762,84 @@ export class ReviewOrchestrator {
       paused: this.paused,
       lastRunAt: this.lastRunAt,
       lastError: this.lastError,
+      lastFailureKind: this.lastFailureKind,
+      lastDeferred: this.lastDeferred,
       nextReviewAt:
         next === undefined ? undefined : new Date(next).toISOString(),
     };
   }
 
-  private active(): boolean {
-    return this.deps.config.review.enabled && !this.disposed && !this.paused;
+  private active(reason: "auto" | "manual" = "auto"): boolean {
+    return this.deps.config.review.enabled && !this.disposed && !this.paused &&
+      (reason === "manual" || this.deps.config.automation.mode !== "off");
+  }
+
+  private async automaticConfigCurrent(
+    mode: AutoMemConfig["automation"]["mode"],
+    revision: number | undefined,
+  ): Promise<boolean> {
+    if (mode === "off") return false;
+    const persisted = await this.deps.store.readConfig().catch(() => undefined);
+    if (!persisted) return false;
+    return persisted?.automation?.mode === mode &&
+      persisted.automation?.revision === revision;
+  }
+
+  /** A session with a known, different project is never touched by this instance. */
+  private owns(session: SessionState): boolean {
+    const projectKey = this.deps.projectKey;
+    if (projectKey === undefined) return true;
+    return session.contextProjectKey === projectKey;
+  }
+
+  /**
+   * Automatic scheduling requires fresh native ownership when the host
+   * provides it. Cached context keys and old review records are hints only.
+   */
+  private async autoOwns(sessionID: string, session: SessionState): Promise<boolean> {
+    if (!this.deps.ownsNative) return this.owns(session);
+    return await this.deps.ownsNative(sessionID, session) === "owned";
+  }
+
+  private async ownsFor(
+    sessionID: string,
+    session: SessionState,
+    reason: "auto" | "manual",
+  ): Promise<boolean> {
+    if (reason === "auto") return this.autoOwns(sessionID, session);
+    // Manual keeps the existing context-key authorization. A fresh native
+    // foreign/mismatch still rejects; only an unavailable host read may fall
+    // back to the legacy hint.
+    if (!this.owns(session)) return false;
+    if (!this.deps.ownsNative) return true;
+    const native = await this.deps.ownsNative(sessionID, session);
+    return native !== "foreign" && native !== "mismatch";
+  }
+
+  private recoverOwns(
+    sessionID: string,
+    session: SessionState,
+    latestProject: Map<string, string | undefined>,
+  ): boolean {
+    const projectKey = this.deps.projectKey;
+    if (projectKey === undefined) return true;
+    if (session.contextProjectKey !== undefined) {
+      return session.contextProjectKey === projectKey;
+    }
+    return latestProject.get(sessionID) === projectKey;
+  }
+
+  private async latestReviewProjects(): Promise<Map<string, string | undefined>> {
+    const latest = new Map<string, { at: string; projectKey?: string }>();
+    for (const entry of await this.deps.store.listReviews()) {
+      const sessionID = typeof entry.sessionID === "string" ? entry.sessionID : undefined;
+      if (!sessionID) continue;
+      const at = typeof entry.createdAt === "string" ? entry.createdAt : "";
+      const projectKey = typeof entry.projectKey === "string" ? entry.projectKey : undefined;
+      const previous = latest.get(sessionID);
+      if (!previous || at >= previous.at) latest.set(sessionID, { at, projectKey });
+    }
+    return new Map([...latest].map(([sessionID, value]) => [sessionID, value.projectKey]));
   }
 
   private async finishSkip(
@@ -641,14 +903,24 @@ export class ReviewOrchestrator {
   private arm(sessionID: string, delay: number): void {
     if (this.disposed) return;
     this.clear(sessionID);
-    this.dueAt.set(sessionID, this.now() + Math.max(0, delay));
-    const timer = setTimeout(() => {
-      this.dueAt.delete(sessionID);
-      this.timers.delete(sessionID);
-      void this.track(this.fire(sessionID)).catch((error: unknown) => this.deps.log?.("scheduled review failed", error));
-    }, Math.max(0, delay));
-    timer.unref?.();
-    this.timers.set(sessionID, timer);
+    const target = this.now() + Math.max(0, delay);
+    this.dueAt.set(sessionID, target);
+    const schedule = (): void => {
+      if (this.disposed) return;
+      const remaining = target - this.now();
+      if (remaining <= 0) {
+        this.dueAt.delete(sessionID);
+        this.timers.delete(sessionID);
+        void this.track(this.fire(sessionID)).catch((error: unknown) =>
+          this.deps.log?.("scheduled review failed", error),
+        );
+        return;
+      }
+      const timer = setTimeout(schedule, Math.min(remaining, MAX_TIMER_DELAY));
+      timer.unref?.();
+      this.timers.set(sessionID, timer);
+    };
+    schedule();
   }
 
   private async fire(sessionID: string): Promise<void> {
@@ -661,7 +933,10 @@ export class ReviewOrchestrator {
     const dueAt = session.reviewDueAt
       ? Date.parse(session.reviewDueAt)
       : Number.NaN;
-    if (Number.isFinite(dueAt) && dueAt > this.now() + 1_000) return;
+    if (Number.isFinite(dueAt) && dueAt > this.now() + 1_000) {
+      this.arm(sessionID, dueAt - this.now());
+      return;
+    }
     const lastUser = await this.deps.reader.lastUser(sessionID);
 
     if (this.running.has(sessionID)) {
@@ -734,12 +1009,82 @@ function windowKey(messages: SessionMessage[]): WindowKey {
  * is legal JavaScript, so never dereference the value directly in a catch.
  */
 function isTransportFailure(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "countsAsAttempt" in error &&
-    error.countsAsAttempt === false
-  );
+  return failureKind(error) === "transport";
+}
+
+function failureKind(error: unknown): NonNullable<ReviewRecord["errorKind"]> {
+  if (error instanceof ReviewBudgetError) return "budget";
+  if (error instanceof ReviewRetryAfterError) return "retry-after";
+  const kind = (error as { kind?: unknown } | undefined)?.kind;
+  if (
+    kind === "transport" ||
+    kind === "http" ||
+    kind === "empty" ||
+    kind === "format" ||
+    kind === "budget" ||
+    kind === "config" ||
+    kind === "cache" ||
+    kind === "retry-after"
+  ) {
+    return kind;
+  }
+  return "transport";
+}
+
+function requestsMadeOf(error: unknown): number | undefined {
+  const value = (error as { requestsMade?: unknown } | undefined)?.requestsMade;
+  return typeof value === "number" ? value : undefined;
+}
+
+function deferralOf(
+  error: unknown,
+): {
+  reason: "request-budget" | "retry-after" | "extract-state" | "extract-transport";
+  requestsMade: number;
+  retryAt?: number;
+  waitForSignal?: boolean;
+} | undefined {
+  if (error instanceof ReviewBudgetError) {
+    return {
+      reason: "request-budget",
+      requestsMade: error.requestsMade,
+      ...(error.retryAt !== undefined ? { retryAt: error.retryAt } : {}),
+    };
+  }
+  if (error instanceof ReviewRetryAfterError) {
+    return {
+      reason: "retry-after",
+      requestsMade: error.requestsMade,
+      retryAt: error.retryAt,
+    };
+  }
+  if (error instanceof ExtractRequestError) {
+    if (error.kind === "budget") {
+      return {
+        reason: "request-budget",
+        requestsMade: error.requestsMade ?? 0,
+        ...(error.retryAt !== undefined ? { retryAt: error.retryAt } : {}),
+      };
+    }
+    if (error.kind === "retry-after" || error.kind === "circuit") {
+      return {
+        reason: "retry-after",
+        requestsMade: error.requestsMade ?? 0,
+        ...(error.retryAt !== undefined ? { retryAt: error.retryAt } : {}),
+      };
+    }
+    if (error.kind === "config" && error.waitForSignal) {
+      return { reason: "extract-state", requestsMade: error.requestsMade ?? 0, waitForSignal: true };
+    }
+    if (error.kind === "transport" && error.retryAt !== undefined) {
+      return {
+        reason: "extract-transport",
+        requestsMade: error.requestsMade ?? 1,
+        retryAt: error.retryAt,
+      };
+    }
+  }
+  return undefined;
 }
 
 /**

@@ -266,7 +266,12 @@ export async function runAudit(store: Store, config: AutoMemConfig): Promise<Aud
 
   const summary = { error: 0, warning: 0, info: 0 };
   for (const finding of findings) summary[finding.severity] += 1;
-  const report: AuditReport = { generatedAt: new Date().toISOString(), findings, summary };
+  const report: AuditReport = {
+    generatedAt: new Date().toISOString(),
+    auditRunAt: new Date().toISOString(),
+    findings,
+    summary,
+  };
   await store.writeAudit(report);
   await computeMetrics(store, report);
   return report;

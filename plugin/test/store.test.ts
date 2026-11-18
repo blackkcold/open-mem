@@ -35,6 +35,40 @@ describe("Store", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("shares a daily review-request ceiling across rolling-hour windows", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-store-day-cap-"));
+    try {
+      const first = new Store(dir);
+      await first.init();
+      const second = new Store(dir);
+      await second.init();
+      const start = Date.UTC(2026, 0, 1, 0, 0, 0);
+
+      const reservations = await Promise.all(Array.from({ length: 48 }, (_, index) => {
+        const store = index % 2 === 0 ? first : second;
+        return store.takeModelSlot("review", 100, start + index * 30 * 60_000);
+      }));
+      expect(reservations.filter(Boolean)).toHaveLength(40);
+      expect((await first.readState()).modelRequests?.review).toHaveLength(40);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not consume a second request timestamp when the shared hourly cap rejects", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-store-hour-cap-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const at = Date.UTC(2026, 0, 1, 0, 0, 0);
+      expect(await store.takeModelSlot("review", 1, at)).toBe(true);
+      expect(await store.takeModelSlot("review", 1, at + 1_000)).toBe(false);
+      expect((await store.readState()).modelRequests?.review).toEqual([at]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
   it("creates the data layout and round-trips auto memory", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-store-"));
     try {

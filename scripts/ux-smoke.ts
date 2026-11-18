@@ -56,6 +56,32 @@ for (const entry of [
     updatedAt: at,
   });
 }
+// Segment fixtures: one row per console segment, a legacy queue row, a project B
+// row and one revertible change. Flags such as expired/restorable stay
+// server-computed; the fixture only seeds the ledger the server reads.
+const earlier = new Date(Date.now() - 3 * 86_400_000).toISOString();
+const fixtureSource = { sessionID: "ux-session", role: "user" as const };
+const stopping = { id: "ux-stopped", title: "已停止的习惯", text: "旧项目要求回复使用长标题", kind: "preference" as const, scope: "project" as const, projectKey: "ux-project", project: "UX 合成项目", status: "auto" as const, source: fixtureSource, createdAt: earlier, updatedAt: earlier };
+const stopped = { ...stopping, status: "archived" as const, supersededBy: "deactivate", updatedAt: at };
+const restoredBefore = { id: "ux-restored", title: "恢复的排查规则", text: "排查先看日志", kind: "rule" as const, scope: "project" as const, projectKey: "ux-project", project: "UX 合成项目", status: "archived" as const, supersededBy: "deactivate", source: fixtureSource, createdAt: earlier, updatedAt: earlier };
+const restored = { ...restoredBefore, status: "auto" as const, supersededBy: undefined, updatedAt: at };
+const undoBefore = { id: "ux-undo", title: "撤销演练", text: "回复先给结论，再补细节", kind: "preference" as const, scope: "global" as const, status: "auto" as const, source: fixtureSource, createdAt: earlier, updatedAt: earlier };
+const undoAfter = { ...undoBefore, text: "回复先给结论", updatedAt: at };
+for (const entry of [
+  stopped,
+  restored,
+  undoAfter,
+  { id: "ux-expired", title: "过期偏好", text: "本周内使用周报模板", kind: "preference" as const, scope: "global" as const, status: "auto" as const, expiresAt: new Date(Date.now() - 86_400_000).toISOString(), source: fixtureSource, createdAt: earlier, updatedAt: earlier },
+  { id: "ux-legacy-queue", title: "旧审批队列偏好", text: "旧版候选仍待审批", kind: "preference" as const, scope: "project" as const, projectKey: "ux-project", project: "UX 合成项目", status: "queue" as const, origin: "session-review" as const, reviewType: "preference" as const, reviewID: "review_ux", source: fixtureSource, createdAt: earlier, updatedAt: earlier },
+  { id: "ux-project-b-item", title: "项目 B 记忆", text: "这个项目使用英文小标题", kind: "rule" as const, scope: "project" as const, projectKey: "ux-project-b", project: "UX 项目 B", status: "auto" as const, source: fixtureSource, createdAt: earlier, updatedAt: earlier },
+]) await store.appendItem(entry);
+for (const [id, kind, actor, before, after, reason, revertible] of [
+  ["change_ux_stop", "deactivate", "user", stopping, stopped, "仅用于 UX 验证的停止操作", false],
+  ["change_ux_restore", "restore", "user", restoredBefore, restored, "仅用于 UX 验证的版本恢复", false],
+  ["change_ux_undo", "update", "system", undoBefore, undoAfter, "仅用于 UX 验证的撤销操作", true],
+] as const) {
+  await store.appendChange({ id, at, kind, actor, itemID: after.id, before, after, source: fixtureSource, reason, revertible });
+}
 await store.appendReview({ id: "review_ux", sessionID: "ux-session", projectKey: "ux-project", status: "ready", createdAt: at, candidates: 0, dropped: 0,
   sessionNotes: [{ type: "preference", text: "输出先简述结论", createdAt: at, evidence: [{ messageID: "ux-m1", quote: "先简述结论", kind: "user" }] }] });
 await mkdir(path.join(dataDir, "recovery"), { recursive: true });

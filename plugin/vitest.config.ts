@@ -2,9 +2,10 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    // The orchestrator uses real timers and temp-dir I/O; under a full parallel
-    // run the default 5s is too tight for the multi-step reliability cases.
-    testTimeout: 20_000,
-    hookTimeout: 20_000,
+    // The orchestrator uses real timers and temp-dir I/O; full-suite runs are
+    // CPU-bound on 8 workers, so the default 5s and the older 20s are too tight
+    // for the multi-step reliability and wiring cases.
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
   },
 });

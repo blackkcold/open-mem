@@ -534,3 +534,86 @@ body {
   .op-skeleton { animation: none; }
   .op-bar i { transition: none; }
 }
+
+/* P05: memory-first rail, 260/320 density, always-visible 44px actions. */
+.op-panel { min-width: 0; }
+.op-axes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+.op-axis {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 2px 6px;
+  border: 1px solid var(--oc-border);
+  border-radius: 999px;
+  color: var(--oc-muted);
+  font: 500 0.6rem/1.3 var(--oc-font, sans-serif);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.op-axis i {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: currentColor;
+}
+.op-axis.success { color: var(--oc-success-text); border-color: var(--oc-success); }
+.op-axis.warning { color: var(--oc-warning-text); border-color: var(--oc-warning); }
+.op-axis.info { color: var(--oc-info-text); border-color: var(--oc-info); }
+
+.op-row { grid-template-columns: minmax(0, 1fr) auto; }
+.op-row-copy strong { overflow-wrap: anywhere; }
+.op-btn,
+.op-icon-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+.op-btn.row-action { padding: 4px 9px; font-size: 0.7rem; }
+.op-icon-btn { width: 44px; height: 44px; }
+.op-message {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--oc-border);
+  border-left: 2px solid var(--oc-primary);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--oc-primary) 8%, transparent);
+  color: var(--oc-fg);
+  font-size: 0.66rem;
+  line-height: 1.45;
+}
+.op-legacy {
+  margin: 0;
+  color: var(--oc-muted);
+  font-size: 0.6rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.op-foot { min-width: 0; }
+.op-foot .op-btn { flex: none; }
+
+@media (max-width: 320px) {
+  .op-panel { padding: 10px 8px; }
+  .op-title small { display: none; }
+  .op-row { grid-template-columns: 1fr; }
+  .op-row-actions,
+  .op-row .op-btn { width: 100%; justify-content: center; }
+}
+.op-axis,
+.op-message,
+.op-legacy,
+.op-list-head,
+.op-row-copy span,
+.op-tag { font-size: 0.7rem; }
+.op-message.error {
+  border-color: var(--oc-error);
+  border-left-color: var(--oc-error);
+  background: color-mix(in srgb, var(--oc-error) 9%, transparent);
+  color: var(--oc-error-text);
+}

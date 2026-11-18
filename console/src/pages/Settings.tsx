@@ -1,8 +1,23 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ApiError, api } from "../api";
+import {
+  ApiError,
+  api,
+  fetchAutomationStatus,
+  setAutomationMode,
+} from "../api";
 import { confirmAction } from "../extension/confirm";
 import { isExtension } from "../extension/mode";
-import type { Config, Health } from "../types";
+import type {
+  AutomationMode,
+  AutomationStatus,
+  Config,
+  Health,
+  Metrics,
+  RetentionPreview,
+} from "../types";
+import { advancedLink } from "./audit-links";
+import { formatBytes } from "./memory-graph";
+import { modeLabel, reasonLabel } from "./status-model";
 import { applyLoad, applySaveResult, isDraftDirty, newLoadTicket } from "./draft-state";
 import type { LoadOutcome } from "./draft-state";
 import {
@@ -26,6 +41,8 @@ interface Props {
   refreshKey: number;
   onChanged: () => void;
   onDirtyChange: (dirty: boolean) => void;
+  metrics?: Metrics;
+  automation?: AutomationStatus;
 }
 
 type ConfigLoadResult =
@@ -33,9 +50,19 @@ type ConfigLoadResult =
   | { kind: "failed" }
   | { kind: "loaded"; outcome: LoadOutcome; decision: LoadedConfigDecision };
 
-export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
+export function SettingsPage({
+  refreshKey,
+  onChanged,
+  onDirtyChange,
+  metrics,
+  automation,
+}: Props) {
   const [config, setConfig] = useState<Config>();
   const [health, setHealth] = useState<Health>();
+  const [retention, setRetention] = useState<RetentionPreview>();
+  const [automationStatus, setAutomationStatus] = useState<AutomationStatus | undefined>(
+    automation,
+  );
   const [savedSnapshot, setSavedSnapshot] = useState("");
   const [message, setMessage] = useState("");
   const [notice, setNotice] = useState("");
@@ -96,9 +123,10 @@ export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
     async (explicit: boolean): Promise<ConfigLoadResult> => {
       const ticket = newLoadTicket(++loadSeq.current, draftOf(configRef.current));
       try {
-        const [response, nextHealth] = await Promise.all([
+        const [response, nextHealth, nextRetention] = await Promise.all([
           api<ConfigWithRevision>("/api/config"),
           api<Health>("/api/health"),
+          api<RetentionPreview>("/api/retention/preview").catch(() => undefined),
         ]);
         const snapshot = readConfigSnapshot(response);
         const nextConfig = snapshot.config;
@@ -125,6 +153,7 @@ export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
         // confirmation was based on, so that attempt must be re-confirmed.
         saveContextSeq.current += 1;
         setHealth(nextHealth);
+        setRetention(nextRetention);
         setError("");
 
         if (decision.kind === "invalid-revision") {
@@ -181,6 +210,25 @@ export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
   useEffect(() => {
     void loadConfig(false);
   }, [refreshKey, loadConfig]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setAutomationStatus(automation);
+    if (automation) return () => {
+      cancelled = true;
+    };
+    fetchAutomationStatus()
+      .then((value) => {
+        if (!cancelled) setAutomationStatus(value);
+      })
+      .catch(() => {
+        // The automation panel states the snapshot is unavailable instead of
+        // rendering a reassuring green state.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [automation, refreshKey]);
 
   const dirty = config !== undefined && isDraftDirty(JSON.stringify(config), savedSnapshot);
   const saveBlocked =
@@ -493,40 +541,50 @@ export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
 
   return (
     <div className="settings">
-      <section className="panel">
-        <div className="panel-head"><h2>写入策略</h2><span className="meta">auto vs queue</span></div>
-        <div className="detail-body">
-          <label className="row">
-            <input
-              type="checkbox"
-              checked={config.shadow}
-              onChange={(event) => setConfig({ ...config, shadow: event.target.checked })}
-            />
-            <span>Shadow mode：只观察，不自动写入；会话复盘启用时仍会调用模型</span>
-          </label>
-          <label className="row">
-            <input
-              type="checkbox"
-              checked={config.autoMemory}
-              onChange={(event) => setConfig({ ...config, autoMemory: event.target.checked })}
-            />
-            <span>允许自动写 facts / preferences / references</span>
-          </label>
-          <label className="row">
-            <input
-              type="checkbox"
-              checked={false}
-              disabled
-            />
-            <span>规则始终需要人工批准，不会自动写入</span>
-          </label>
-          <p className="muted small" style={{ margin: 0 }}>
-            Shadow 开启时只记录“本来会写入什么”，不落盘；关闭 Shadow 后，低风险、无重复、
-            无冲突的条目才会自动写入。高危、冲突、重复、低置信、规则合并和 skill 始终需要人工。
-          </p>
-        </div>
-      </section>
+      <fieldset className="settings-group">
+        <legend>写入与自动化</legend>
+        <div className="settings-group-body">
+          <AutomationPanel
+            status={automationStatus}
+            onChanged={() => {
+              void fetchAutomationStatus()
+                .then(setAutomationStatus)
+                .catch(() => undefined);
+              onChanged();
+            }}
+          />
 
+          <section className="panel">
+            <div className="panel-head">
+              <h2>兼容配置</h2>
+              <span className="meta">只读 · 由运行模式控制</span>
+            </div>
+            <div className="detail-body">
+              <p className="muted small" style={{ margin: 0 }}>
+                持久配置中的 shadow / autoMemory 由运行模式统一控制，页面不再单独改写，避免
+                “开关看起来打开但实际不写”。旧实例遗留的状态如实显示在这里，不会自动转换模式。
+              </p>
+              <div className="field">
+                <label>兼容字段 shadow</label>
+                <input className="input" readOnly value={config.shadow ? "true（兼容状态）" : "false"} />
+              </div>
+              <div className="field">
+                <label>兼容字段 autoMemory</label>
+                <input className="input" readOnly value={config.autoMemory ? "true（兼容状态）" : "false"} />
+              </div>
+              <p className="muted small" style={{ margin: 0 }}>
+                运行模式为“兼容配置”时按旧配置运行：旧审批仍可人工处理；新自动写入模式未启用，
+                旧路径是否自动写入仍由原有设置与守卫生效，不会改写 P03 学习守卫。规则与高风险候选
+                仍按旧策略进入设置 › 高级与维护 › 审查（legacy）。
+              </p>
+            </div>
+          </section>
+        </div>
+      </fieldset>
+
+      <fieldset className="settings-group">
+        <legend>模型与阈值</legend>
+        <div className="settings-group-body">
       <section className="panel">
         <div className="panel-head">
           <h2>System One · 决策</h2>
@@ -733,7 +791,7 @@ export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
               checked={config.review.enabled}
               onChange={(event) => setReview("enabled", event.target.checked)}
             />
-            <span>会话空闲后自动复盘（候选只进队列，永不自动写）</span>
+            <span>会话空闲后自动复盘（候选如何生效由上方运行模式决定）</span>
           </label>
           <div className="field">
             <label htmlFor="review-idle">空闲阈值（分钟）</label>
@@ -836,7 +894,8 @@ export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
             />
           </div>
           <p className="muted small" style={{ margin: 0 }}>
-            复盘候选永远只进审批队列；关闭后不再发起后台模型调用，已排期的计时器会立即停止。
+            复盘候选的去向由运行模式决定：兼容模式进入旧审批；观察模式只记录；自动写入按阈值与安全守卫生效。
+            关闭后不再发起后台模型调用，已排期的计时器会立即停止。
           </p>
         </div>
       </section>
@@ -870,9 +929,14 @@ export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
           </div>
         </div>
       </section>
+        </div>
+      </fieldset>
 
+      <fieldset className="settings-group">
+        <legend>容量</legend>
+        <div className="settings-group-body">
       <section className="panel">
-        <div className="panel-head"><h2>容量</h2><span className="meta">硬上限</span></div>
+        <div className="panel-head"><h2>容量与磁盘预算</h2><span className="meta">硬上限</span></div>
         <div className="detail-body">
           <div className="field">
             <label>AUTO_MEMORY max items</label>
@@ -910,9 +974,94 @@ export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
               }
             />
           </div>
+          <div className="field" style={{ gridColumn: "1 / -1" }}>
+            <span className="meta">当前保留与回收口径</span>
+            <p className="muted small">
+              变更 {retention?.counts.changes ?? automationStatus?.capacity.counts.changes ?? "—"} 条 ·
+              journal {retention?.counts.changeJournals ?? automationStatus?.capacity.counts.changeJournals ?? "—"} 份 ·
+              抑制 {retention?.counts.suppressions ?? automationStatus?.capacity.counts.suppressions ?? "—"} 条 ·
+              隔离 {retention?.counts.quarantine ?? automationStatus?.capacity.counts.quarantine ?? "—"} 条 ·
+              迁移 journal {retention?.counts.migrationJournals ?? automationStatus?.capacity.counts.migrationJournals ?? "—"} 份 · checkpoint {retention?.counts.checkpointBackups ?? automationStatus?.capacity.counts.checkpointBackups ?? "—"} 份
+            </p>
+            <p className="muted small">
+              可回收 {formatBytes(retention?.reclaimableBytes ?? automationStatus?.retention?.remainingReclaimableBytes)}，托管历史 {formatBytes(retention?.historyBytes)}；
+              受保护变更 {retention?.protectedChanges ?? automationStatus?.retention?.protected.changes ?? "—"} 条、
+              journal {retention?.protectedJournals ?? automationStatus?.retention?.protected.journals ?? "—"} 份。
+            </p>
+            <p className="muted small">
+              容量 {automationStatus ? `${Math.round(automationStatus.capacity.ratio * 100)}%（${automationStatus.capacity.level}${automationStatus.capacity.historyAtCapacity ? "，受保护历史已满" : ""}）` : "未知"}；
+              阻断 {retention?.blocked
+                ? retention.blockedReasons.join("、")
+                : automationStatus?.retention?.blocked
+                  ? automationStatus.retention.blockedReasons.join("、")
+                  : "无"}；
+              最近自动回收 {automationStatus?.retention
+                ? `${new Date(automationStatus.retention.at).toLocaleString()}，释放 ${formatBytes(automationStatus.retention.reclaimedBytes)}`
+                : "无记录"}。
+              完整预览与确认在 <a href={advancedLink("health")}>健康与维护</a>。
+            </p>
+          </div>
         </div>
       </section>
+        </div>
+      </fieldset>
 
+      <fieldset className="settings-group">
+        <legend>高级与维护</legend>
+        <div className="settings-group-body">
+          <section className="panel" style={{ gridColumn: "1 / -1" }}>
+            <div className="panel-head">
+              <h2>旧能力入口</h2>
+              <span className="meta">主动进入 · 不催审</span>
+            </div>
+            <div className="advanced-grid">
+              <AdvancedLink
+                href={advancedLink("review")}
+                title="审查（legacy）"
+                summary={
+                  metrics
+                    ? `旧审批候选 ${metrics.queue} 条；普通自动记忆不会进入这里`
+                    : "旧审批候选数量未知"
+                }
+              />
+              <AdvancedLink
+                href={advancedLink("health")}
+                title="健康与维护"
+                summary="健康分、模型调用、压缩、历史清理"
+              />
+              <AdvancedLink
+                href={advancedLink("audit")}
+                title="审计"
+                summary={metrics ? `当前发现 ${metrics.auditFindings} 条` : "发现数量未知"}
+              />
+              <AdvancedLink
+                href={advancedLink("graph")}
+                title="记忆图谱"
+                summary="六视图只读快照；管理请在记忆页"
+              />
+              <AdvancedLink
+                href={advancedLink("skills")}
+                title="技能审查"
+                summary={metrics ? `草稿 ${metrics.skillDrafts} 条` : "草稿数量未知"}
+              />
+              <AdvancedLink
+                href={advancedLink("history")}
+                title="历史"
+                summary="操作历史、合并撤销与维护回滚"
+              />
+              <AdvancedLink
+                href={advancedLink("backup")}
+                title="备份"
+                summary="覆盖矩阵与恢复演练状态"
+              />
+            </div>
+          </section>
+        </div>
+      </fieldset>
+
+      <fieldset className="settings-group">
+        <legend>环境</legend>
+        <div className="settings-group-body">
       <section className="panel">
         <div className="panel-head"><h2>环境</h2><span className="meta">local only</span></div>
         <div className="detail-body">
@@ -944,6 +1093,23 @@ export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
           </p>
         </div>
       </section>
+        </div>
+      </fieldset>
+
+      <fieldset className="settings-group danger-zone">
+        <legend>危险区</legend>
+        <div className="settings-group-body">
+          <section className="panel">
+            <div className="panel-head"><h2>删除与迁移</h2><span className="meta">未实现入口不显示</span></div>
+            <div className="detail-body">
+              <p className="muted small" style={{ margin: 0 }}>
+                当前版本没有“彻底删除所有副本（含备份）”或迁移回滚的产品入口，因此不显示假按钮。
+                停止使用只是停止上下文注入，不承诺删除本机备份或上游已收到的请求数据。
+              </p>
+            </div>
+          </section>
+        </div>
+      </fieldset>
 
       {revisionBlocked || metadataBlocked || conflictBlocked || concurrentRevision ? (
         <div style={{ gridColumn: "1 / -1", display: "grid", gap: 8 }}>
@@ -1003,6 +1169,173 @@ export function SettingsPage({ refreshKey, onChanged, onDirtyChange }: Props) {
         ) : null}
       </div>
     </div>
+  );
+}
+
+function AdvancedLink({
+  href,
+  title,
+  summary,
+}: {
+  href: string;
+  title: string;
+  summary: string;
+}) {
+  return (
+    <a className="advanced-row" href={href}>
+      <span className="advanced-copy">
+        <strong>{title}</strong>
+        <small>{summary}</small>
+      </span>
+      <span className="advanced-open">打开</span>
+    </a>
+  );
+}
+
+const MODE_OPTIONS: Array<{ id: AutomationMode; label: string; note: string }> = [
+  { id: "off", label: "停止学习", note: "停止后台自动采集与写入；已有记忆仍可用" },
+  { id: "shadow", label: "观察不写入", note: "不写入生效记忆，保留观察记录" },
+  { id: "autonomous", label: "自动写入", note: "低风险描述性记忆直接生效；规则仍走旧审批" },
+];
+
+function AutomationPanel({
+  status,
+  onChanged,
+}: {
+  status: AutomationStatus | undefined;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState<string | undefined>();
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const revision = status?.configRevision;
+
+  async function change(mode: AutomationMode) {
+    if (!revision || busy) return;
+    setBusy(mode);
+    setMessage("");
+    setError("");
+    try {
+      await setAutomationMode(mode, revision);
+      setMessage(
+        mode === "off"
+          ? "已提交“停止学习”；后台自动采集与写入已停止，已有记忆仍可用。"
+          : mode === "shadow"
+            ? "已提交“观察不写入”；后台不写入生效记忆，只保留观察记录。"
+            : "已提交“自动写入”；实际是否执行以服务端 effectiveMode 与 blocked 状态为准。",
+      );
+      onChanged();
+    } catch (caught: unknown) {
+      setError(
+        caught instanceof ApiError && caught.status === 409
+          ? "配置已变化，未切换模式；请刷新后重新选择。"
+          : errorMessage(caught),
+      );
+    } finally {
+      setBusy(undefined);
+    }
+  }
+
+  if (!status) {
+    return (
+      <section className="panel">
+        <div className="panel-head"><h2>运行模式</h2><span className="badge warning">状态不可用</span></div>
+        <div className="detail-body">
+          <p className="muted small" style={{ margin: 0 }}>
+            读取不到 /api/automation/status，无法确认当前模式或安全切换；不会显示“绿色可运行”。
+          </p>
+        </div>
+      </section>
+    );
+  }
+
+  const blocked =
+    status.blockedReasons.length > 0 ||
+    status.pending.capacityBlocked ||
+    status.availability.extract === "degraded" ||
+    status.availability.extract === "unknown" ||
+    status.degraded.some(
+      (entry) => entry.state === "blocked" || entry.state === "degraded",
+    );
+  const runnable =
+    status.effectiveMode === "autonomous" &&
+    !blocked &&
+    status.availability.extract === "configured";
+  const blockedText = status.blockedReasons.map(reasonLabel).join("、");
+  const retryAt =
+    status.pending.nextRetryAt ??
+    status.budget.hourly.retryAt ??
+    status.budget.daily.retryAt ??
+    status.degraded.find((entry) => entry.retryAt)?.retryAt ??
+    null;
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>运行模式</h2>
+        <span className={`badge ${runnable ? "success" : blocked ? "warning" : "info"}`}>
+          {runnable ? "自动写入 · 生效中" : blocked ? "受限/状态未知" : modeLabel(status.effectiveMode)}
+        </span>
+      </div>
+      <div className="detail-body">
+        <div className="mode-options" role="radiogroup" aria-label="自动记忆运行模式">
+          {MODE_OPTIONS.map((option) => (
+            <label className={`mode-option${status.configuredMode === option.id ? " active" : ""}`} key={option.id}>
+              <input
+                type="radio"
+                name="automation-mode"
+                checked={status.configuredMode === option.id}
+                disabled={busy !== undefined || !revision}
+                onChange={() => void change(option.id)}
+              />
+              <span>
+                <strong>{option.label}</strong>
+                <small>{option.note}</small>
+              </span>
+            </label>
+          ))}
+        </div>
+        <p className="muted small" style={{ margin: 0 }}>
+          一次选择就是一次原子设置（带 expectedConfigRevision）。当前配置模式：{status.configuredMode}；
+          服务端 effective：{status.effectiveMode}。兼容配置不会因页面选择自动转换；旧行为仍按旧配置与 P03 守卫执行。
+        </p>
+        <div className="status-facts">
+          <span>抽取可用性 <b>{status.availability.extract}</b></span>
+          <span>阻断 <b>{blockedText || "无"}</b></span>
+          <span>重试 <b>{retryAt ? new Date(retryAt).toLocaleString() : "无"}</b></span>
+          <span>
+            最近成功{" "}
+            <b>{status.lastSuccess ? new Date(status.lastSuccess.at).toLocaleString() : "无记录"}</b>
+          </span>
+        </div>
+        {status.degraded.length > 0 ? (
+          <ul className="degraded-list">
+            {status.degraded.map((entry) => (
+              <li key={`${entry.scope}:${entry.reason}`}>
+                <span className={`dot ${entry.state === "blocked" ? "warn" : ""}`} aria-hidden="true" />
+                {entry.scope} · {reasonLabel(entry.reason)}
+                {entry.count ? ` · ${entry.count}` : ""}
+              </li>
+            ))}
+          </ul>
+        ) : null}
+        <div className="actions">
+          <button
+            className="btn danger"
+            type="button"
+            disabled={busy !== undefined || !revision}
+            onClick={() => void change("off")}
+          >
+            {busy === "off" ? "正在停止…" : "立即停止后台学习"}
+          </button>
+          <span className="muted small">
+            kill switch 会真实停止后台采集/写入，不会隐藏组件，也不影响已有记忆的查看、停止使用或恢复。
+          </span>
+        </div>
+        {message ? <div className="banner ok" role="status">{message}</div> : null}
+        {error ? <div className="banner error" role="alert">{error}</div> : null}
+      </div>
+    </section>
   );
 }
 

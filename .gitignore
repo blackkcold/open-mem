@@ -28,3 +28,6 @@ extension/service/main.js
 *.bak
 *.bak-*
 *.tmp
+
+# early duplicate reports; canonical reports live under docs/goals/*/reports/
+/reports/

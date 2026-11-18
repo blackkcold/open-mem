@@ -1,5 +1,5 @@
 import type { SessionMessage } from "../types.js";
-import { normalizeSessionMessage, rawMessageID } from "./normalize.js";
+import { normalizeSessionMessage, normalizeSessionMessages, rawMessageID } from "./normalize.js";
 import { isUserAuthored } from "./filters.js";
 import { clipMiddle, truncate } from "../util/text.js";
 
@@ -107,6 +107,16 @@ export class SessionReader {
     entry.messages = out.slice(-this.options.maxMessages);
     this.evictSessions();
     return entry.messages;
+  }
+
+  /**
+   * Re-read the complete native transcript for evidence extraction. This path
+   * deliberately bypasses the turn cache, message-count cap and text slimming;
+   * callers must still filter roles/synthetic content before using it.
+   */
+  async readForEvidence(sessionID: string): Promise<SessionMessage[]> {
+    const raw = await this.load(sessionID);
+    return normalizeSessionMessages(raw);
   }
 
   async delta(sessionID: string, afterMessageID?: string): Promise<SessionMessage[]> {

@@ -3,6 +3,8 @@ import type { Store } from "./store.js";
 import { rebuildAutoFiles } from "./rebuild.js";
 import { capacityStatus } from "./capacity.js";
 import { classifyRelation, isExactRelation } from "./relations.js";
+import { newChangeID, recordChange } from "./changes.js";
+import type { ChangeKind } from "./types.js";
 
 export interface CompactionResult {
   ok: boolean;
@@ -37,6 +39,7 @@ export async function runCompaction(
   }
 
   const next = [...items];
+  const kinds = new Map<string, ChangeKind>();
   const now = new Date().toISOString();
   let merged = 0;
   let archived = 0;
@@ -50,6 +53,7 @@ export async function runCompaction(
         left.createdAt.localeCompare(right.createdAt),
     );
     const canonical = group[0];
+    let clusterMerged = 0;
     for (const other of group.slice(1)) {
       // Automatic maintenance may only collapse evidence-backed exact
       // duplicates. A short SimHash/lexical distance is not enough: a port,
@@ -70,6 +74,7 @@ export async function runCompaction(
       canonical.lastSeenAt = now;
       canonical.aliases = [...(canonical.aliases ?? []), other.text].slice(-10);
       merged += 1;
+      clusterMerged += 1;
 
       const index = next.findIndex((item) => item.id === other.id);
       if (index !== -1) {
@@ -79,11 +84,18 @@ export async function runCompaction(
           supersededBy: canonical.id,
           updatedAt: now,
         };
+        kinds.set(other.id, "archive");
         archived += 1;
       }
     }
     const index = next.findIndex((item) => item.id === canonical.id);
-    if (index !== -1) next[index] = canonical;
+    if (index !== -1) {
+      next[index] = canonical;
+      // Only a cluster that actually merged may stamp its canonical: a global
+      // counter would write a ghost `update` for untouched groups, which then
+      // blocks earlier reverts and can revive downstream invalidation.
+      if (clusterMerged > 0) kinds.set(canonical.id, "update");
+    }
   }
 
   if (options.dryRun) {
@@ -92,7 +104,31 @@ export async function runCompaction(
       memory: activeBefore.filter((item) => item.kind !== "rule" && item.kind !== "skill").length,
       rules: activeBefore.filter((item) => item.kind === "rule").length };
   }
-  const journalID = merged > 0 ? await store.applyItemChanges(snapshot, next) : undefined;
+  const journalID = merged > 0 ? await store.transaction(async () => {
+    // Stamp change ids before the maintenance snapshot so journal.after and
+    // the stored rows stay identical for undoMaintenance.
+    for (const [id] of kinds) {
+      const index = next.findIndex((item) => item.id === id);
+      if (index !== -1) next[index] = { ...next[index], changeID: newChangeID() };
+    }
+    const id = await store.applyItemChanges(snapshot, next);
+    for (const [itemID, kind] of kinds) {
+      const after = next.find((item) => item.id === itemID);
+      const before = snapshot.find((item) => item.id === itemID);
+      if (!after || !before) continue;
+      await recordChange(store, {
+        kind,
+        actor: "curator",
+        itemID,
+        item: after,
+        before,
+        source: before.source,
+        origin: "curator",
+        reason: kind === "archive" ? "compaction duplicate" : "compaction canonical",
+      });
+    }
+    return id;
+  }) : undefined;
   await store.pruneReservations(10 * 60 * 1000);
   await store.pruneShadow(config.caps.shadow);
   await store.pruneHooks(config.caps.hooks);

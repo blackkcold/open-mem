@@ -13,6 +13,7 @@ import {
 } from "./memory/write-guard.js";
 import type { RelationKind } from "./relations.js";
 import { queueItemSnapshotVersion } from "./fingerprint.js";
+import { newChangeID, recordChange } from "./changes.js";
 import {
   BATCH_APPLY_CONFIDENCE_FLOOR,
   batchItemNeedsIndividualReview,
@@ -292,9 +293,19 @@ async function applyQueueDecisionUnlocked(
       sources: found.sources ?? [found.source],
       evidence: found.evidence,
       tags: [...(found.tags ?? []), found.id],
+      changeID: newChangeID(),
     };
     const recoveryID = await store.saveQueueRecovery(found, item);
     await store.appendItem(item);
+    await recordChange(store, {
+      kind: "promote",
+      actor: "user",
+      itemID: item.id,
+      item,
+      source: item.source,
+      origin: "user",
+      reason: `promote ${found.id}`,
+    });
     await store.removeQueue(found.id);
     await rebuildAutoFiles(store);
     await store.incrementStat("promotionApplied");
@@ -441,9 +452,19 @@ async function applyQueueDecisionUnlocked(
       seenCount: 1,
       lastSeenAt: now,
       sources: [found.source],
+      changeID: newChangeID(),
     };
     const recoveryID = await store.saveQueueRecovery(found, item);
     await store.appendItem(item);
+    await recordChange(store, {
+      kind: "add",
+      actor: "user",
+      itemID: item.id,
+      item,
+      source: found.source,
+      origin: "user",
+      reason: "approved",
+    });
     await store.removeQueue(found.id);
     await rebuildAutoFiles(store);
     await store.incrementStat("suggestionApplied");
@@ -494,9 +515,19 @@ async function applyQueueDecisionUnlocked(
       updatedAt: now,
       decision: found.decision,
       tags: [...(found.tags ?? []), found.id],
+      changeID: newChangeID(),
     };
     const recoveryID = await store.saveQueueRecovery(found, item);
     await store.appendItem(item);
+    await recordChange(store, {
+      kind: "add",
+      actor: "user",
+      itemID: item.id,
+      item,
+      source: found.source,
+      origin: "user",
+      reason: "denied",
+    });
     await store.removeQueue(found.id);
     await store.incrementStat("suggestionRejected");
     await store.appendChangelog({

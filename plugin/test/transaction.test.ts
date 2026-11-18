@@ -7,7 +7,9 @@ import path from "node:path";
 import { Store } from "../src/store.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { buildSuggestion } from "../src/suggestion.js";
-import type { DecisionResult } from "../src/types.js";
+import { newChangeID, recordChange, revertChange } from "../src/changes.js";
+import { itemContentVersion } from "../src/fingerprint.js";
+import type { DecisionResult, Item } from "../src/types.js";
 
 describe("durable Store transactions", () => {
   it("rolls back a caught nested transaction without discarding the outer writes", async () => {
@@ -126,4 +128,84 @@ describe("durable Store transactions", () => {
       expect((await recovered.readStats()).committed).toBe(1);
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
+  it("replays an interrupted undo without leaving a half state", async () => {
+    const run = promisify(execFile);
+    const script = `import fs from 'node:fs/promises';
+      const {Store}=await import('./src/store.ts');
+      const {revertChange}=await import('./src/changes.ts');
+      const {itemContentVersion}=await import('./src/fingerprint.ts');
+      const rename=fs.rename; let n=0;
+      fs.rename=async(...args)=>{const result=await rename(...args); if(++n===Number(process.argv[2])) process.exit(73); return result;};
+      const store=new Store(process.argv[1]);
+      const current=(await store.listItems()).find((entry)=>entry.id==='item_crash');
+      const result=await revertChange(store,process.argv[3],{expectedVersion:itemContentVersion(current)});
+      if(!result.ok) throw new Error(result.message);
+      console.log(JSON.stringify({renames:n}));`;
+    let count = 0;
+    for (let point = 0; point <= count; point++) {
+      const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-txn-"));
+      try {
+        // Seed outside the crashing process so every rename belongs to the undo.
+        const store = new Store(dir);
+        await store.init();
+        const at = new Date().toISOString();
+        const base: Item = {
+          id: "item_crash",
+          title: "偏好",
+          text: "回复先给结论",
+          kind: "preference",
+          scope: "global",
+          status: "auto",
+          source: { sessionID: "s1", messageID: "m1", role: "user" },
+          createdAt: at,
+          updatedAt: at,
+        };
+        const seeded = { ...base, changeID: newChangeID() };
+        const addEvent = await store.transaction(async () => {
+          await store.appendItem(seeded);
+          return recordChange(store, {
+            kind: "add",
+            actor: "auto",
+            itemID: seeded.id,
+            item: seeded,
+            source: seeded.source,
+            origin: "turn",
+            reason: "auto",
+          });
+        });
+        const child = run(
+          process.execPath,
+          ["--import", "tsx", "--input-type=module", "-e", script, dir, String(point), addEvent.id],
+          { cwd: process.cwd() },
+        );
+        if (point === 0) {
+          count = (JSON.parse((await child).stdout) as { renames: number }).renames;
+        } else {
+          await expect(child).rejects.toMatchObject({ code: 73 });
+        }
+        const recovered = new Store(dir);
+        await recovered.init();
+        const row = (await recovered.listItems()).find((entry) => entry.id === "item_crash");
+        const revertEvents = (await recovered.listChanges()).filter((entry) => entry.kind === "revert");
+        const journal = await recovered.readChangeJournal(addEvent.id);
+        if (row?.status === "archived") {
+          // Fully committed: the row, the ledger row and the undone flag agree.
+          expect(revertEvents).toHaveLength(1);
+          expect(row.supersededBy).toBe("revert");
+          expect(row.changeID).toBe(revertEvents[0].id);
+          expect(journal?.undone).toBe(true);
+        } else {
+          // Not committed at all: nothing partial leaked, and a retry works.
+          expect(row?.status).toBe("auto");
+          expect(revertEvents).toHaveLength(0);
+          expect(journal?.undone).toBeFalsy();
+          const retry = await revertChange(recovered, addEvent.id, {
+            expectedVersion: itemContentVersion(seeded),
+          });
+          expect(retry.ok).toBe(true);
+        }
+      } finally { await rm(dir, { recursive: true, force: true }); }
+    }
+    expect(count).toBeGreaterThan(2);
+  }, 120_000);
 });

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, formatAge, formatPercent, formatReviewAge } from "../api";
 import { confirmAction } from "../extension/confirm";
-import type { Health, HealthScore, MergeJournal, UsageSummary } from "../types";
+import type { Health, HealthScore, MergeJournal, RetentionPreview, UsageSummary } from "../types";
 import {
   buildMergeUndoPreview,
   canApplyLoadRequest,
@@ -35,17 +35,6 @@ interface Props {
 }
 
 interface HistoryEntry { at: string; action: string; itemID?: string; queueID?: string; journalID?: string; recoveryID?: string; target?: string }
-interface RetentionPreview {
-  id: string;
-  policy: { days: number; minRecords: number; sessionDays: number };
-  deleteFiles: string[];
-  archiveSessions: string[];
-  pruneItems: number;
-  pruneMerges: number;
-  pruneHistory: number;
-  reclaimableBytes: number;
-  protectedCount: number;
-}
 
 const HISTORY_LABEL: Record<string, string> = { approve: "批准记忆", deny: "拒绝候选", promote: "提升范围", promote_session_note: "保留会话笔记", compact: "压缩", curator: "自动整理", edit: "编辑", defer: "延后", resume: "取消延后", undo_maintenance: "撤销整理", undo_merge: "撤销合并", restore_queue_action: "恢复候选", create_skill_draft: "生成流程草稿", dismiss_note: "忽略笔记", restore_note: "恢复笔记", capture_blocked: "容量待处理", capture_rejected: "敏感信息拦截" };
 
@@ -483,12 +472,12 @@ export function HealthPage({ refreshKey, onChanged }: Props) {
       <section className="panel" style={{ marginTop: 12 }} aria-label="历史保留与清理">
         <div className="panel-head"><h2>历史保留与清理</h2><span className="spacer" /><button className="btn" disabled={busy} onClick={() => void previewHistory()}>预览历史清理</button></div>
         <div className="detail-body">
-          <p className="muted small">恢复记录至少保留 90 天及每类最近 20 次；90 天不活跃的会话状态可冷归档，续聊会保留原游标与固定上下文。不会后台自动删除。</p>
+          <p className="muted small">后台只按已批准策略回收：过期自动记忆、精确重复、72h 隔离候选、观察/钩子上限、以及超过 {(retention?.policy.days ?? 90)} 天且无引用的派生历史。人工记忆、已停止/已撤销、受保护事件与引用闭包不会自动删除；其余硬清理仍需下方预览确认。</p>
           {retention ? <div role="status">
-            <p>预计清理 {retention.deleteFiles.length} 个文件、{retention.pruneItems + retention.pruneMerges + retention.pruneHistory} 条记录，释放约 {(retention.reclaimableBytes / 1024).toFixed(1)} KB；冷归档 {retention.archiveSessions.length} 个会话状态。</p>
-            <p className="muted small">保守保护 {retention.protectedCount} 份记录；保护窗口内或时间不明的历史不会为满足容量强行删除。冷归档只减少活跃状态，不等于释放同等磁盘空间。</p>
-            {retention.deleteFiles.length ? <details><summary>查看待清理文件名</summary><ul>{retention.deleteFiles.slice(0, 50).map((file) => <li key={file}><code>{file}</code></li>)}</ul>{retention.deleteFiles.length > 50 ? <p>另有 {retention.deleteFiles.length - 50} 个文件</p> : null}</details> : null}
-            <div className="actions"><button className="btn danger" disabled={busy || !(retention.deleteFiles.length + retention.archiveSessions.length + retention.pruneItems + retention.pruneMerges + retention.pruneHistory)} onClick={() => void cleanHistory()}>确认清理预览项</button><button className="btn" disabled={busy} onClick={() => setRetention(undefined)}>取消预览</button></div>
+            <p>预计清理 {retention.deleteFiles.length} 个历史文件、{retention.pruneItems + retention.pruneMerges + retention.pruneHistory} 条记录、{retention.pruneChanges} 条变更事件与 {retention.pruneChangeJournals} 份变更 journal，释放约 {(retention.reclaimableBytes / 1024).toFixed(1)} KB；冷归档 {retention.archiveSessions.length} 个会话状态。</p>
+            <p className="muted small">受保护：{retention.protectedChanges} 条变更事件、{retention.protectedJournals} 份 journal、{retention.protectedSuppressions} 条抑制；共保护 {retention.protectedCount} 份记录。{retention.blocked ? `保留策略已到上限：${retention.blockedReasons.join("、")}。` : "当前没有保留策略阻断。"}托管历史共 {(retention.historyBytes / 1024).toFixed(1)} KB。</p>
+            {retention.deleteFiles.length || retention.deletedChangeJournals.length ? <details><summary>查看待清理路径</summary><ul>{[...retention.deleteFiles, ...retention.deletedChangeJournals].slice(0, 50).map((file) => <li key={file}><code>{file}</code></li>)}</ul>{retention.deleteFiles.length + retention.deletedChangeJournals.length > 50 ? <p>另有 {retention.deleteFiles.length + retention.deletedChangeJournals.length - 50} 个文件</p> : null}</details> : null}
+            <div className="actions"><button className="btn danger" disabled={busy || !(retention.deleteFiles.length + retention.archiveSessions.length + retention.pruneItems + retention.pruneMerges + retention.pruneHistory + retention.pruneChanges + retention.pruneChangeJournals + retention.pruneSuppressions + retention.pruneQuarantine)} onClick={() => void cleanHistory()}>确认清理预览项</button><button className="btn" disabled={busy} onClick={() => setRetention(undefined)}>取消预览</button></div>
           </div> : null}
         </div>
       </section>

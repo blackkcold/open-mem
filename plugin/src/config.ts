@@ -1,7 +1,9 @@
 import type {
   AutoMemConfig,
+  AutomationConfig,
   DecisionConfig,
   DigestConfig,
+  RecallConfig,
   ReviewConfig,
   RewriteConfig,
   Scope,
@@ -47,6 +49,7 @@ export const DEFAULT_CONFIG: AutoMemConfig = {
   },
   review: {
     enabled: true,
+    transport: "ollama",
     idleMs: 180_000,
     minNewUserMessages: 1,
     checkpointMessages: 20,
@@ -68,10 +71,27 @@ export const DEFAULT_CONFIG: AutoMemConfig = {
     },
     maxDeferrals: 3,
   },
+  automation: {
+    enabled: false,
+    mode: "off",
+    revision: 0,
+    autoUpdate: true,
+    dailyWrites: 40,
+    maxWritesPerSession: 5,
+  },
+  recall: {
+    limit: 5,
+    tokenBudget: 600,
+    apiLimit: 8,
+    apiTokenBudget: 1200,
+  },
   digest: {
     maxEntries: 2000,
     maxBytes: 2 * 1024 * 1024,
     maxChars: 160,
+  },
+  undo: {
+    retainDays: 90,
   },
   thresholds: {
     memoryMaxChars: 200,
@@ -97,7 +117,7 @@ export const DEFAULT_CONFIG: AutoMemConfig = {
 
 export type ConfigPatch = Omit<
   Partial<AutoMemConfig>,
-  "decision" | "rewrite" | "thresholds" | "caps" | "turn" | "review" | "digest"
+  "decision" | "rewrite" | "thresholds" | "caps" | "turn" | "review" | "digest" | "undo" | "automation" | "recall"
 > & {
   decision?: Partial<DecisionConfig>;
   rewrite?: Partial<Omit<RewriteConfig, "model">> & {
@@ -110,13 +130,16 @@ export type ConfigPatch = Omit<
   thresholds?: Partial<AutoMemConfig["thresholds"]>;
   caps?: Partial<AutoMemConfig["caps"]>;
   turn?: Partial<AutoMemConfig["turn"]>;
+  undo?: Partial<AutoMemConfig["undo"]>;
+  automation?: Partial<AutomationConfig>;
+  recall?: Partial<RecallConfig>;
 };
 
 export function mergeConfig(...parts: Array<ConfigPatch | undefined>): AutoMemConfig {
   const result: AutoMemConfig = structuredClone(DEFAULT_CONFIG);
   for (const part of parts) {
     if (!part) continue;
-    const { decision, rewrite, review, digest, thresholds, caps, turn, ...rest } = part;
+    const { decision, rewrite, review, digest, thresholds, caps, turn, undo, automation, recall, ...rest } = part;
     const defined = Object.fromEntries(
       Object.entries(rest).filter(([, value]) => value !== undefined),
     );
@@ -124,6 +147,9 @@ export function mergeConfig(...parts: Array<ConfigPatch | undefined>): AutoMemCo
     if (thresholds) result.thresholds = { ...result.thresholds, ...thresholds };
     if (caps) result.caps = { ...result.caps, ...caps };
     if (turn) result.turn = { ...result.turn, ...turn };
+    if (undo) result.undo = { ...result.undo, ...undo };
+    if (automation) result.automation = { ...result.automation, ...automation };
+    if (recall) result.recall = { ...result.recall, ...recall };
     if (decision) result.decision = { ...result.decision, ...decision };
     if (digest) result.digest = { ...result.digest, ...digest };
     if (review) {
@@ -148,6 +174,13 @@ export function mergeConfig(...parts: Array<ConfigPatch | undefined>): AutoMemCo
         },
       };
     }
+  }
+  // A persisted pre-mode config is legacy state, not an implicit opt-in to
+  // the new kill-switch semantics. Fresh stores use DEFAULT_CONFIG (mode=off);
+  // only an explicit stored/API mode selects one of the new modes.
+  const baseAutomation = parts[0]?.automation;
+  if (!baseAutomation || typeof baseAutomation.mode !== "string") {
+    result.automation.mode = undefined;
   }
   return result;
 }

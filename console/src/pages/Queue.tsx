@@ -109,7 +109,7 @@ const STATUS_TONE: Record<ReviewRecord["status"], string> = {
   failed: "error",
 };
 
-export function QueuePage({
+export function ReviewQueue({
   refreshKey,
   onChanged,
   targetItemID,
@@ -2527,3 +2527,6 @@ function formatClock(value: string): string {
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+/** Legacy import name; the queue is now rendered only under settings › advanced. */
+export const QueuePage = ReviewQueue;

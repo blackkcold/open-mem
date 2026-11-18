@@ -132,7 +132,7 @@ export function AuditPage({
                   ref={isTarget ? targetRef : undefined}
                   style={
                     isTarget
-                      ? { outline: "2px solid var(--primary)", outlineOffset: 4, borderRadius: 6 }
+                      ? { outline: "2px solid var(--accent)", outlineOffset: 4, borderRadius: 6 }
                       : undefined
                   }
                   data-finding-id={finding.id}

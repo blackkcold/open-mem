@@ -7,11 +7,19 @@ import { readFile, stat } from "node:fs/promises";
 import { URL } from "node:url";
 import type {
   AutoMemConfig,
+  AutomationMode,
+  ChangeEvent,
   QueueItem,
+  RevertResult,
   Suggestion,
   UsageSummary,
 } from "./types.js";
-import { Store } from "./store.js";
+import {
+  Store,
+  EXTRACT_PENDING_MAX_BYTES,
+  EXTRACT_PENDING_MAX_ROWS,
+  EXTRACT_PENDING_TTL_MS,
+} from "./store.js";
 import { sortQueue } from "./priority.js";
 import { computeMetrics, runAudit } from "./audit.js";
 import { projectMap } from "./map.js";
@@ -22,7 +30,14 @@ import {
   batchItemNeedsIndividualReview,
   batchSuggestionRejection,
 } from "./batch-policy.js";
-import { queueItemSnapshotVersion } from "./fingerprint.js";
+import { queueItemSnapshotVersion, itemContentVersion } from "./fingerprint.js";
+import {
+  deactivateItem,
+  reactivateItem,
+  recordItemDiff,
+  restoreVersion,
+  revertChange,
+} from "./changes.js";
 import { promoteSessionNote } from "./memory/session-promotion.js";
 import {
   applyScopeMigration,
@@ -36,10 +51,13 @@ import { undoMerge } from "./apply.js";
 import { computeHealth } from "./health.js";
 import { runCompaction } from "./compact.js";
 import { applyRetention, previewRetention } from "./retention.js";
+import { capacityStatus } from "./capacity.js";
 import { rebuildAutoFiles } from "./rebuild.js";
 import { validateModelEndpoint } from "./util/endpoint.js";
 import { mergeConfig } from "./config.js";
+import { recallMemory } from "./recall.js";
 import { sha16 } from "./util/text.js";
+import { lifecycleStatus } from "./memory/lifecycle.js";
 import {
   buildMemoryGraph,
   readGraphSource,
@@ -60,6 +78,8 @@ export interface ServerOptions {
   consoleDir?: string;
   decisionKeySource?: "env" | "auth" | "missing";
   projectDir?: string;
+  /** Instance project identity; only this key may query /api/recall. */
+  projectKey?: string;
   graphRoots?: Partial<GraphRoots>;
   suggest?: (id: string) => Promise<Suggestion | undefined>;
   reviewStats?: () => Record<string, unknown>;
@@ -238,11 +258,22 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
     }
 
     if (requestURL.pathname === "/api/health" && req.method === "GET") {
+      // The console server is shared per data dir. Its project key belongs to
+      // the instance that started it, and is the only key /api/recall accepts.
+      // Surface that identity instead of letting the UI treat any project
+      // dropdown value as a server-side owner.
+      const project = options.projectKey
+        ? {
+            key: options.projectKey,
+            label: projectLabelOf(options.projectDir),
+          }
+        : null;
       sendJson(res, 200, {
         ok: true,
-        version: "0.5.0",
+        version: "0.6.0",
         dataDir: store.dataDir,
         shadow: config.shadow,
+        project,
         decision: {
           kind: config.decision.kind,
           model: config.decision.model,
@@ -259,9 +290,349 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
           model: config.review.model,
           idleMs: config.review.idleMs,
           transcript: config.review.transcript,
+          transport: config.review.transport ?? "ollama",
           maxPerHour: config.review.maxPerHour,
+          maxRequestsPerHour:
+            config.review.maxRequestsPerHour ??
+            Math.max(
+              config.review.maxPerHour,
+              config.review.maxPerHour * (1 + config.review.repairAttempts) * 2,
+            ),
           runtime: options.reviewStats?.() ?? null,
         },
+      });
+      return;
+    }
+
+    if (requestURL.pathname === "/api/console/open" && req.method === "POST") {
+      if (!options.openExternal) {
+        sendJson(res, 501, { ok: false, error: "当前宿主没有打开控制台的能力" });
+        return;
+      }
+      try {
+        const opened = await options.openExternal(url);
+        sendJson(res, 200, { ok: opened });
+      } catch (error: unknown) {
+        sendJson(res, 500, {
+          ok: false,
+          error: error instanceof Error ? error.message : "打开控制台失败",
+        });
+      }
+      return;
+    }
+
+    if (requestURL.pathname === "/api/automation/status" && req.method === "GET") {
+      const [persistedConfig, state] = await Promise.all([
+        store.readConfig().then((value) => mergeConfig(value)),
+        store.readState(),
+      ]);
+      const now = Date.now();
+      const lifecycle = await lifecycleStatus(store, now);
+      const capacity = await capacityStatus(store, persistedConfig);
+      const historyRetention = state.automation?.retention;
+      const retentionRetryAt = historyRetention?.nextAttemptAt ??
+        state.automation?.retentionGate?.nextAttemptAt ?? null;
+      const sessions = state.sessions ?? {};
+      const allPendingEntries = Object.entries(sessions).flatMap(([sessionID, session]) =>
+        session.extractPending
+          ? [{ sessionID, session, pending: session.extractPending }]
+          : [],
+      );
+      const pendingEntries = allPendingEntries.filter(({ pending }) => {
+        const createdAt = Date.parse(pending.createdAt ?? pending.updatedAt);
+        return Number.isFinite(createdAt) && now - createdAt < EXTRACT_PENDING_TTL_MS;
+      });
+      const expiredPendingCount = allPendingEntries.length - pendingEntries.length;
+      const pendingBytes = pendingEntries.reduce(
+        (total, { sessionID, pending }) =>
+          total + Buffer.byteLength(JSON.stringify([sessionID, pending]), "utf8") + 1,
+        0,
+      );
+      const pendingByReason: Record<string, number> = {};
+      for (const { pending } of pendingEntries) {
+        pendingByReason[pending.reason] = (pendingByReason[pending.reason] ?? 0) + 1;
+      }
+      const pendingTimes = pendingEntries
+        .map(({ pending }) => Date.parse(pending.createdAt ?? pending.updatedAt))
+        .filter(Number.isFinite);
+      const oldestPendingAt = pendingTimes.length > 0 ? Math.min(...pendingTimes) : undefined;
+      const pendingRetryTimes = pendingEntries
+        .map(({ pending }) => {
+          const retryAt = pending.retryAt ?? pending.dueAt;
+          return retryAt ? Date.parse(retryAt) : Number.NaN;
+        })
+        .filter((value) => Number.isFinite(value) && value > now);
+      const nextRetryAt = pendingRetryTimes.length > 0
+        ? new Date(Math.min(...pendingRetryTimes)).toISOString()
+        : undefined;
+      const storedCapacityBlockedUntil = state.automation?.capacityBlockedUntil;
+      const storedCapacityBlockedUntilMs = storedCapacityBlockedUntil
+        ? Date.parse(storedCapacityBlockedUntil)
+        : Number.NaN;
+      const storedCapacityBlockActive = state.automation?.pendingCapacityBlocked === true &&
+        (!storedCapacityBlockedUntil || !Number.isFinite(storedCapacityBlockedUntilMs) || storedCapacityBlockedUntilMs > now);
+      const pendingCapacityBlocked = storedCapacityBlockActive ||
+        pendingEntries.length >= EXTRACT_PENDING_MAX_ROWS ||
+        pendingBytes >= EXTRACT_PENDING_MAX_BYTES;
+      const capacityBlockedUntil = storedCapacityBlockedUntil &&
+        Number.isFinite(storedCapacityBlockedUntilMs) && storedCapacityBlockedUntilMs > now
+        ? storedCapacityBlockedUntil
+        : null;
+
+      const reviewRequests = (state.modelRequests?.review ?? [])
+        .filter((value) => Number.isFinite(value) && value >= now - 24 * 60 * 60 * 1000);
+      const hourlyRequests = reviewRequests.filter((value) => value >= now - 60 * 60 * 1000);
+      const purposeRequests = (state.modelRequestPurposes ?? [])
+        .filter((entry) => entry.at >= now - 24 * 60 * 60 * 1000);
+      const hourlyPurposeRequests = purposeRequests.filter((entry) => entry.at >= now - 60 * 60 * 1000);
+      const extractDailyUsed = purposeRequests.filter((entry) => entry.purpose === "extract").length;
+      const extractHourlyUsed = hourlyPurposeRequests.filter((entry) => entry.purpose === "extract").length;
+      const rawDailyLimit = persistedConfig.automation.dailyModelCalls;
+      const dailyLimit = Math.min(
+        40,
+        Math.max(0, Math.floor(
+          typeof rawDailyLimit === "number" && Number.isFinite(rawDailyLimit)
+            ? rawDailyLimit
+            : 40,
+        )),
+      );
+      const derivedHourlyLimit = persistedConfig.review.maxRequestsPerHour ?? Math.max(
+        persistedConfig.review.maxPerHour,
+        persistedConfig.review.maxPerHour * (1 + persistedConfig.review.repairAttempts) * 2,
+      );
+      const hourlyLimit = Math.max(0, Math.floor(
+        Number.isFinite(derivedHourlyLimit) ? derivedHourlyLimit : 0,
+      ));
+      const runtime = options.reviewStats?.() ?? {};
+      const providers = isRecord(runtime.providers) ? runtime.providers : {};
+      const providerSummary = (purpose: "review" | "extract") => {
+        const value = providers[purpose];
+        if (!isRecord(value)) return null;
+        const openUntil = typeof value.openUntil === "number" && value.openUntil > now
+          ? new Date(value.openUntil).toISOString()
+          : null;
+        return {
+          failures: typeof value.failures === "number" ? value.failures : 0,
+          cached: typeof value.cached === "number" ? value.cached : 0,
+          circuitOpen: openUntil !== null,
+          retryAt: openUntil,
+        };
+      };
+      const reviewProviderStatus = providerSummary("review");
+      const extractProviderStatus = providerSummary("extract");
+      const configuredMode = persistedConfig.automation.mode ?? "legacy";
+      const effectiveMode = configuredMode === "legacy"
+        ? "legacy"
+        : persistedConfig.automation.enabled !== true || configuredMode === "off"
+          ? "off"
+          : configuredMode;
+      const extractEnabled = persistedConfig.automation.enabled === true &&
+        persistedConfig.automation.mode !== "off";
+      const modelConfigured = Boolean(persistedConfig.review.model.id);
+      const hourlyBudgetBlocked = hourlyLimit === 0 || hourlyRequests.length >= hourlyLimit;
+      const dailyBudgetBlocked = dailyLimit === 0 || reviewRequests.length >= dailyLimit;
+      const hourlyRetryAt = hourlyRequests.length >= hourlyLimit && hourlyRequests.length > 0
+        ? new Date(Math.min(...hourlyRequests) + 60 * 60 * 1000 + 1000).toISOString()
+        : null;
+      const dailyRetryAt = reviewRequests.length >= dailyLimit && reviewRequests.length > 0
+        ? new Date(Math.min(...reviewRequests) + 24 * 60 * 60 * 1000 + 1000).toISOString()
+        : null;
+      const ownershipSessions = pendingEntries.map(({ session }) => session);
+      const ownerUnknown = ownershipSessions.filter((session) => !session.sessionDirectory).length;
+      const childSessions = ownershipSessions.filter((session) => Boolean(session.parentSessionID)).length;
+      const parentUnknown = ownershipSessions.filter((session) => session.parentChecked !== true).length;
+      const expired = state.automation?.expiredUnlearned ?? 0;
+      const blockedReasons: string[] = [];
+      if (persistedConfig.automation.mode === "off") blockedReasons.push("mode-off");
+      if (capacity.level === "freeze") blockedReasons.push("capacity-freeze");
+      if (capacity.level === "block") blockedReasons.push("capacity-block");
+      if (capacity.historyAtCapacity) blockedReasons.push("history-protected-capacity");
+      if (pendingCapacityBlocked) blockedReasons.push("pending-capacity");
+      if (lifecycle.retiredLearningBlocked) blockedReasons.push("retired-source-capacity");
+      if (lifecycle.globalPromotionBlocked) blockedReasons.push("global-candidate-capacity");
+      if (ownerUnknown > 0) blockedReasons.push("owner-unconfirmed");
+      if (providerSummary("extract")?.circuitOpen) blockedReasons.push("extract-provider-circuit");
+
+      const degraded: Array<{
+        scope: string;
+        state: "disabled" | "blocked" | "degraded" | "unknown";
+        reason: string;
+        count?: number;
+        retryAt?: string | null;
+      }> = [];
+      if (!extractEnabled) {
+        degraded.push({
+          scope: "extract",
+          state: "disabled",
+          reason: effectiveMode === "off" ? "mode-off" : "automation-disabled",
+        });
+      }
+      if (pendingCapacityBlocked) {
+        degraded.push({ scope: "pending", state: "blocked", reason: "pending-capacity" });
+      }
+      if (capacity.historyAtCapacity) {
+        degraded.push({
+          scope: "history-retention",
+          state: "blocked",
+          reason: "history-protected-capacity",
+          retryAt: retentionRetryAt,
+        });
+      } else if (historyRetention?.blocked) {
+        degraded.push({
+          scope: "history-retention",
+          state: "blocked",
+          reason: "retention-blocked",
+          retryAt: retentionRetryAt,
+        });
+      }
+      if (lifecycle.retiredLearningBlocked) {
+        degraded.push({ scope: "lifecycle.retired-learning", state: "blocked", reason: "retired-source-capacity" });
+      }
+      if (lifecycle.globalPromotionBlocked) {
+        degraded.push({ scope: "lifecycle.global-promotion", state: "blocked", reason: "global-candidate-capacity" });
+      }
+      if (ownerUnknown > 0) {
+        degraded.push({ scope: "ownership.pending", state: "unknown", reason: "owner-unconfirmed", count: ownerUnknown });
+      }
+      if (!modelConfigured && extractEnabled) {
+        degraded.push({ scope: "extract-provider", state: "blocked", reason: "model-unconfigured" });
+      }
+      if (extractProviderStatus?.circuitOpen) {
+        degraded.push({
+          scope: "extract-provider",
+          state: "degraded",
+          reason: "circuit-open",
+          retryAt: extractProviderStatus.retryAt,
+        });
+      } else if (extractEnabled && extractProviderStatus === null) {
+        degraded.push({ scope: "extract-provider", state: "unknown", reason: "runtime-provider-unknown" });
+      }
+      if (reviewProviderStatus?.circuitOpen) {
+        degraded.push({
+          scope: "review-provider",
+          state: "degraded",
+          reason: "circuit-open",
+          retryAt: reviewProviderStatus.retryAt,
+        });
+      }
+      if (hourlyBudgetBlocked) {
+        degraded.push({ scope: "shared-model-budget.hourly", state: "blocked", reason: "hourly-limit", retryAt: hourlyRetryAt });
+      }
+      if (dailyBudgetBlocked) {
+        degraded.push({ scope: "shared-model-budget.daily", state: "blocked", reason: "daily-limit", retryAt: dailyRetryAt });
+      }
+      const extractAvailability = !extractEnabled
+        ? "disabled"
+        : !modelConfigured || extractProviderStatus?.circuitOpen || pendingCapacityBlocked ||
+            hourlyBudgetBlocked || dailyBudgetBlocked
+          ? "degraded"
+          : extractProviderStatus === null
+            ? "unknown"
+            : "configured";
+
+      sendJson(res, 200, {
+        mode: configuredMode,
+        configuredMode,
+        effectiveMode,
+        configRevision: configRevisionOf(persistedConfig),
+        revision: persistedConfig.automation.revision ?? 0,
+        counts: {
+          pending: pendingEntries.length,
+          running: pendingByReason["in-flight"] ?? 0,
+          delayed: pendingEntries.length - (pendingByReason["in-flight"] ?? 0),
+          expired,
+          expiredPending: expiredPendingCount,
+          quarantined: lifecycle.quarantine,
+        },
+        pending: {
+          usedRows: pendingEntries.length,
+          maxRows: EXTRACT_PENDING_MAX_ROWS,
+          usedBytes: pendingBytes,
+          maxBytes: EXTRACT_PENDING_MAX_BYTES,
+          ttlMs: EXTRACT_PENDING_TTL_MS,
+          oldestAgeMs: oldestPendingAt === undefined ? 0 : Math.max(0, now - oldestPendingAt),
+          expiredRows: expiredPendingCount,
+          pendingFull: state.automation?.pendingFull ?? 0,
+          capacityBlocked: pendingCapacityBlocked,
+          capacityBlockedUntil,
+          nextRetryAt: nextRetryAt ?? null,
+          reasons: pendingByReason,
+        },
+        ownership: {
+          basis: "pending-only",
+          currentValidation: "unknown",
+          cachedOwnerKnown: ownershipSessions.length - ownerUnknown,
+          ownerUnknown,
+          child: childSessions,
+          parentUnknown,
+        },
+        provider: {
+          transport: persistedConfig.review.transport ?? "ollama",
+          providerID: persistedConfig.review.model.providerID || "unknown",
+          runtimeProviderID: extractProviderStatus
+            ? persistedConfig.review.model.providerID || "unknown"
+            : "unknown",
+          runtimeKnown: extractProviderStatus !== null,
+          modelConfigured,
+          review: reviewProviderStatus,
+          extract: extractProviderStatus,
+        },
+        availability: {
+          extract: extractAvailability,
+          reviewProvider: reviewProviderStatus === null
+            ? "unknown"
+            : reviewProviderStatus.circuitOpen ? "degraded" : "configured",
+          extractProvider: extractProviderStatus === null
+            ? "unknown"
+            : extractProviderStatus.circuitOpen ? "degraded" : "configured",
+          externalReachability: "unknown",
+        },
+        budget: {
+          hourly: {
+            used: hourlyRequests.length,
+            limit: hourlyLimit,
+            retryAt: hourlyRetryAt,
+          },
+          daily: {
+            used: reviewRequests.length,
+            limit: dailyLimit,
+            retryAt: dailyRetryAt,
+          },
+          purpose: {
+            review: purposeRequests.filter((entry) => entry.purpose === "review").length,
+            extract: purposeRequests.filter((entry) => entry.purpose === "extract").length,
+          },
+          extractFloor: {
+            eligible: oldestPendingAt !== undefined && now - oldestPendingAt >= 15 * 60 * 1000,
+            daily: Math.min(8, dailyLimit),
+            hourly: Math.min(1, hourlyLimit),
+            usedDaily: extractDailyUsed,
+            remainingDaily: Math.max(0, Math.min(8, dailyLimit) - extractDailyUsed),
+            usedHourly: extractHourlyUsed,
+            remainingHourly: Math.max(0, Math.min(1, hourlyLimit) - extractHourlyUsed),
+          },
+        },
+        lifecycle,
+        capacity: {
+          level: capacity.level,
+          ratio: capacity.ratio,
+          reason: capacity.reason,
+          historyAtCapacity: capacity.historyAtCapacity,
+          counts: capacity.counts,
+        },
+        retention: historyRetention ?? null,
+        blockedReasons,
+        degraded,
+        lastExtractAt: state.automation?.lastExtractAt ?? null,
+        lastSuccess: state.automation?.lastSuccess
+          ? {
+              at: state.automation.lastSuccess.at,
+              kind: state.automation.lastSuccess.kind,
+              action: state.automation.lastSuccess.action,
+            }
+          : null,
+        lastMaintenanceAt: state.automation?.lastMaintenanceAt ?? null,
+        generatedAt: new Date(now).toISOString(),
       });
       return;
     }
@@ -326,6 +697,14 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
         );
       const items = all.slice(0, limit);
       const runtime = options.reviewStats?.();
+      const persisted = await store.readState();
+      const now = Date.now();
+      const requests = (persisted.modelRequests?.review ?? []).filter(
+        (at) => at >= now - 60 * 60 * 1000,
+      );
+      const runs = (persisted.reviewRuns ?? []).filter(
+        (at) => at >= now - 60 * 60 * 1000,
+      );
       sendJson(res, 200, {
         items,
         canRun: Boolean(options.onReviewRequest),
@@ -333,6 +712,11 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
           runtime && typeof runtime.nextReviewAt === "string"
             ? runtime.nextReviewAt
             : null,
+        budget: {
+          runsLastHour: runs.length,
+          requestsLastHour: requests.length,
+          retryAt: requests.length ? Math.min(...requests) + 60 * 60 * 1000 + 1000 : null,
+        },
         summary: {
           total: all.length,
           last24h: all.filter(
@@ -833,6 +1217,153 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
       return;
     }
 
+    // Read-only activity ledger for the UI. Never returns prompts, credentials
+    // or filesystem paths, only item snapshots and their versions.
+    if (requestURL.pathname === "/api/changes" && req.method === "GET") {
+      const limit = Math.min(
+        500,
+        Math.max(1, Number(requestURL.searchParams.get("limit")) || 100),
+      );
+      const since = requestURL.searchParams.get("since");
+      const all = await store.listChanges();
+      const filtered = since ? all.filter((event) => event.at > since) : all;
+      sendJson(res, 200, { changes: filtered.slice(-limit) });
+      return;
+    }
+
+    // Read-only, bounded recall for the formal UI and debugging. The caller
+    // may only use this instance's project key; nothing is written and no
+    // usage/learning state is updated.
+    if (requestURL.pathname === "/api/recall" && req.method === "GET") {
+      const requestedKey = requestURL.searchParams.get("projectKey");
+      if (requestedKey !== null && requestedKey !== "" && requestedKey !== options.projectKey) {
+        sendJson(res, 403, { error: "project_mismatch" });
+        return;
+      }
+      const q = (requestURL.searchParams.get("q") ?? "").slice(0, 400);
+      const requestedLimit = Number(requestURL.searchParams.get("limit"));
+      const limit =
+        Number.isFinite(requestedLimit) && requestedLimit > 0
+          ? Math.min(8, Math.max(1, Math.floor(requestedLimit)))
+          : config.recall?.apiLimit ?? 8;
+      const result = await recallMemory(store, config, q, {
+        ...(options.projectKey !== undefined ? { projectKey: options.projectKey } : {}),
+        limit,
+        tokenBudget: config.recall?.apiTokenBudget ?? 1200,
+        now: clock(),
+      });
+      sendJson(res, 200, { ...result, estimate: true });
+      return;
+    }
+
+    if (requestURL.pathname === "/api/memory/items" && req.method === "GET") {
+      const status = requestURL.searchParams.get("status");
+      const scope = requestURL.searchParams.get("scope");
+      const projectKey = requestURL.searchParams.get("projectKey");
+      const query = requestURL.searchParams.get("q")?.trim().toLowerCase() ?? "";
+      const includeArchived = requestURL.searchParams.get("includeArchived") === "true";
+      const latest = new Map<string, ChangeEvent>();
+      for (const event of await store.listChanges()) latest.set(event.itemID, event);
+      const rows = (await store.listItems())
+        .filter((item) => {
+          if (status) return item.status === status;
+          return includeArchived || item.status !== "archived";
+        })
+        .filter((item) => !scope || item.scope === scope)
+        .filter((item) => !projectKey || item.projectKey === projectKey)
+        .filter(
+          (item) =>
+            !query ||
+            item.title.toLowerCase().includes(query) ||
+            item.text.toLowerCase().includes(query),
+        )
+        .map((item) => {
+          const change = latest.get(item.id);
+          const expired = isExpiredItem(item);
+          return {
+            ...item,
+            version: itemContentVersion(item),
+            changeID: item.changeID ?? change?.id,
+            latestChange: change,
+            source: item.source,
+            // Capabilities are computed here so the UI never re-derives the
+            // 90-day window, expiry or conflict rules from local dates.
+            expired,
+            stoppable:
+              (item.status === "auto" || item.status === "promoted") &&
+              !item.invalidatedBy &&
+              !expired,
+            restorable:
+              item.status === "archived" &&
+              item.supersededBy === "deactivate" &&
+              !expired,
+            revertible: change?.revertible ?? false,
+          };
+        });
+      sendJson(res, 200, { items: rows });
+      return;
+    }
+
+    const itemChanges = requestURL.pathname.match(/^\/api\/items\/([^/]+)\/changes$/);
+    if (itemChanges && req.method === "GET") {
+      const id = decodeURIComponent(itemChanges[1]);
+      const found = (await store.listItems()).find((item) => item.id === id);
+      if (!found) {
+        sendJson(res, 404, { error: "item not found" });
+        return;
+      }
+      sendJson(res, 200, { changes: await store.listChanges({ itemID: id }) });
+      return;
+    }
+
+    const itemAction = requestURL.pathname.match(
+      /^\/api\/items\/([^/]+)\/(deactivate|reactivate|revert|restore)$/,
+    );
+    if (itemAction && req.method === "POST") {
+      const id = decodeURIComponent(itemAction[1]);
+      const action = itemAction[2];
+      const body = await readJson(req);
+      if (!isRecord(body) || typeof body.expectedVersion !== "string" || !body.expectedVersion) {
+        sendJson(res, 400, { error: "expectedVersion is required" });
+        return;
+      }
+      // `source` from the body is ignored on purpose; the server owns it.
+      const reason = typeof body.reason === "string" ? body.reason : undefined;
+      let result: RevertResult;
+      if (action === "deactivate") {
+        result = await deactivateItem(store, id, { expectedVersion: body.expectedVersion, reason });
+      } else if (action === "reactivate") {
+        result = await reactivateItem(store, id, { expectedVersion: body.expectedVersion });
+      } else {
+        if (typeof body.changeID !== "string" || !body.changeID) {
+          sendJson(res, 400, { error: "changeID is required" });
+          return;
+        }
+        result =
+          action === "revert"
+            ? await revertChange(store, body.changeID, {
+                expectedVersion: body.expectedVersion,
+                reason,
+                itemID: id,
+              })
+            : await restoreVersion(store, id, body.changeID, { expectedVersion: body.expectedVersion });
+      }
+      if (result.ok) {
+        broadcast("items.updated", { id: result.event.itemID, action });
+        sendJson(res, 200, result);
+        return;
+      }
+      const current = (await store.listItems()).find((item) => item.id === id);
+      const status = result.code === "not_found" ? 404 : 409;
+      sendJson(res, status, {
+        ok: false,
+        code: result.code,
+        error: result.message,
+        version: current ? itemContentVersion(current) : undefined,
+      });
+      return;
+    }
+
     if (requestURL.pathname === "/api/map" && req.method === "GET") {
       const [items, queue, shadow] = await Promise.all([
         store.listItems(),
@@ -1011,7 +1542,7 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
       const limit = Math.min(200, Math.max(1, Number(requestURL.searchParams.get("limit")) || 50));
       const action = requestURL.searchParams.get("action");
       const entries = (await store.listChangelog()).filter((entry) => !action || entry.action === action);
-      const fields = ["at", "action", "queueID", "itemID", "target", "journalID", "reviewID", "curatorID", "recoveryID", "source", "decision", "fields", "humanEdited"];
+      const fields = ["at", "action", "queueID", "itemID", "target", "journalID", "reviewID", "curatorID", "recoveryID", "source", "decision", "fields", "humanEdited", "reason", "count", "reasons", "sessionID", "messageID"];
       sendJson(res, 200, { items: entries.slice(-limit).reverse().map((entry) => Object.fromEntries(fields.filter((field) => entry[field] !== undefined).map((field) => [field, entry[field]]))) });
       return;
     }
@@ -1020,7 +1551,14 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
     if (restoreAction && req.method === "POST") {
       try {
         await store.transaction(async () => {
+        const beforeItems = await store.listItems();
         await store.restoreQueueAction(restoreAction[1]);
+        await recordItemDiff(store, beforeItems, await store.listItems(), {
+          kind: "archive",
+          actor: "user",
+          reason: `restore queue action ${restoreAction[1]}`,
+          origin: "user",
+        });
         await rebuildAutoFiles(store);
         await store.appendChangelog({ action: "restore_queue_action", recoveryID: restoreAction[1] });
         });
@@ -1035,7 +1573,14 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
     if (maintenanceUndo && req.method === "POST") {
       try {
         const restored = await store.transaction(async () => {
+        const beforeItems = await store.listItems();
         const restored = await store.undoMaintenance(maintenanceUndo[1]);
+        await recordItemDiff(store, beforeItems, await store.listItems(), {
+          kind: "revert",
+          actor: "user",
+          reason: `undo maintenance ${maintenanceUndo[1]}`,
+          origin: "user",
+        });
         await rebuildAutoFiles(store);
         await store.appendChangelog({ action: "undo_maintenance", journalID: maintenanceUndo[1] });
         return restored;
@@ -1193,6 +1738,95 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
       return;
     }
 
+    if (requestURL.pathname === "/api/automation/mode" && req.method === "POST") {
+      const body = await readJson(req);
+      if (!isRecord(body)) {
+        sendJson(res, 400, { error: "invalid automation mode body" });
+        return;
+      }
+      const mode = body.mode;
+      if (mode !== "off" && mode !== "shadow" && mode !== "autonomous") {
+        sendJson(res, 400, { error: "mode must be off, shadow or autonomous" });
+        return;
+      }
+      if (typeof body.expectedConfigRevision !== "string") {
+        sendJson(res, 400, { error: "expectedConfigRevision is required" });
+        return;
+      }
+
+      await runConfigPatchExclusive(async () => {
+        let revisionConflict = false;
+        let committed = false;
+        let committedLive: AutoMemConfig | undefined;
+        let committedConfigRevision: string | undefined;
+        try {
+          await store.transaction(async () => {
+            const persisted = await store.readConfig();
+            const diskBefore = structuredClone({
+              ...mergeConfig(persisted),
+              token: config.token,
+              dataDir: config.dataDir,
+            });
+            if (body.expectedConfigRevision !== configRevisionOf(diskBefore)) {
+              revisionConflict = true;
+              return;
+            }
+            const diskNext = structuredClone(diskBefore);
+            const currentRevision = diskBefore.automation.revision;
+            const modeRevision = (
+              typeof currentRevision === "number" &&
+              Number.isSafeInteger(currentRevision) &&
+              currentRevision >= 0
+                ? currentRevision
+                : 0
+            ) + 1;
+            diskNext.automation = {
+              ...diskBefore.automation,
+              enabled: mode !== "off",
+              mode: mode as AutomationMode,
+              revision: modeRevision,
+            };
+            diskNext.shadow = mode !== "autonomous";
+            await store.writeConfig(diskNext);
+            await store.appendChangelog({
+              action: "automation_mode",
+              source: "local-token-api",
+              decision: mode,
+              fields: ["automation.enabled", "automation.mode", "automation.revision", "shadow"],
+            });
+            committedConfigRevision = configRevisionOf(diskNext);
+            committedLive = diskNext;
+            committed = true;
+          });
+        } catch (error: unknown) {
+          sendJson(res, 500, {
+            error: error instanceof Error ? error.message : "automation mode write failed",
+          });
+          return;
+        }
+        if (revisionConflict) {
+          sendJson(res, 409, { error: "配置已变化，请重新加载后再切换模式" });
+          return;
+        }
+        if (!committed || !committedLive || !committedConfigRevision) {
+          sendJson(res, 500, { error: "automation mode write was not committed" });
+          return;
+        }
+        Object.assign(config, committedLive);
+        options.onConfigChange?.(config);
+        broadcast("automation.updated", {
+          mode: config.automation.mode,
+          revision: config.automation.revision,
+        });
+        broadcast("config.updated", publicConfig(config));
+        sendJson(res, 200, {
+          ...publicConfig(config),
+          configRevision: committedConfigRevision,
+        });
+      });
+      return;
+    }
+
     if (requestURL.pathname === "/api/config" && req.method === "GET") {
       const persisted = mergeConfig(await store.readConfig());
       sendJson(res, 200, {
@@ -1234,11 +1868,60 @@ export async function startServer(options: ServerOptions): Promise<ServerHandle>
                 return;
               }
             }
+            const automationMode = diskBefore.automation.mode;
+            if (
+              automationMode !== undefined &&
+              typeof body.shadow === "boolean" &&
+              body.shadow !== (automationMode !== "autonomous")
+            ) {
+              validationError = "shadow is controlled by automation.mode; use /api/automation/mode";
+              return;
+            }
             const diskNext = structuredClone(diskBefore);
             const liveBefore = structuredClone(config);
             const liveNext = structuredClone(config);
             try {
               validateNumericPatch(body, diskNext);
+              if (isRecord(body.review)) {
+                const value = body.review;
+                if (
+                  value.transport !== undefined &&
+                  value.transport !== "opencode" &&
+                  value.transport !== "ollama"
+                ) {
+                  throw new Error("review.transport 必须是 opencode 或 ollama");
+                }
+                if (value.maxRequestsPerHour !== undefined) {
+                  if (
+                    typeof value.maxRequestsPerHour !== "number" ||
+                    !Number.isFinite(value.maxRequestsPerHour) ||
+                    value.maxRequestsPerHour <= 0
+                  ) {
+                    throw new Error("review.maxRequestsPerHour 必须是大于 0 的有效数字");
+                  }
+                }
+              }
+              if (isRecord(body.recall)) {
+                const value = body.recall;
+                const ranges: Array<[string, number, number]> = [
+                  ["limit", 1, 8],
+                  ["tokenBudget", 100, 2000],
+                  ["apiLimit", 1, 20],
+                  ["apiTokenBudget", 100, 4000],
+                ];
+                for (const [key, min, max] of ranges) {
+                  if (value[key] === undefined) continue;
+                  const candidate = value[key];
+                  if (
+                    typeof candidate !== "number" ||
+                    !Number.isFinite(candidate) ||
+                    candidate < min ||
+                    candidate > max
+                  ) {
+                    throw new Error(`recall.${key} 必须在 ${min}..${max} 之间`);
+                  }
+                }
+              }
               for (const field of ["decision", "rewrite"]) {
                 const value = body[field];
                 if (isRecord(value) && typeof value.endpoint === "string") {
@@ -1469,6 +2152,9 @@ function applyConfigPatch(config: AutoMemConfig, body: Record<string, unknown>):
     const value = body.review;
     if (typeof value.enabled === "boolean") config.review.enabled = value.enabled;
     if (typeof value.redact === "boolean") config.review.redact = value.redact;
+    if (value.transport === "opencode" || value.transport === "ollama") {
+      config.review.transport = value.transport;
+    }
     if (value.transcript === "user" || value.transcript === "user+tools") {
       config.review.transcript = value.transcript;
     }
@@ -1490,6 +2176,7 @@ function applyConfigPatch(config: AutoMemConfig, body: Record<string, unknown>):
       "maxCandidates",
       "minConfidence",
       "maxPerHour",
+      "maxRequestsPerHour",
       "maxOutputTokens",
       "timeoutMs",
       "cacheTtlHours",
@@ -1498,6 +2185,9 @@ function applyConfigPatch(config: AutoMemConfig, body: Record<string, unknown>):
   }
   if (isRecord(body.digest)) {
     assignNumbers(config.digest, body.digest, ["maxEntries", "maxBytes", "maxChars"]);
+  }
+  if (isRecord(body.undo)) {
+    assignNumbers(config.undo, body.undo, ["retainDays"]);
   }
   if (isRecord(body.decision)) {
     const value = body.decision;
@@ -1534,6 +2224,22 @@ function applyConfigPatch(config: AutoMemConfig, body: Record<string, unknown>):
       "maxCallsPerHour",
       "repairAttempts",
       "cacheTtlHours",
+    ]);
+  }
+  if (isRecord(body.recall)) {
+    config.recall ??= {
+      limit: 5,
+      tokenBudget: 600,
+      apiLimit: 8,
+      apiTokenBudget: 1200,
+    };
+    const value = body.recall;
+    if (typeof value.enabled === "boolean") config.recall.enabled = value.enabled;
+    assignNumbers(config.recall, value, [
+      "limit",
+      "tokenBudget",
+      "apiLimit",
+      "apiTokenBudget",
     ]);
   }
 }
@@ -1614,6 +2320,8 @@ const PERSISTED_SETTINGS_PATHS = [
   "review.enabled",
   "review.idleMs",
   "review.maxPerHour",
+  "review.maxRequestsPerHour",
+  "review.transport",
   "review.maxCandidates",
   "review.transcript",
   "review.redact",
@@ -1633,6 +2341,11 @@ const PERSISTED_SETTINGS_PATHS = [
   "caps.skillDrafts",
   "caps.itemsTotal",
   "caps.diskBytes",
+  "recall.enabled",
+  "recall.limit",
+  "recall.tokenBudget",
+  "recall.apiLimit",
+  "recall.apiTokenBudget",
 ] as const;
 
 type PersistedSettingValue = string | number | boolean | null;
@@ -1809,6 +2522,19 @@ function parseAcknowledgedRelations(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/** Project basename only; no absolute path is exposed on /api/health. */
+function projectLabelOf(projectDir: string | undefined): string {
+  if (!projectDir) return "当前项目";
+  const parts = projectDir.replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts.at(-1) ?? "当前项目";
+}
+
+function isExpiredItem(item: { expiresAt?: string }, now = Date.now()): boolean {
+  if (!item.expiresAt) return false;
+  const at = Date.parse(item.expiresAt);
+  return Number.isFinite(at) && at <= now;
 }
 
 function sendJson(res: http.ServerResponse, status: number, value: unknown): void {

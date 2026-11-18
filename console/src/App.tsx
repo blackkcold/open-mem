@@ -5,6 +5,7 @@ import {
   clearToken,
   getToken,
   exchangeConnectTicket,
+  fetchAutomationStatus,
   readTokenFromLocation,
   setToken,
   sseUrl,
@@ -14,9 +15,16 @@ import { connectionHint } from "./extension/errors";
 import { Icon, LogoMark } from "./extension/Icon";
 import { isExtension } from "./extension/mode";
 import { startPolling } from "./extension/poll";
-import type { Health, Metrics, MemoryGraphView } from "./types";
-import { AuditPage } from "./pages/Audit";
-import { parseRouteHash, type RouteTab } from "./pages/audit-links";
+import { host } from "./extension/transport";
+import type { AutomationStatus, Health, Metrics } from "./types";
+import { AdvancedPage, AdvancedShell } from "./pages/Advanced";
+import { ActivityPage } from "./pages/Activity";
+import {
+  canonicalHash,
+  parseRouteHash,
+  type ConsoleRoute,
+  type MainTab,
+} from "./pages/audit-links";
 import {
   CLEAN_FORMS,
   disconnectDraftWarning,
@@ -27,42 +35,57 @@ import {
   setFormDirty,
 } from "./pages/draft-state";
 import type { DirtyForms, DraftForm, RetainedPage } from "./pages/draft-state";
-import { HealthPage } from "./pages/Health";
-import { MemoryGraph } from "./pages/MemoryGraph";
-import { QueuePage } from "./pages/Queue";
+import { MemoryPage } from "./pages/Memory";
+import { ReviewQueue } from "./pages/Queue";
 import { SettingsPage } from "./pages/Settings";
+import {
+  itemActionLockScope,
+  useItemActionLocks,
+} from "./pages/item-action-locks";
 import { SkillsPage } from "./pages/Skills";
+import { axisChips, writeAxis } from "./pages/status-model";
 
-type Tab = RouteTab;
-
-const TABS: Array<{ id: Tab; label: string; icon: Parameters<typeof Icon>[0]["name"] }> = [
-  { id: "queue", label: "审批队列", icon: "queue" },
-  { id: "skills", label: "Skill Review", icon: "spark" },
-  { id: "map", label: "记忆图谱", icon: "shield" },
-  { id: "audit", label: "审计", icon: "alert" },
-  { id: "health", label: "健康", icon: "clock" },
+const TABS: Array<{ id: MainTab; label: string; icon: Parameters<typeof Icon>[0]["name"] }> = [
+  { id: "memory", label: "记忆", icon: "shield" },
+  { id: "activity", label: "活动", icon: "clock" },
   { id: "settings", label: "设置", icon: "settings" },
 ];
+
+const MAIN_TABS: ReadonlySet<string> = new Set<MainTab>(["memory", "activity", "settings"]);
 
 export function App() {
   const extension = isExtension();
   const [token, setTokenState] = useState(() => readTokenFromLocation());
-  const [tab, setTab] = useState<Tab>("queue");
-  // The queue is the default tab; mark it retained from the start so its
-  // unsaved decision drafts survive switching to audit and back.
-  const [retainedPages, setRetainedPages] = useState<readonly RetainedPage[]>(["queue"]);
+  const [tab, setTab] = useState<MainTab>("memory");
+  const [route, setRoute] = useState<ConsoleRoute>({ tab: "memory" });
+  const [retainedPages, setRetainedPages] = useState<readonly RetainedPage[]>([]);
   const [dirtyForms, setDirtyForms] = useState<DirtyForms>(CLEAN_FORMS);
-  const [queueTarget, setQueueTarget] = useState<string>();
-  const [auditTarget, setAuditTarget] = useState<{ id?: string; reportAt?: string }>();
-  const [graphView, setGraphView] = useState<MemoryGraphView>("architecture");
+  const [reviewVisited, setReviewVisited] = useState(
+    () => parseRouteHash(window.location.hash)?.advanced === "review",
+  );
+  const [skillsVisited, setSkillsVisited] = useState(
+    () => parseRouteHash(window.location.hash)?.advanced === "skills",
+  );
   const [health, setHealth] = useState<Health>();
   const [metrics, setMetrics] = useState<Metrics>();
+  const [automation, setAutomation] = useState<AutomationStatus>();
+  const [currentSessionID, setCurrentSessionID] = useState<string | undefined>();
   const [refreshKey, setRefreshKey] = useState(0);
   const [healthKey, setHealthKey] = useState(0);
   const [error, setError] = useState<ApiError | null>(null);
   const [live, setLive] = useState(false);
   const [connecting, setConnecting] = useState(() => !extension && new URL(window.location.href).searchParams.has("connect"));
   const connectAttempt = useRef<Promise<string | undefined>>(undefined);
+  const lockScope = itemActionLockScope(health);
+  const actionLocks = useItemActionLocks(lockScope);
+  const actionLockCount = Object.keys(actionLocks.locks).length;
+
+  useEffect(() => {
+    if (!extension) return;
+    // The extension host is the only trusted source of "this session"; the
+    // standalone console never guesses a session from URLs or model input.
+    return host.onSession((session) => setCurrentSessionID(session?.id));
+  }, [extension]);
 
   useEffect(() => {
     if (!connecting) return;
@@ -79,15 +102,23 @@ export function App() {
     bumpHealth();
   }, [bump, bumpHealth]);
 
-  // Remembering the visit in the same update as the tab change means a page
-  // mounts on its first visit and is never unmounted by a later switch.
-  const selectTab = useCallback((next: Tab) => {
+  const selectTab = useCallback((next: MainTab) => {
     setTab(next);
     setRetainedPages((current) => rememberPageVisit(current, next));
   }, []);
 
-  // Stable per-page callbacks: the retained editors register their dirty state
-  // here, and clear it on unmount so a stale flag cannot block a clean exit.
+  const applyRoute = useCallback(
+    (next: ConsoleRoute) => {
+      if (!MAIN_TABS.has(next.tab)) return;
+      const main = next.tab as MainTab;
+      selectTab(main);
+      setRoute(next);
+      if (next.advanced === "review") setReviewVisited(true);
+      if (next.advanced === "skills") setSkillsVisited(true);
+    },
+    [selectTab],
+  );
+
   const registerDirty = useCallback((form: DraftForm, dirty: boolean) => {
     setDirtyForms((current) => setFormDirty(current, form, dirty));
   }, []);
@@ -104,17 +135,27 @@ export function App() {
     [registerDirty],
   );
 
-  // Browser-level close/reload must warn while any retained editor is dirty.
   useEffect(() => {
     const handler = (event: BeforeUnloadEvent) => {
       if (!hasDirtyForms(dirtyForms)) return;
       event.preventDefault();
-      // Legacy browsers require a truthy returnValue to show the prompt.
       event.returnValue = "";
     };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
   }, [dirtyForms]);
+
+  useEffect(() => {
+    if (actionLockCount === 0 || actionLocks.persistence === "available") {
+      return;
+    }
+    const handler = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [actionLockCount, actionLocks.persistence]);
 
   async function disconnect() {
     const warning = disconnectDraftWarning(dirtyForms);
@@ -138,7 +179,8 @@ export function App() {
     Promise.allSettled([
       api<Health>("/api/health"),
       api<Metrics>("/api/metrics"),
-    ]).then(([healthResult, metricsResult]) => {
+      fetchAutomationStatus(),
+    ]).then(([healthResult, metricsResult, automationResult]) => {
       if (cancelled) return;
       if (healthResult.status === "fulfilled") {
         setHealth(healthResult.value);
@@ -149,10 +191,13 @@ export function App() {
       if (metricsResult.status === "fulfilled") {
         setMetrics(metricsResult.value);
       } else {
-        // Never keep a previous snapshot when the live read failed: the queue
-        // shows "unknown" instead of a stale global count.
+        // Never keep a previous snapshot when the live read failed: counts
+        // show "unknown" instead of a stale global number.
         setMetrics(undefined);
       }
+      setAutomation(
+        automationResult.status === "fulfilled" ? automationResult.value : undefined,
+      );
     });
     return () => {
       cancelled = true;
@@ -184,7 +229,7 @@ export function App() {
     ];
     for (const event of events) source.addEventListener(event, handler);
     source.onopen = () => setLive(true);
-    source.onerror = () => setLive(false); // EventSource retries transient errors automatically.
+    source.onerror = () => setLive(false);
     const timer = window.setInterval(() => {
       bump();
       bumpHealth();
@@ -198,29 +243,35 @@ export function App() {
 
   useEffect(() => {
     const navigate = () => {
-      const route = parseRouteHash(window.location.hash);
-      if (!route) return;
-      selectTab(route.tab);
-      setQueueTarget(route.queueItemID);
-      setAuditTarget(
-        route.auditFindingID
-          ? { id: route.auditFindingID, reportAt: route.auditReportAt }
-          : undefined,
-      );
-      if (route.graphView) {
-        setGraphView(route.graphView);
-      } else if (route.tab === "map") {
-        setGraphView("architecture");
+      const parsed = parseRouteHash(window.location.hash);
+      if (!parsed) {
+        // Unknown hashes keep the existing "do not jump" behaviour. An empty
+        // hash is the one case where the console lands on Memory.
+        if (!window.location.hash) {
+          window.history.replaceState(null, "", "#memory");
+          applyRoute({ tab: "memory" });
+        }
+        return;
       }
+      const canonical = canonicalHash(parsed);
+      if (window.location.hash !== canonical) {
+        window.history.replaceState(null, "", canonical);
+      }
+      const normalized = parseRouteHash(canonical);
+      if (normalized) applyRoute(normalized);
     };
     navigate();
     window.addEventListener("hashchange", navigate);
-    return () => window.removeEventListener("hashchange", navigate);
-  }, [selectTab]);
+    window.addEventListener("popstate", navigate);
+    return () => {
+      window.removeEventListener("hashchange", navigate);
+      window.removeEventListener("popstate", navigate);
+    };
+  }, [applyRoute]);
 
   useEffect(() => {
     if (!token || !extension) return;
-    const interval = tab === "map" || tab === "settings" ? 20_000 : 5_000;
+    const interval = tab === "settings" ? 20_000 : 5_000;
     return startPolling(() => bump(), interval);
   }, [token, extension, tab, bump]);
 
@@ -253,9 +304,15 @@ export function App() {
   }
 
   const active = TABS.find((entry) => entry.id === tab) ?? TABS[0];
+  const settingsVisible = tab === "settings" && !route.advanced;
+  const chips = axisChips(automation);
+  const writeChip = writeAxis(automation);
 
   return (
     <div className="app">
+      <a className="skip-link" href="#main-content">
+        跳到主要内容
+      </a>
       <aside className="sidebar">
         <div className="brand">
           <span className="brand-mark" aria-hidden="true">
@@ -266,29 +323,31 @@ export function App() {
             <small>Console</small>
           </span>
         </div>
-        {TABS.map((entry) => (
-          <button
-            key={entry.id}
-            className={`nav${entry.id === tab ? " active" : ""}`}
-            data-tab={entry.id}
-            onClick={() => {
-              selectTab(entry.id);
-              setQueueTarget(undefined);
-              setAuditTarget(undefined);
-              if (entry.id === "map") setGraphView("architecture");
-              window.location.hash = entry.id;
-              bump();
-            }}
-          >
-            <Icon name={entry.icon} size={15} />
-            <span>{entry.label}</span>
-            {entry.id === "queue" && metrics ? <b>{metrics.queue}</b> : null}
-            {entry.id === "skills" && metrics ? <b>{metrics.skillDrafts}</b> : null}
-            {entry.id === "audit" && metrics ? <b>{metrics.auditFindings}</b> : null}
-          </button>
-        ))}
+        <nav aria-label="主导航">
+          {TABS.map((entry) => (
+            <button
+              key={entry.id}
+              className={`nav${entry.id === tab ? " active" : ""}`}
+              data-tab={entry.id}
+              aria-current={entry.id === tab ? "page" : undefined}
+              onClick={() => {
+                if (window.location.hash === `#${entry.id}`) {
+                  applyRoute({ tab: entry.id });
+                } else {
+                  window.location.hash = entry.id;
+                }
+                bump();
+              }}
+            >
+              <Icon name={entry.icon} size={15} />
+              <span>{entry.label}</span>
+            </button>
+          ))}
+        </nav>
         <div className="sidebar-foot">
-          <span className="shadow-pill">{health?.shadow ? "SHADOW ON" : "SHADOW OFF"}</span>
+          <span className="sidebar-mode" title={writeChip.detail}>
+            {writeChip.label}
+          </span>
           <span className="sidebar-mode">{extension ? "OpenChamber 扩展" : "localhost + token"}</span>
           <span className="sidebar-version">v{__APP_VERSION__}</span>
           <span className="sidebar-build" title={__BUILD_TIME__}>
@@ -297,7 +356,7 @@ export function App() {
         </div>
       </aside>
 
-      <main className="main">
+      <main className="main" id="main-content">
         <header className="topbar">
           <div className="topbar-title">
             <h1>{active.label}</h1>
@@ -305,6 +364,14 @@ export function App() {
               {health?.dataDir ?? "connecting…"}
             </span>
           </div>
+          <span className="axis-chips topbar-axes" aria-label="运行状态（三轴独立）">
+            {chips.map((chip) => (
+              <span className={`axis-chip ${chip.tone}`} key={chip.key} title={chip.detail}>
+                <i aria-hidden="true" />
+                {chip.label}
+              </span>
+            ))}
+          </span>
           <span className="spacer" />
           <span className={`connection-pill${extension ? " extension" : " local"}`}>
             <i aria-hidden="true" />
@@ -326,45 +393,82 @@ export function App() {
         </header>
 
         {error ? <div className="banner error">{error.message}</div> : null}
+        {actionLockCount > 0 && actionLocks.persistence === "unavailable" ? (
+          <div className="banner warning" role="status">
+            操作结果锁无法跨刷新持久化；当前页面内仍保留，刷新前请先核对未知结果。
+          </div>
+        ) : null}
 
         <div className="content">
-          {isPageMounted(retainedPages, tab, "queue") ? (
-            <div hidden={!isPageVisible(tab, "queue")}>
-              <QueuePage
+          {tab === "memory" ? (
+            <MemoryPage
+              refreshKey={refreshKey}
+              health={health}
+              metrics={metrics}
+              automation={automation}
+              itemID={route.memoryItemID}
+              sessionID={currentSessionID}
+              lockScope={lockScope}
+              onChanged={refresh}
+            />
+          ) : null}
+          {tab === "activity" ? (
+            <ActivityPage
+              refreshKey={refreshKey}
+              automation={automation}
+              metrics={metrics}
+              eventID={route.activityEventID}
+              lockScope={lockScope}
+              onChanged={refresh}
+            />
+          ) : null}
+          {isPageMounted(retainedPages, tab, "settings") ? (
+            <div hidden={!settingsVisible}>
+              <SettingsPage
                 refreshKey={refreshKey}
                 onChanged={refresh}
-                targetItemID={queueTarget}
-                globalQueueCount={metrics?.queue}
-                visible={isPageVisible(tab, "queue")}
-                onDirtyChange={onQueueDirty}
+                onDirtyChange={onSettingsDirty}
+                metrics={metrics}
+                automation={automation}
               />
             </div>
           ) : null}
-          {isPageMounted(retainedPages, tab, "skills") ? (
-            <div hidden={!isPageVisible(tab, "skills")}>
-              <SkillsPage refreshKey={refreshKey} onChanged={refresh} onDirtyChange={onSkillsDirty} />
+          {reviewVisited ? (
+            <div hidden={route.advanced !== "review"}>
+              <AdvancedShell section="review">
+                <ReviewQueue
+                  refreshKey={refreshKey}
+                  onChanged={refresh}
+                  targetItemID={route.reviewItemID}
+                  globalQueueCount={metrics?.queue}
+                  visible={route.advanced === "review"}
+                  onDirtyChange={onQueueDirty}
+                />
+              </AdvancedShell>
             </div>
           ) : null}
-          {tab === "map" ? (
-            <MemoryGraph
-              refreshKey={refreshKey}
-              view={graphView}
-              onViewChange={setGraphView}
-            />
+          {skillsVisited ? (
+            <div hidden={route.advanced !== "skills"}>
+              <AdvancedShell section="skills">
+                <SkillsPage
+                  refreshKey={refreshKey}
+                  onChanged={refresh}
+                  onDirtyChange={onSkillsDirty}
+                />
+              </AdvancedShell>
+            </div>
           ) : null}
-          {tab === "audit" ? (
-            <AuditPage
+          {route.advanced && route.advanced !== "review" && route.advanced !== "skills" ? (
+            <AdvancedPage
+              section={route.advanced}
               refreshKey={refreshKey}
               onChanged={refresh}
-              targetFindingID={auditTarget?.id}
-              targetReportAt={auditTarget?.reportAt}
+              metrics={metrics}
+              auditFindingID={route.auditFindingID}
+              auditReportAt={route.auditReportAt}
+              graphView={route.graphView}
+              onDirtyChange={onSettingsDirty}
             />
-          ) : null}
-          {tab === "health" ? <HealthPage refreshKey={refreshKey} onChanged={refresh} /> : null}
-          {isPageMounted(retainedPages, tab, "settings") ? (
-            <div hidden={!isPageVisible(tab, "settings")}>
-              <SettingsPage refreshKey={refreshKey} onChanged={refresh} onDirtyChange={onSettingsDirty} />
-            </div>
           ) : null}
         </div>
       </main>

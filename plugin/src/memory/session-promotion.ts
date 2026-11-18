@@ -6,6 +6,7 @@ import { admitNewItem } from "../capacity.js";
 import { rebuildAutoFiles } from "../rebuild.js";
 import { reviewKind } from "../review/decision.js";
 import { canPromote } from "./promotion.js";
+import { newChangeID, recordChange } from "../changes.js";
 import type { RelationKind } from "../relations.js";
 import type { WriteConflict } from "./write-guard.js";
 
@@ -184,8 +185,18 @@ async function promoteSessionNoteUnlocked(
       },
     ],
     tags: [`review:${reviewID}`, `note:${index}`],
+    changeID: newChangeID(),
   };
   await store.appendItem(item);
+  await recordChange(store, {
+    kind: "promote",
+    actor: "user",
+    itemID: item.id,
+    item,
+    source: item.source,
+    origin: "user",
+    reason: `promote session note ${reviewID}#${index}`,
+  });
   await store.updateReviewNote(reviewID, index, { status: "promoted", promotedItemID: item.id });
   await rebuildAutoFiles(store);
   await store.incrementStat("promotionApplied");

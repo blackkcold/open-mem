@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { setupPlugin, type PluginContext } from "../src/plugin.js";
 import { Store } from "../src/store.js";
+import { DEFAULT_CONFIG, mergeConfig } from "../src/config.js";
 import { sha16 } from "../src/util/text.js";
 import type { SessionMessage } from "../src/types.js";
 
@@ -28,11 +29,20 @@ interface MockState {
   opened: string[];
 }
 
+const TEST_DIR = "/tmp/openmem-plugin-test";
+
 async function* eventStream(): AsyncGenerator<{ type: string; sessionID?: string; data?: unknown; [key: string]: unknown }> {
   // V2 delivers the payload under `data`; session.idle is ephemeral and not
   // delivered to ctx.event.subscribe, so turn completion arrives as
   // session.execution.succeeded.
-  yield { type: "session.created", data: { sessionID: "s1" } };
+  yield {
+    type: "session.created",
+    data: {
+      sessionID: "s1",
+      projectID: "project-test",
+      location: { directory: TEST_DIR },
+    },
+  };
   yield { type: "session.execution.succeeded", data: { sessionID: "s1" } };
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
@@ -47,7 +57,7 @@ function createMockContext(messages: SessionMessage[]): { ctx: PluginContext; st
     opened: [],
   };
   const ctx: PluginContext = {
-    location: { directory: "/tmp/openmem-plugin-test" },
+    location: { directory: TEST_DIR },
     event: {
       subscribe() {
         return eventStream();
@@ -57,6 +67,9 @@ function createMockContext(messages: SessionMessage[]): { ctx: PluginContext; st
       async context() {
         state.contextCalls += 1;
         return messages;
+      },
+      async get(input) {
+        return { id: input.sessionID, location: { directory: TEST_DIR } };
       },
       async prompt(input) {
         state.prompts.push(input.text);
@@ -120,6 +133,23 @@ async function waitFor<T>(fn: () => Promise<T | undefined>, timeout = 3_000): Pr
   throw new Error("waitFor timed out");
 }
 
+/**
+ * The legacy hook/queue lanes still exist behind the automation kill switch.
+ * These fixtures exercise that lane explicitly: `shadow` mode leaves it on,
+ * while `enabled:false` keeps the autonomous extract lane out of the way.
+ */
+async function seedLegacyAutomation(dir: string): Promise<Store> {
+  const store = new Store(dir);
+  await store.init();
+  await store.writeConfig(
+    mergeConfig(DEFAULT_CONFIG, {
+      shadow: true,
+      automation: { enabled: false, mode: "shadow", revision: 0 },
+    }),
+  );
+  return store;
+}
+
 /** Plugin writes can outlive dispose by a tick; retry the removal. */
 async function removeDir(dir: string): Promise<void> {
   for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -137,19 +167,36 @@ describe("plugin setup with mock OpenCode context", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-plugin-"));
     const disposers: Array<() => Promise<void>> = [];
     try {
+      const store = await seedLegacyAutomation(dir);
       const a = createMockContext([{ id: "m1", type: "user", text: "记住这个项目采用 pnpm 安装依赖" }]);
       const b = createMockContext([{ id: "m1", type: "user", text: "记住这个项目采用 pnpm 安装依赖" }]);
       a.ctx.location = { directory: "/workspace/A" };
       b.ctx.location = { directory: "/workspace/B" };
+      if (a.ctx.session) {
+        a.ctx.session.get = async ({ sessionID }) => ({
+          id: sessionID,
+          location: { directory: "/workspace/A" },
+        });
+      }
+      if (b.ctx.session) {
+        b.ctx.session.get = async ({ sessionID }) => ({
+          id: sessionID,
+          location: { directory: "/workspace/B" },
+        });
+      }
+      // Let startup maintenance settle before the first delivery; the event
+      // loop subscribes during setup, and an immediate stream end only replays
+      // already-seen ids after the backoff.
       const subscribe = async function* () {
+        await new Promise((resolve) => setTimeout(resolve, 250));
         yield { id: "created", type: "session.created", location: { directory: "/workspace/B" }, data: { sessionID: "owner-session" } };
+        await new Promise((resolve) => setTimeout(resolve, 50));
         yield { id: "finished", type: "session.execution.succeeded", location: { directory: "/workspace/B" }, data: { sessionID: "owner-session" } };
       };
       a.ctx.event = { subscribe };
       b.ctx.event = { subscribe };
       disposers.push(await setupPlugin(a.ctx, { dataDir: dir, console: false }));
       disposers.push(await setupPlugin(b.ctx, { dataDir: dir, console: false }));
-      const store = new Store(dir);
       const hooks = await waitFor(async () => {
         const hooks = await store.listHooks();
         return hooks.length ? hooks : undefined;
@@ -290,8 +337,14 @@ describe("plugin setup with mock OpenCode context", () => {
       expect(content).not.toContain("token=");
       expect(content).not.toContain("connect=");
       const body = JSON.parse(content) as {
+        auditAgeMs: number | null;
+        review: { runsLastHour: number; requestsLastHour: number; lastFailureKind?: string };
         console: { available: boolean; url: string; connect: string };
       };
+      expect(body.auditAgeMs).toBeNull();
+      expect(body.review.runsLastHour).toBe(0);
+      expect(body.review.requestsLastHour).toBe(0);
+      expect(content).not.toContain(dir);
       expect(body.console.available).toBe(true);
       expect(body.console.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
       expect(body.console.connect).not.toContain("console_url");
@@ -320,7 +373,9 @@ describe("plugin setup with mock OpenCode context", () => {
         { id: "m1", type: "user", text: "回复必须使用 Markdown 格式" },
       ];
       const { ctx, state } = createMockContext(messages);
-      const store = new Store(dir);
+      // Rule/queue/suggestion assertions are the legacy consolidation lane,
+      // not the autonomous extract lane.
+      const store = await seedLegacyAutomation(dir);
       const cleanup = await setupPlugin(ctx, {
         dataDir: dir,
         console: false,

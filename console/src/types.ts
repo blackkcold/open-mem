@@ -86,6 +86,13 @@ export interface ReviewRecord {
   chars?: number;
   candidates: number;
   queued?: number;
+  /** Ordinary review-origin items written by the P01 writer. */
+  learned?: number;
+  updated?: number;
+  shadowed?: number;
+  learningSkipped?: number;
+  protectedCandidates?: number;
+  learningDeferred?: string;
   dropped: number;
   durationMs?: number;
   model?: string;
@@ -488,11 +495,19 @@ export interface Config {
   };
 }
 
+/** Server-owned project identity for this console instance. */
+export interface ProjectContext {
+  key: string;
+  label: string;
+}
+
 export interface Health {
   ok: boolean;
   version: string;
   dataDir: string;
   shadow: boolean;
+  /** Absent when the console was started without a project context. */
+  project?: ProjectContext | null;
   decision: {
     kind: string;
     model: string;
@@ -591,4 +606,303 @@ export interface MergeJournal {
   /** A started undo can safely resume after a crash between file writes. */
   undoing?: boolean;
   undone?: boolean;
+}
+
+/** One item as returned by GET /api/memory/items (P01 envelope). */
+export interface MemoryItem {
+  id: string;
+  title: string;
+  text: string;
+  kind: "fact" | "preference" | "rule" | "reference" | "skill";
+  scope: "session" | "project" | "global";
+  project?: string;
+  projectKey?: string;
+  expiresAt?: string;
+  manual?: boolean;
+  status: "auto" | "queue" | "shadow" | "promoted" | "false_positive" | "archived";
+  source: SourceRef;
+  sources?: SourceRef[];
+  createdAt: string;
+  updatedAt: string;
+  origin?: "turn" | "session-review";
+  reviewType?: ReviewType;
+  evidence?: ReviewEvidence[];
+  reviewID?: string;
+  changeID?: string;
+  invalidatedBy?: string;
+  invalidatedAt?: string;
+  supersededBy?: string;
+  derivedFrom?: string[];
+  /** Server-computed content version; the only value accepted by write APIs. */
+  version: string;
+  /** Server-computed capability flags; the UI never derives these locally. */
+  stoppable: boolean;
+  restorable: boolean;
+  expired: boolean;
+  revertible: boolean;
+  /** Most recent change event for this item, when one is recorded. */
+  latestChange?: ChangeEvent;
+}
+
+export type ChangeKind =
+  | "add"
+  | "update"
+  | "merge"
+  | "replace"
+  | "archive"
+  | "revert"
+  | "restore"
+  | "deactivate"
+  | "expire"
+  | "invalidate"
+  | "promote"
+  | "migration";
+
+export type ChangeActor = "auto" | "user" | "curator" | "migration" | "system";
+
+/** Full item snapshot recorded inside a change event (no derived fields). */
+export type ItemSnapshot = Omit<
+  MemoryItem,
+  "version" | "stoppable" | "restorable" | "expired" | "revertible" | "latestChange"
+>;
+
+/** A read-only ledger event from GET /api/changes. */
+export interface ChangeEvent {
+  id: string;
+  at: string;
+  kind: ChangeKind;
+  actor: ChangeActor;
+  itemID: string;
+  /** Post-change content version; absent when the item is gone. */
+  itemVersion?: string;
+  before?: ItemSnapshot;
+  after?: ItemSnapshot;
+  source: SourceRef;
+  origin?: "turn" | "session-review" | "curator" | "migration" | "user";
+  dependsOn?: string[];
+  derivedFrom?: string[];
+  linkGroupID?: string;
+  reason: string;
+  reverts?: string;
+  revertible: boolean;
+}
+
+/** Result of POST /api/items/:id/{deactivate,reactivate,revert,restore}. */
+export type RevertOutcome =
+  | { ok: true; event: ChangeEvent; invalidated: string[] }
+  | {
+      ok: false;
+      code: "not_found" | "version_mismatch" | "not_revertible" | "conflict";
+      message: string;
+      /** Current content version reported by a 409 response. */
+      version?: string;
+    };
+
+/** One bounded recall hit from GET /api/recall. */
+export interface RecallHit {
+  id: string;
+  version: string;
+  title: string;
+  text: string;
+  scope: "session" | "project" | "global";
+  kind: MemoryItem["kind"];
+  /** Ordering feature sum, not a probability. */
+  score: number;
+  reasons: string[];
+  numericConflict?: boolean;
+  negationMismatch?: boolean;
+}
+
+export interface RecallResult {
+  hits: RecallHit[];
+  tokens: number;
+  estimate: boolean;
+  degraded?: { reason: "empty_query" | "store_error" | "budget" | "unlocated" };
+}
+
+export type AutomationMode = "off" | "shadow" | "autonomous";
+
+export interface AutomationStatus {
+  mode: AutomationMode | "legacy";
+  configuredMode: AutomationMode | "legacy";
+  effectiveMode: AutomationMode | "legacy";
+  configRevision: string;
+  revision: number;
+  counts: {
+    pending: number;
+    running: number;
+    delayed: number;
+    expired: number;
+    expiredPending: number;
+    quarantined: number;
+  };
+  pending: {
+    usedRows: number;
+    maxRows: number;
+    usedBytes: number;
+    maxBytes: number;
+    ttlMs: number;
+    oldestAgeMs: number;
+    expiredRows: number;
+    pendingFull: number;
+    capacityBlocked: boolean;
+    capacityBlockedUntil: string | null;
+    nextRetryAt: string | null;
+    reasons: Record<string, number>;
+  };
+  ownership: {
+    basis: string;
+    currentValidation: string;
+    cachedOwnerKnown: number;
+    ownerUnknown: number;
+    child: number;
+    parentUnknown: number;
+  };
+  provider: {
+    transport: string;
+    providerID: string;
+    runtimeProviderID: string;
+    runtimeKnown: boolean;
+    modelConfigured: boolean;
+    review: unknown;
+    extract: unknown;
+  };
+  availability: {
+    extract: "configured" | "degraded" | "disabled" | "unknown";
+    reviewProvider: string;
+    extractProvider: string;
+    externalReachability: string;
+  };
+  budget: {
+    hourly: { used: number; limit: number; retryAt: string | null };
+    daily: { used: number; limit: number; retryAt: string | null };
+    purpose: { review: number; extract: number };
+    extractFloor: {
+      eligible: boolean;
+      daily: number;
+      hourly: number;
+      usedDaily: number;
+      remainingDaily: number;
+      usedHourly: number;
+      remainingHourly: number;
+    };
+  };
+  lifecycle: Record<string, unknown>;
+  capacity: {
+    level: "ok" | "warn" | "compact" | "freeze" | "block";
+    ratio: number;
+    reason: string;
+    historyAtCapacity: boolean;
+    counts: {
+      items: number;
+      autoMemory: number;
+      autoRules: number;
+      queue: number;
+      shadow: number;
+      drafts: number;
+      diskBytes: number;
+      changes: number;
+      changeJournals: number;
+      suppressions: number;
+      quarantine: number;
+      retiredSources: number;
+      globalCandidates: number;
+      migrationJournals: number;
+      checkpointBackups: number;
+    };
+  };
+  retention: RetentionHistorySnapshot | null;
+  blockedReasons: string[];
+  degraded: Array<{
+    scope: string;
+    state: "disabled" | "blocked" | "degraded" | "unknown";
+    reason: string;
+    count?: number;
+    retryAt?: string | null;
+  }>;
+  lastExtractAt: string | null;
+  lastSuccess: { at: string; kind: string; action?: string } | null;
+  lastMaintenanceAt: string | null;
+  /** Server time this snapshot was produced; UI freshness uses this, not activity. */
+  generatedAt?: string;
+}
+
+export interface RetentionHistorySnapshot {
+  at: string;
+  deleted: { changes: number; journals: number; suppressions: number; quarantine: number };
+  reclaimedBytes: number;
+  remainingReclaimableBytes: number;
+  protected: { changes: number; journals: number; suppressions: number };
+  blocked: boolean;
+  blockedReasons: string[];
+  notes: string[];
+  nextAttemptAt?: string;
+}
+
+/** Read-only retention preview; contains ids/paths/counts, never content. */
+export interface RetentionPreview {
+  id: string;
+  policy: { days: number; minRecords: number; sessionDays: number };
+  retainDays: number;
+  deleteFiles: string[];
+  archiveSessions: string[];
+  pruneItems: number;
+  pruneMerges: number;
+  pruneHistory: number;
+  reclaimableBytes: number;
+  reclaimable: {
+    filesBytes: number;
+    changesBytes: number;
+    changeJournalBytes: number;
+    suppressionBytes: number;
+    quarantineBytes: number;
+  };
+  protectedCount: number;
+  protectedChanges: number;
+  protectedJournals: number;
+  protectedSuppressions: number;
+  pruneChanges: number;
+  pruneChangeJournals: number;
+  pruneSuppressions: number;
+  pruneQuarantine: number;
+  deletedChanges: string[];
+  deletedChangeJournals: string[];
+  deletedSuppressions: string[];
+  deletedQuarantine: string[];
+  counts: {
+    changes: number;
+    changeJournals: number;
+    suppressions: number;
+    quarantine: number;
+    retiredSources: number;
+    globalCandidates: number;
+    migrationJournals: number;
+    checkpointBackups: number;
+  };
+  historyBytes: number;
+  blocked: boolean;
+  blockedReasons: string[];
+  notes: string[];
+}
+
+/** Read-only changelog entry as returned by GET /api/changelog. */
+export interface ChangelogEntry {
+  at: string;
+  action: string;
+  queueID?: string;
+  itemID?: string;
+  target?: string;
+  journalID?: string;
+  reviewID?: string;
+  curatorID?: string;
+  recoveryID?: string;
+  source?: string;
+  decision?: string;
+  fields?: string[];
+  humanEdited?: boolean;
+  reason?: string;
+  count?: number;
+  reasons?: string[];
+  sessionID?: string;
+  messageID?: string;
 }
