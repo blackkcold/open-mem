@@ -10,14 +10,23 @@ import { compact, lintText } from "./linter.js";
 import { admitNewItem } from "./capacity.js";
 import { rebuildAutoFiles } from "./rebuild.js";
 import { itemContentVersion } from "./fingerprint.js";
+import { newChangeID, recordChange, recordItemDiff } from "./changes.js";
 import { isSuggestionReady } from "./suggestion.js";
 import { validateRewrite } from "./rewrite/validate.js";
+import { findWriteConflicts } from "./memory/write-guard.js";
+import type { RelationKind } from "./relations.js";
 import type { RewriteInput, RewriteOutput } from "./rewrite/types.js";
 
 export interface ApplyEdits {
   title?: string;
   text?: string;
   note?: string;
+}
+
+export interface RelationWarning {
+  id: string;
+  relation: RelationKind;
+  version: string;
 }
 
 export interface ApplyResult {
@@ -27,6 +36,8 @@ export interface ApplyResult {
   journalID?: string;
   target?: Item;
   item?: Item;
+  /** Non-blocking relation evidence for create/keep_both; never copied bodies. */
+  relationWarnings?: RelationWarning[];
 }
 
 const UNDO_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -174,6 +185,30 @@ async function applySuggestionUnlocked(
   if ((action === "create" || action === "keep_both") && target?.id === item.id) {
     return { ok: false, error: "合并目标不能是候选自身" };
   }
+  let relationWarnings: RelationWarning[] | undefined;
+  if (action === "create" || action === "keep_both") {
+    const guard = findWriteConflicts(
+      {
+        id: item.id,
+        title,
+        text,
+        kind: item.kind,
+        scope: item.scope,
+        projectKey: item.projectKey,
+      },
+      [...(await store.listItems()), ...(await store.listQueue())],
+      { excludeID: item.id },
+    );
+    const relevant = guard.conflicts.filter((entry) =>
+      ["exact", "covered", "classification-mismatch", "conflict"].includes(
+        entry.relation,
+      ),
+    );
+    relationWarnings =
+      relevant.length > 0
+        ? relevant.map(({ id, relation, version }) => ({ id, relation, version }))
+        : undefined;
+  }
   if (action === "create" || action === "keep_both") {
     const admission = await admitNewItem(store, config, item.kind);
     if (!admission.ok) return { ok: false, error: admission.reason ?? "容量不足" };
@@ -198,7 +233,7 @@ async function applySuggestionUnlocked(
   if (action === "merge_into" || action === "replace") {
     if (!target) return { ok: false, error: "合并目标已不存在" };
     if (action === "replace") {
-      await store.appendItem({
+      const archivedCopy: Item = {
         ...target,
         id: newId("item"),
         status: "archived",
@@ -206,6 +241,17 @@ async function applySuggestionUnlocked(
         tags: [...(target.tags ?? []), `merge:${journal.id}`],
         createdAt: now,
         updatedAt: now,
+        changeID: newChangeID(),
+      };
+      await store.appendItem(archivedCopy);
+      await recordChange(store, {
+        kind: "replace",
+        actor: "user",
+        itemID: archivedCopy.id,
+        item: archivedCopy,
+        source: item.source,
+        origin: "user",
+        reason: `replace ${target.id}`,
       });
     }
     updatedTarget = await store.updateItem(target.id, {
@@ -217,8 +263,19 @@ async function applySuggestionUnlocked(
       lastSeenAt: now,
       sources: [...(target.sources ?? [target.source]), item.source].slice(-20),
       aliases: [...(target.aliases ?? []), item.text].slice(-10),
+      changeID: newChangeID(),
     }, target);
     if (!updatedTarget) return { ok: false, error: "更新目标失败" };
+    await recordChange(store, {
+      kind: action === "replace" ? "update" : "merge",
+      actor: "user",
+      itemID: target.id,
+      item: updatedTarget,
+      before: target,
+      source: item.source,
+      origin: "user",
+      reason: `${action} ${item.id}`,
+    });
   } else if (action === "reject_duplicate") {
     created = {
       id: newId("item"),
@@ -239,8 +296,18 @@ async function applySuggestionUnlocked(
       seenCount: 1,
       lastSeenAt: now,
       tags: [...(item.tags ?? []), item.id, `merge:${journal.id}`],
+      changeID: newChangeID(),
     };
     await store.appendItem(created);
+    await recordChange(store, {
+      kind: "add",
+      actor: "user",
+      itemID: created.id,
+      item: created,
+      source: item.source,
+      origin: "user",
+      reason: "reject_duplicate",
+    });
     if (target) updatedTarget = await store.touchItem(target.id, item.source);
   } else {
     created = {
@@ -263,8 +330,25 @@ async function applySuggestionUnlocked(
       seenCount: 1,
       lastSeenAt: now,
       tags: [...(item.tags ?? []), item.id, `merge:${journal.id}`],
+      // Keep the captured text as an alias when a suggestion rewrote the body,
+      // otherwise same-source suppression would hash the new text only and the
+      // original hook could be learned again.
+      aliases: [
+        ...(item.aliases ?? []),
+        ...(text !== item.text ? [item.text] : []),
+      ].slice(-10),
+      changeID: newChangeID(),
     };
     await store.appendItem(created);
+    await recordChange(store, {
+      kind: "add",
+      actor: "user",
+      itemID: created.id,
+      item: created,
+      source: item.source,
+      origin: "user",
+      reason: action,
+    });
   }
 
   await store.removeQueue(item.id);
@@ -281,6 +365,7 @@ async function applySuggestionUnlocked(
     journalID: journal.id,
     note: edits?.note,
     humanEdited: humanEdited || undefined,
+    relationWarnings,
   });
   await rebuildAutoFiles(store);
   return {
@@ -289,6 +374,7 @@ async function applySuggestionUnlocked(
     journalID: journal.id,
     target: updatedTarget,
     item: created,
+    relationWarnings,
   };
 }
 
@@ -303,9 +389,21 @@ async function undoMergeUnlocked(
   store: Store,
   journalID: string,
 ): Promise<ApplyResult> {
+  const beforeItems = await store.listItems();
   let entry: MergeJournal;
   try { entry = await store.undoMergeEntry(journalID, UNDO_WINDOW_MS); }
   catch (error) { return { ok: false, error: error instanceof Error ? error.message : "撤销失败" }; }
+  const afterItems = await store.listItems();
+  const reverts = new Map<string, string>();
+  if (entry.after.target?.changeID) reverts.set(entry.after.target.id, entry.after.target.changeID);
+  if (entry.after.item?.changeID) reverts.set(entry.after.item.id, entry.after.item.changeID);
+  await recordItemDiff(store, beforeItems, afterItems, {
+    kind: "revert",
+    actor: "user",
+    reason: `undo merge ${entry.id}`,
+    origin: "user",
+    reverts,
+  });
   await store.incrementStat("mergeUndone");
   await store.appendChangelog({ action: "undo_merge", journalID: entry.id, queueID: entry.queueID });
   await rebuildAutoFiles(store);

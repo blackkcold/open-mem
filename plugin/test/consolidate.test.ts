@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Store } from "../src/store.js";
@@ -94,7 +94,9 @@ describe("runConsolidation", () => {
       const gate = new Promise<void>((resolve) => { release = resolve; });
       const decision = { async classify() { if (++arrived === 2) release(); await gate; return preferenceJev; } };
       const config = mergeConfig({ shadow: false, autoMemory: lane === "auto", caps: { autoMemory: 1, queue: 1 } });
-      await Promise.all(stores.map((store, index) => runConsolidation(`s${index}`, { store, config, decision,
+      // Legacy manual lane: persisted mode stays absent, matching the fixture.
+      await stores[0].writeConfig(config);
+      await Promise.all(stores.map((store, index) => runConsolidation(`s${index}`, { store, config, allowLegacyManual: true, decision,
         readMessages: async () => [{ id: `m${index}`, type: "user", text: index === 0 ? "我喜欢回复先给结论" : "以后测试失败先检查环境变量" }] })));
       expect((await stores[0].listItems()).filter((item) => item.status === "auto").length).toBeLessThanOrEqual(1);
       expect(await stores[0].listQueue()).toHaveLength(1);
@@ -105,7 +107,9 @@ describe("runConsolidation", () => {
     try {
       const store = new Store(dir);
       await store.init();
-      const deps = { store, config: mergeConfig({ turn: { maxCandidates: 1 } }), decision: provider(preferenceJev),
+      const config = mergeConfig({ turn: { maxCandidates: 1 } });
+      await store.writeConfig(config);
+      const deps = { store, config, allowLegacyManual: true, decision: provider(preferenceJev),
         readMessages: async () => [{ id: "many", type: "user", text: "我喜欢回复使用简体中文。记住构建失败时检查磁盘空间。" }] };
       const first = await runConsolidation("overflow", deps);
       expect(first.captured).toBe(2);
@@ -122,7 +126,9 @@ describe("runConsolidation", () => {
       const at = new Date().toISOString();
       await store.upsertQueue({ id: "full", title: "占位", text: "不同内容", kind: "fact", scope: "global", status: "queue", source: {}, createdAt: at, updatedAt: at, reason: "test" });
       let calls = 0;
-      const deps = { store, config: mergeConfig({ shadow: false, caps: { queue: 1 } }), decision: { async classify() { calls++; return queuePreferenceJev; } }, readMessages: async () => messages };
+      const config = mergeConfig({ shadow: false, caps: { queue: 1 } });
+      await store.writeConfig(config);
+      const deps = { store, config, allowLegacyManual: true, decision: { async classify() { calls++; return queuePreferenceJev; } }, readMessages: async () => messages };
       await runConsolidation("s1", deps);
       await store.removeQueue("full");
       const next = await runConsolidation("s1", deps);
@@ -146,9 +152,12 @@ describe("runConsolidation", () => {
         status: "pending", attempts: 0,
       });
       let calls = 0;
+      const config = mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 1 }, turn: { maxCandidates: 2 } });
+      await store.writeConfig(config);
       const result = await runConsolidation("s-starve", {
         store,
-        config: mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 1 }, turn: { maxCandidates: 2 } }),
+        config,
+        allowLegacyManual: true,
         decision: { async classify() { calls++; return queuePreferenceJev; } },
         readMessages: async () => [],
       });
@@ -174,9 +183,12 @@ describe("runConsolidation", () => {
         status: "pending", attempts: 0,
       });
       let calls = 0;
+      const config = mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 2 }, turn: { maxCandidates: 2 } });
+      await store.writeConfig(config);
       const result = await runConsolidation("s-starve", {
         store,
-        config: mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 2 }, turn: { maxCandidates: 2 } }),
+        config,
+        allowLegacyManual: true,
         decision: { async classify() { calls++; return queuePreferenceJev; } },
         readMessages: async () => [],
       });
@@ -199,9 +211,12 @@ describe("runConsolidation", () => {
       await store.appendHook(pendingCandidateHook("fresh-1", "以后测试失败先检查磁盘空间", "2026-01-01T00:00:10.000Z"));
       await store.appendHook(pendingCandidateHook("fresh-2", "以后提交前先运行一遍 tsc", "2026-01-01T00:00:11.000Z"));
       let calls = 0;
+      const config = mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 5 }, turn: { maxCandidates: 2 } });
+      await store.writeConfig(config);
       const result = await runConsolidation("s-starve", {
         store,
-        config: mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 5 }, turn: { maxCandidates: 2 } }),
+        config,
+        allowLegacyManual: true,
         decision: { async classify() { calls++; return queuePreferenceJev; } },
         readMessages: async () => [],
       });
@@ -223,9 +238,12 @@ describe("runConsolidation", () => {
       await store.appendHook(capacityBlockedHook("old-1", "旧候选一：使用 pnpm 安装依赖", "2026-01-01T00:00:00.000Z"));
       await store.appendHook(pendingCandidateHook("fresh-1", "以后提交前先运行一遍 tsc", "2026-01-01T00:00:10.000Z"));
       let calls = 0;
+      const config = mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 5 }, turn: { maxCandidates: 1 } });
+      await store.writeConfig(config);
       const result = await runConsolidation("s-starve", {
         store,
-        config: mergeConfig({ shadow: false, autoMemory: false, caps: { queue: 5 }, turn: { maxCandidates: 1 } }),
+        config,
+        allowLegacyManual: true,
         decision: { async classify() { calls++; return queuePreferenceJev; } },
         readMessages: async () => [],
       });
@@ -243,7 +261,7 @@ describe("runConsolidation", () => {
       const store = new Store(dir);
       await store.init();
       let called = false;
-      await runConsolidation("secret", { store, config: DEFAULT_CONFIG,
+      await runConsolidation("secret", { store, config: DEFAULT_CONFIG, allowLegacyManual: true,
         decision: { async classify() { called = true; return preferenceJev; } },
         readMessages: async () => [{ id: "secret-msg", type: "user", text: "记住我的 api_key=sk-synthetic1234567890" }],
       });
@@ -256,6 +274,156 @@ describe("runConsolidation", () => {
     expect(canAutoApply({ config: mergeConfig(DEFAULT_CONFIG, { autoRules: true }), kind: "rule", lintOk: true,
       jev: { ...preferenceJev, kind: "rule", strictness: "format", safeAuto: 1 }, scope: "global", autoCounts: { memory: 0, rules: 0 },
     })).toBe(false);
+  });
+  it("queues a conflicting candidate instead of auto-writing it", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const at = new Date().toISOString();
+      await store.appendItem({
+        id: "port-5199",
+        title: "[F] 端口",
+        text: "本地 dev server 端口是 5199",
+        kind: "fact",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: at,
+        updatedAt: at,
+      });
+      const result = await runConsolidation("port-guard", {
+        store,
+        allowLegacyManual: true,
+        decision: provider({ ...preferenceJev, kind: "fact" }),
+        config: mergeConfig(DEFAULT_CONFIG, { shadow: false }),
+        readMessages: async () => [{ id: "m-port", type: "user", text: "以后本地 dev server 端口是 5198" }],
+      });
+      expect(result.auto).toBe(0);
+      expect(result.queued).toBe(1);
+      const queue = await store.listQueue();
+      expect(queue[0]?.reason).toMatch(/conflict|relation/);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("queues a partial duplicate when the model still reports a high duplicate score", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const at = new Date().toISOString();
+      await store.appendItem({
+        id: "conclusion",
+        title: "[P] 先给结论",
+        text: "回复先给结论",
+        kind: "preference",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: at,
+        updatedAt: at,
+      });
+      const result = await runConsolidation("partial-guard", {
+        store,
+        allowLegacyManual: true,
+        decision: provider({ ...preferenceJev, duplicate: 0.5 }),
+        config: mergeConfig(DEFAULT_CONFIG, {
+          shadow: false,
+          thresholds: { ...DEFAULT_CONFIG.thresholds, duplicateMax: 0.8 },
+        }),
+        readMessages: async () => [{ id: "m-partial", type: "user", text: "以后回复先给结论，3 个要点" }],
+      });
+      expect(result.auto).toBe(0);
+      expect(result.queued).toBe(1);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("re-checks the guard inside the transaction and does not duplicate a concurrent write", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const config = mergeConfig(DEFAULT_CONFIG, { shadow: false });
+      let injected = false;
+      const originalTransaction = store.transaction.bind(store);
+      store.transaction = async <T>(fn: () => Promise<T>): Promise<T> => {
+        if (!injected) {
+          injected = true;
+          const at = new Date().toISOString();
+          await store.appendItem({
+            id: "raced",
+            title: "[P] 以后回复先给结论",
+            text: "以后回复先给结论",
+            kind: "preference",
+            scope: "global",
+            status: "auto",
+            source: {},
+            createdAt: at,
+            updatedAt: at,
+          });
+        }
+        return originalTransaction(fn);
+      };
+      const result = await runConsolidation("race-session", {
+        store,
+        allowLegacyManual: true,
+        decision: provider(preferenceJev),
+        config,
+        readMessages: async () => [{ id: "m1", type: "user", text: "以后回复先给结论" }],
+      });
+      expect(result.auto).toBe(0);
+      expect(result.skipped).toBe(1);
+      expect((await store.listItems()).filter((item) => item.status === "auto")).toHaveLength(1);
+      expect((await store.listHooks())[0]?.status).toBe("ignored");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("does not drop a review candidate whose kind differs from an identical stored text", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const at = new Date().toISOString();
+      await store.appendItem({
+        id: "pref-1",
+        title: "[P] 回复先给结论",
+        text: "回复先给结论",
+        kind: "preference",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: at,
+        updatedAt: at,
+      });
+      await store.appendHook({
+        id: "review-rule",
+        key: "review-rule",
+        sessionID: "s1",
+        turnID: "t1",
+        messageID: "m1",
+        text: "回复先给结论",
+        title: "[R] 回复先给结论",
+        trigger: "review",
+        scope: "global",
+        source: {},
+        createdAt: at,
+        updatedAt: at,
+        status: "pending",
+        attempts: 0,
+        origin: "session-review",
+        reviewType: "rule",
+      });
+      const result = await runConsolidation("s1", {
+        store,
+        allowLegacyManual: true,
+        decision: provider(preferenceJev),
+        config: mergeConfig(DEFAULT_CONFIG, { shadow: false }),
+        readMessages: async () => [],
+      });
+      expect(result.skipped).toBe(0);
+      expect(result.queued).toBe(1);
+      expect((await store.listQueue())[0]?.kind).toBe("rule");
+    } finally { await rm(dir, { recursive: true, force: true }); }
   });
   it("does not drop a candidate that changes only a port", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-"));
@@ -276,6 +444,7 @@ describe("runConsolidation", () => {
       });
       const result = await runConsolidation("port-change", {
         store,
+        allowLegacyManual: true,
         decision: provider(riskyRuleJev),
         config: mergeConfig(DEFAULT_CONFIG, { shadow: false }),
         readMessages: async () => [{ id: "m-port", type: "user", text: "以后本地 dev server 端口是 5198" }],
@@ -299,7 +468,7 @@ describe("runConsolidation", () => {
       await store.appendItem({ id: "foreign", title: text, text, kind: "preference", scope: "project", projectKey: "A", status: "auto", source: {}, createdAt: at, updatedAt: at });
       await store.appendHook({ id: "hook-b", key: "hook-b", sessionID: "s-b", turnID: "t-b", messageID: "m-b", text, title: text, trigger: "test", scope: "project", projectKey: "B", source: {}, createdAt: at, updatedAt: at, status: "pending", attempts: 0 });
       const result = await runConsolidation("s-b", {
-        store, decision: provider(queuePreferenceJev), config: mergeConfig(DEFAULT_CONFIG, { shadow: false }),
+        store, allowLegacyManual: true, decision: provider(queuePreferenceJev), config: mergeConfig(DEFAULT_CONFIG, { shadow: false }),
         readMessages: async () => [],
       });
       expect(result.queued).toBe(1);
@@ -316,6 +485,7 @@ describe("runConsolidation", () => {
       const config = mergeConfig(DEFAULT_CONFIG, { shadow: false });
       const result = await runConsolidation("s1", {
         store,
+        allowLegacyManual: true,
         decision: provider(preferenceJev),
         config,
         readMessages: async () => messages,
@@ -337,6 +507,7 @@ describe("runConsolidation", () => {
       const config = mergeConfig(DEFAULT_CONFIG, { shadow: false });
       const result = await runConsolidation("s1", {
         store,
+        allowLegacyManual: true,
         decision: provider(riskyRuleJev),
         config,
         readMessages: async () => [
@@ -359,6 +530,7 @@ describe("runConsolidation", () => {
       const config = mergeConfig(DEFAULT_CONFIG, { shadow: true });
       const result = await runConsolidation("s1", {
         store,
+        allowLegacyManual: true,
         decision: provider(preferenceJev),
         config,
         readMessages: async () => messages,
@@ -380,6 +552,7 @@ describe("runConsolidation", () => {
       const config = mergeConfig(DEFAULT_CONFIG, { shadow: false });
       const deps = {
         store,
+        allowLegacyManual: true,
         decision: provider(preferenceJev),
         config,
         readMessages: async () => messages,
@@ -434,9 +607,11 @@ describe("runConsolidation", () => {
       ];
       const result = await runConsolidation("s1", {
         store,
+        allowLegacyManual: true,
         decision: parallelProvider,
         config,
         project: "/repo/a",
+        projectKey: "proj-a",
         readMessages: async () => turnMessages,
       });
       expect(result.auto).toBe(2);
@@ -457,6 +632,7 @@ describe("runConsolidation", () => {
       const config = mergeConfig(DEFAULT_CONFIG, { shadow: false });
       const result = await runConsolidation("s1", {
         store,
+        allowLegacyManual: true,
         decision: provider(preferenceJev),
         config,
         readMessages: async () => [
@@ -484,6 +660,7 @@ describe("runConsolidation", () => {
       const config = mergeConfig(DEFAULT_CONFIG, { shadow: false });
       const result = await runConsolidation("s1", {
         store,
+        allowLegacyManual: true,
         decision: provider(queuePreferenceJev),
         config,
         readMessages: async () => [
@@ -529,6 +706,7 @@ describe("runConsolidation", () => {
       const config = mergeConfig(DEFAULT_CONFIG, { shadow: false });
       const result = await runConsolidation("s1", {
         store,
+        allowLegacyManual: true,
         decision: provider(queuePreferenceJev),
         config,
         readMessages: async () => [],
@@ -575,6 +753,7 @@ describe("runConsolidation", () => {
           mergeAction: "reject_duplicate",
           mergeTargetId: "item_existing",
         }),
+        allowLegacyManual: true,
         config,
         readMessages: async () => [
           { id: "m1", type: "user", text: "以后给出精确文件路径和行号/脚本片段依据" },
@@ -605,6 +784,7 @@ describe("runConsolidation", () => {
           risk: 0.35,
           strictness: "workflow",
         }),
+        allowLegacyManual: true,
         config,
         readMessages: async () => [
           { id: "m1", type: "user", text: "不要用 nohup 启动 dev server" },
@@ -630,6 +810,7 @@ describe("runConsolidation", () => {
       const result = await runConsolidation("s1", {
         store,
         decision: provider(riskyRuleJev),
+        allowLegacyManual: true,
         config,
         readMessages: async () => [
           { id: "m1", type: "user", text: "禁止用 nohup 启动 dev server" },
@@ -639,6 +820,110 @@ describe("runConsolidation", () => {
       expect(result.queued).toBe(1);
       expect(await store.listShadow()).toHaveLength(1);
       expect(await store.listQueue()).toHaveLength(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes a legacy manual consolidation when the persisted config has no automation revision", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-legacy-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      // v0.5.0-shaped file: no automation object, so revision and mode are absent.
+      await writeFile(
+        path.join(dir, "config.json"),
+        JSON.stringify({ version: 1, shadow: false }),
+      );
+      const result = await runConsolidation("legacy", {
+        store,
+        decision: provider(preferenceJev),
+        config: mergeConfig(await store.readConfig()),
+        allowLegacyManual: true,
+        readMessages: async () => [
+          { id: "m1", type: "user", text: "我喜欢回复先给结论" },
+        ],
+      });
+      expect(result.auto).toBe(1);
+      expect(await store.listItems()).toHaveLength(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("holds a legacy auto-write once the daily write budget is spent", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-budget-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const config = mergeConfig({
+        shadow: false,
+        automation: { enabled: false, dailyWrites: 1, maxWritesPerSession: 5 },
+      });
+      await store.writeConfig(config);
+      const deps = {
+        store,
+        config,
+        allowLegacyManual: true,
+        decision: provider(preferenceJev),
+      };
+      const first = await runConsolidation("budget", {
+        ...deps,
+        readMessages: async () => [
+          { id: "m1", type: "user", text: "我喜欢回复先给结论" },
+        ],
+      });
+      expect(first.auto).toBe(1);
+      const second = await runConsolidation("budget", {
+        ...deps,
+        readMessages: async () => [
+          { id: "m1", type: "user", text: "我喜欢回复先给结论" },
+          { id: "m2", type: "user", text: "以后每次测试失败先检查环境变量" },
+        ],
+      });
+      expect(second.auto).toBe(0);
+      expect(await store.listItems()).toHaveLength(1);
+      const blocked = (await store.listHooks()).filter(
+        (hook) => hook.error === "capacity: write-budget",
+      );
+      expect(blocked).toHaveLength(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("aborts a legacy manual consolidation when the persisted revision changes", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-consolidate-legacy-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await writeFile(
+        path.join(dir, "config.json"),
+        JSON.stringify({ version: 1, shadow: false, automation: { enabled: false } }),
+      );
+      const result = await runConsolidation("legacy", {
+        store,
+        decision: {
+          async classify() {
+            await writeFile(
+              path.join(dir, "config.json"),
+              JSON.stringify({
+                version: 1,
+                shadow: false,
+                automation: { enabled: false, revision: 1 },
+              }),
+            );
+            return preferenceJev;
+          },
+        },
+        config: mergeConfig(await store.readConfig()),
+        allowLegacyManual: true,
+        readMessages: async () => [
+          { id: "m1", type: "user", text: "我喜欢回复先给结论" },
+        ],
+      });
+      expect(result.auto).toBe(0);
+      expect(await store.listItems()).toHaveLength(0);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -6,7 +6,7 @@ import { Store } from "../src/store.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { applyQueueDecision } from "../src/actions.js";
 import { queueItemSnapshotVersion } from "../src/fingerprint.js";
-import type { DecisionResult, QueueItem, Suggestion } from "../src/types.js";
+import type { DecisionResult, Item, QueueItem, Suggestion } from "../src/types.js";
 
 const now = new Date().toISOString();
 
@@ -163,6 +163,231 @@ describe("queue actions", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("refuses to approve an exact duplicate without an acknowledgement", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.appendItem({
+        id: "existing",
+        title: "[P] 先给结论",
+        text: "回复先给结论",
+        kind: "preference",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: now,
+        updatedAt: now,
+      });
+      await store.upsertQueue(queue("dup", "[P] 先给结论", "回复先给结论"));
+      const result = await applyQueueDecision(store, DEFAULT_CONFIG, "dup", { action: "approve" });
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("重复");
+      expect(await store.listQueue()).toHaveLength(1);
+      expect((await store.listItems()).filter((entry) => entry.status === "auto")).toHaveLength(1);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("requires an acknowledgement for a conflict and binds it to the version", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.appendItem({
+        id: "port-5199",
+        title: "[F] 端口",
+        text: "本地 dev server 端口是 5199",
+        kind: "fact",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: now,
+        updatedAt: now,
+      });
+      await store.upsertQueue({ ...queue("port-5198", "[F] 端口", "本地 dev server 端口是 5198"), kind: "fact" });
+
+      const first = await applyQueueDecision(store, DEFAULT_CONFIG, "port-5198", { action: "approve" });
+      expect(first.ok).toBe(false);
+      expect(first.conflict).toBe(true);
+      expect(first.code).toBe("RELATION_ACK_REQUIRED");
+      expect(first.conflicts?.[0]).toMatchObject({ id: "port-5199", relation: "conflict" });
+      expect(await store.listQueue()).toHaveLength(1);
+
+      const stale = await applyQueueDecision(store, DEFAULT_CONFIG, "port-5198", {
+        action: "approve",
+        acknowledgedRelations: [{ id: "port-5199", relation: "conflict", version: "stale" }],
+      });
+      expect(stale.ok).toBe(false);
+      expect(stale.conflict).toBe(true);
+      expect(await store.listQueue()).toHaveLength(1);
+
+      const version = first.conflicts?.[0]?.version ?? "";
+      const allowed = await applyQueueDecision(store, DEFAULT_CONFIG, "port-5198", {
+        action: "approve",
+        acknowledgedRelations: [{ id: "port-5199", relation: "conflict", version }],
+      });
+      expect(allowed.ok).toBe(true);
+      const changelog = (await store.listChangelog()).find((entry) => entry.action === "approve");
+      expect(changelog?.acknowledgedRelations).toEqual([
+        { id: "port-5199", relation: "conflict", version },
+      ]);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("still requires an acknowledgement when the wording around the value changes", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.appendItem({
+        id: "port-worded",
+        title: "[F] 端口",
+        text: "本地端口为 5199",
+        kind: "fact",
+        scope: "global",
+        status: "auto",
+        source: {},
+        createdAt: now,
+        updatedAt: now,
+      });
+      await store.upsertQueue({ ...queue("port-worded-q", "[F] 端口", "本地端口是 5198"), kind: "fact" });
+      const result = await applyQueueDecision(store, DEFAULT_CONFIG, "port-worded-q", { action: "approve" });
+      expect(result.ok).toBe(false);
+      expect(result.conflict).toBe(true);
+      expect(result.code).toBe("RELATION_ACK_REQUIRED");
+      expect(await store.listQueue()).toHaveLength(1);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("refuses to approve while an unhandled suggestion exists unless it is ignored", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.upsertQueue(projectQueue("with-suggestion"));
+      const blocked = await applyQueueDecision(store, DEFAULT_CONFIG, "with-suggestion", { action: "approve" });
+      expect(blocked.ok).toBe(false);
+      expect(blocked.error).toContain("建议");
+      expect(await store.listQueue()).toHaveLength(1);
+
+      const allowed = await applyQueueDecision(store, DEFAULT_CONFIG, "with-suggestion", {
+        action: "approve",
+        ignoreSuggestion: true,
+      });
+      expect(allowed.ok).toBe(true);
+      const changelog = (await store.listChangelog()).find((entry) => entry.action === "approve");
+      expect(changelog?.ignoredSuggestion).toBe(true);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("records a human edit without copying the body into the changelog", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.upsertQueue(queue("edited", "[P] 先给结论", "回复先给结论"));
+      const result = await applyQueueDecision(store, DEFAULT_CONFIG, "edited", {
+        action: "approve",
+        confirmedByUser: true,
+        title: "[R] 先给结论",
+        text: "回复先给结论，最多三点",
+      });
+      expect(result.ok).toBe(true);
+      const changelog = (await store.listChangelog()).find((entry) => entry.action === "approve");
+      expect(changelog?.humanEdited).toBe(true);
+      expect(changelog?.editedFields).toEqual(["title", "text"]);
+      expect(JSON.stringify(changelog)).not.toContain("最多三点");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("does not promote a candidate that duplicates a pending queue row", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.upsertQueue({ ...queue("session-1", "[P] 先给结论", "回复先给结论"), scope: "session" });
+      await store.upsertQueue(queue("pending-dup", "[P] 先给结论", "回复先给结论"));
+      const result = await applyQueueDecision(store, DEFAULT_CONFIG, "session-1", {
+        action: "promote",
+        targetScope: "global",
+        confirmedByUser: true,
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("重复");
+      expect(await store.listQueue()).toHaveLength(2);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("requires an acknowledgement to promote over a pending conflict", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.upsertQueue({ ...queue("session-version", "[F] 版本", "部署版本是 1.2.3"), scope: "session", kind: "fact" });
+      await store.upsertQueue({ ...queue("pending-version", "[F] 版本", "部署版本是 1.2.4"), kind: "fact" });
+      const first = await applyQueueDecision(store, DEFAULT_CONFIG, "session-version", {
+        action: "promote",
+        targetScope: "global",
+        confirmedByUser: true,
+      });
+      expect(first.ok).toBe(false);
+      expect(first.conflict).toBe(true);
+      expect(first.conflicts?.[0]?.relation).toBe("conflict");
+      const version = first.conflicts?.[0]?.version ?? "";
+      const allowed = await applyQueueDecision(store, DEFAULT_CONFIG, "session-version", {
+        action: "promote",
+        targetScope: "global",
+        confirmedByUser: true,
+        acknowledgedRelations: [{ id: "pending-version", relation: "conflict", version }],
+      });
+      expect(allowed.ok).toBe(true);
+      const changelog = (await store.listChangelog()).find((entry) => entry.action === "promote");
+      expect(changelog?.acknowledgedRelations).toEqual([
+        { id: "pending-version", relation: "conflict", version },
+      ]);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("requires every pending conflict to be acknowledged on promote", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-actions-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await store.upsertQueue({ ...queue("session-all", "[F] 版本", "部署版本是 1.2.3"), scope: "session", kind: "fact" });
+      await store.upsertQueue({ ...queue("pending-one", "[F] 版本", "部署版本为 1.2.4"), kind: "fact" });
+      await store.upsertQueue({ ...queue("pending-two", "[F] 版本", "部署版本改为 1.2.5"), kind: "fact" });
+      const first = await applyQueueDecision(store, DEFAULT_CONFIG, "session-all", {
+        action: "promote",
+        targetScope: "global",
+        confirmedByUser: true,
+      });
+      expect(first.ok).toBe(false);
+      expect(first.conflicts?.map((entry) => entry.id).sort()).toEqual([
+        "pending-one",
+        "pending-two",
+      ]);
+      const partial = await applyQueueDecision(store, DEFAULT_CONFIG, "session-all", {
+        action: "promote",
+        targetScope: "global",
+        confirmedByUser: true,
+        acknowledgedRelations: [first.conflicts![0]],
+      });
+      expect(partial.ok).toBe(false);
+      expect(partial.conflicts).toHaveLength(1);
+      const allowed = await applyQueueDecision(store, DEFAULT_CONFIG, "session-all", {
+        action: "promote",
+        targetScope: "global",
+        confirmedByUser: true,
+        acknowledgedRelations: first.conflicts!.map(({ id, relation, version }) => ({
+          id,
+          relation,
+          version,
+        })),
+      });
+      expect(allowed.ok).toBe(true);
+    } finally { await rm(dir, { recursive: true, force: true }); }
   });
 
   it("deny archives, edit updates, defer snoozes", async () => {

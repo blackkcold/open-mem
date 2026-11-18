@@ -182,3 +182,118 @@ describe("capacity governor", () => {
     expect(formatBytes(2 * 1024 * 1024)).toBe("2.0 MB");
   });
 });
+
+const budgetDay = Date.UTC(2026, 10, 18, 9, 0, 0);
+
+describe("auto-write budget", () => {
+  it("blocks the second write when the daily limit is one", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-budget-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const first = await store.consumeWriteBudget({
+        sessionID: "s1",
+        dailyWrites: 1,
+        maxWritesPerSession: 5,
+        now: budgetDay,
+      });
+      expect(first).toMatchObject({ ok: true, used: 1, sessionUsed: 1 });
+      const second = await store.consumeWriteBudget({
+        sessionID: "s2",
+        dailyWrites: 1,
+        maxWritesPerSession: 5,
+        now: budgetDay,
+      });
+      expect(second).toMatchObject({ ok: false, reason: "write-budget" });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a second write in the same session but not in a different session", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-budget-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const limits = { dailyWrites: 10, maxWritesPerSession: 1, now: budgetDay };
+      expect((await store.consumeWriteBudget({ sessionID: "s1", ...limits })).ok).toBe(true);
+      expect(await store.consumeWriteBudget({ sessionID: "s1", ...limits })).toMatchObject({
+        ok: false,
+        reason: "write-budget",
+      });
+      expect((await store.consumeWriteBudget({ sessionID: "s2", ...limits })).ok).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not oversell the daily budget across two Store instances", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-budget-"));
+    try {
+      const first = new Store(dir);
+      const second = new Store(dir);
+      await first.init();
+      const limits = { dailyWrites: 1, maxWritesPerSession: 5, now: budgetDay };
+      const results = await Promise.all([
+        first.consumeWriteBudget({ sessionID: "a", ...limits }),
+        second.consumeWriteBudget({ sessionID: "b", ...limits }),
+      ]);
+      expect(results.filter((entry) => entry.ok)).toHaveLength(1);
+      expect((await first.readState()).automation?.writeBudget?.count).toBe(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not count a rolled-back transaction", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-budget-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      await expect(store.transaction(async () => {
+        const consumed = await store.consumeWriteBudget({
+          sessionID: "s1",
+          dailyWrites: 1,
+          maxWritesPerSession: 5,
+          now: budgetDay,
+        });
+        expect(consumed.ok).toBe(true);
+        throw new Error("rollback");
+      })).rejects.toThrow("rollback");
+      expect((await store.readState()).automation?.writeBudget?.count ?? 0).toBe(0);
+      const retry = await store.consumeWriteBudget({
+        sessionID: "s1",
+        dailyWrites: 1,
+        maxWritesPerSession: 5,
+        now: budgetDay,
+      });
+      expect(retry.ok).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resets the counter when the UTC day rolls over", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-budget-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const limits = { dailyWrites: 1, maxWritesPerSession: 5 };
+      const endOfDay = Date.UTC(2026, 10, 18, 23, 59, 30);
+      expect((await store.consumeWriteBudget({ sessionID: "s1", ...limits, now: endOfDay })).ok).toBe(true);
+      expect(await store.consumeWriteBudget({ sessionID: "s1", ...limits, now: endOfDay })).toMatchObject({
+        ok: false,
+        reason: "write-budget",
+      });
+      const nextDay = Date.UTC(2026, 10, 19, 0, 0, 30);
+      const rolled = await store.consumeWriteBudget({ sessionID: "s1", ...limits, now: nextDay });
+      expect(rolled).toMatchObject({ ok: true, used: 1, sessionUsed: 1 });
+      expect((await store.readState()).automation?.writeBudget).toMatchObject({
+        day: "2026-11-19",
+        count: 1,
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

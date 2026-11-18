@@ -1,6 +1,6 @@
 import type { AutoMemConfig, SessionMessage } from "../types.js";
 import type { Store } from "../store.js";
-import { digestToolPart, toolParts } from "../digest/tool.js";
+import { digestToolPart, indexedToolParts } from "../digest/tool.js";
 import type { DigestCache } from "../digest/cache.js";
 import { redactText } from "../redact.js";
 import { isUserAuthored } from "../session/filters.js";
@@ -16,9 +16,22 @@ export interface ReviewInputItem {
   ok?: boolean;
 }
 
+export interface ReviewToolSource {
+  text: string;
+  ok: boolean;
+  tool: string;
+  /** Content address of the redacted digest and hash of the raw output. */
+  digestHash: string;
+  rawHash: string;
+  partIndex: number;
+  toolCallID?: string;
+  observedAt?: number;
+}
+
 export interface ReviewSource {
   user?: string;
-  tools: Array<{ text: string; ok: boolean; tool: string }>;
+  userObservedAt?: number;
+  tools: ReviewToolSource[];
 }
 
 export interface ReviewInput {
@@ -99,13 +112,19 @@ export class ReviewInputBuilder {
               time: message.time?.created ?? message.time?.completed,
             },
           });
-          sources[message.id] = { user: fitted.text, tools: [] };
+          sources[message.id] = {
+            user: fitted.text,
+            ...(Number.isFinite(message.time?.created ?? message.time?.completed)
+              ? { userObservedAt: message.time?.created ?? message.time?.completed }
+              : {}),
+            tools: [],
+          };
         }
         if (fitted.clipped) truncated = true;
       }
 
       if (config.transcript === "user+tools") {
-        for (const part of toolParts(message)) {
+        for (const { part, index: partIndex } of indexedToolParts(message)) {
           const digest = digestToolPart(part, {
             maxChars: this.deps.config.digest.maxChars,
           });
@@ -118,6 +137,8 @@ export class ReviewInputBuilder {
           toolChars += digest.summary.length;
           toolCount += 1;
           this.deps.digestCache.set(digest);
+          const toolCallID = typeof part.callID === "string" ? part.callID : undefined;
+          const observedAt = message.time?.created ?? message.time?.completed;
           collected.push({
             order: order + 0.5,
             item: {
@@ -125,13 +146,22 @@ export class ReviewInputBuilder {
               role: "tool",
               kind: "tool",
               text: digest.summary,
-              time: message.time?.created ?? message.time?.completed,
+              time: observedAt,
               tool: digest.tool,
               ok: digest.ok,
             },
           });
           const source = (sources[message.id] ??= { tools: [] });
-          source.tools.push({ text: digest.summary, ok: digest.ok, tool: digest.tool });
+          source.tools.push({
+            text: digest.summary,
+            ok: digest.ok,
+            tool: digest.tool,
+            digestHash: digest.id,
+            rawHash: digest.rawHash,
+            partIndex,
+            ...(toolCallID ? { toolCallID } : {}),
+            ...(Number.isFinite(observedAt) ? { observedAt } : {}),
+          });
         }
       }
     }
@@ -208,10 +238,10 @@ function fit(
 
 export function reviewEvidenceQuotes(input: ReviewInput): {
   user: Map<string, string>;
-  tools: Map<string, Array<{ text: string; ok: boolean; tool: string }>>;
+  tools: Map<string, ReviewToolSource[]>;
 } {
   const user = new Map<string, string>();
-  const tools = new Map<string, Array<{ text: string; ok: boolean; tool: string }>>();
+  const tools = new Map<string, ReviewToolSource[]>();
   for (const [id, source] of Object.entries(input.sources)) {
     if (source.user) user.set(id, source.user);
     if (source.tools.length > 0) tools.set(id, source.tools);

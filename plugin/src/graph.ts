@@ -6,6 +6,7 @@ import type { Item, QueueItem, ShadowRecord } from "./types.js";
 import { sha16 } from "./util/text.js";
 import { sameScopeAndProject } from "./memory/scope.js";
 import { classifyRelation, type RelationKind } from "./relations.js";
+import { inspectBackup, type BackupStatus } from "./backup.js";
 
 export type GraphLayer = "L0" | "L1" | "L2" | "L3" | "OpenMem" | "LogicChain" | "Backup";
 export type GraphView =
@@ -71,6 +72,8 @@ export interface MemoryGraphData {
   views: Record<GraphView, GraphViewData>;
   /** Lossless, read-only relation groups; no entry is rewritten or archived. */
   groups?: GraphGroup[];
+  /** Structured backup evidence; never inferred from file existence alone. */
+  backup?: BackupStatus;
 }
 
 export interface GraphGroup {
@@ -170,19 +173,118 @@ async function readText(file: string, maxBytes = MAX_READ_BYTES): Promise<string
   }
 }
 
+export interface TextReadResult {
+  text?: string;
+  bytes: number;
+  updatedAt?: string;
+  truncated: boolean;
+  error?: string;
+}
+
+function reasonOf(error: unknown): string {
+  if (error && typeof error === "object" && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string") return code;
+  }
+  return error instanceof Error ? error.message : "unreadable";
+}
+
+export function fileErrorReason(error: unknown): string {
+  return reasonOf(error);
+}
+
+export async function readTextFileDetailed(
+  file: string,
+  maxBytes = MAX_READ_BYTES,
+): Promise<TextReadResult> {
+  try {
+    const info = await stat(file);
+    const buffer = await readFile(file);
+    return {
+      text: buffer.subarray(0, maxBytes).toString("utf8"),
+      bytes: info.size,
+      updatedAt: info.mtime.toISOString(),
+      truncated: info.size > maxBytes,
+    };
+  } catch (error) {
+    return { bytes: 0, truncated: false, error: reasonOf(error) };
+  }
+}
+
+export interface MarkdownScanResult {
+  files: FileInfo[];
+  /** Every `.md` file encountered, including files beyond the cap. */
+  seen: number;
+  /** Files that were not returned, for any reason. */
+  skipped: number;
+  errors: Array<{ path: string; reason: string }>;
+  limitReached: boolean;
+}
+
+/**
+ * Scan without silently swallowing the cap or a permission error. Callers can
+ * say "indexed 200 of 201 files" instead of presenting a partial index as ready.
+ */
+export async function scanMarkdownFiles(
+  root: string,
+  depth = 1,
+  maxFiles = MAX_FILES,
+): Promise<MarkdownScanResult> {
+  const out: FileInfo[] = [];
+  let seen = 0;
+  const errors: Array<{ path: string; reason: string }> = [];
+  async function walk(dir: string, level: number): Promise<void> {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      // An absent directory is "not configured", not a read failure. Only a
+      // real permission/I/O error should downgrade the index to partial/error.
+      if (reasonOf(error) !== "ENOENT") {
+        errors.push({ path: dir, reason: reasonOf(error) });
+      }
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      if (entry.isDirectory()) {
+        if (level >= depth || SKIP_DIRS.has(entry.name)) continue;
+        await walk(path.join(dir, entry.name), level + 1);
+      } else if (entry.isFile() && /\.md$/i.test(entry.name)) {
+        seen += 1;
+        if (out.length >= maxFiles) continue;
+        const info = await fileInfo(path.join(dir, entry.name));
+        if (info) out.push(info);
+        else errors.push({ path: path.join(dir, entry.name), reason: "unreadable" });
+      }
+    }
+  }
+  await walk(root, 0);
+  return {
+    files: out,
+    seen,
+    skipped: seen - out.length,
+    errors,
+    limitReached: seen > maxFiles,
+  };
+}
+
 export async function listMarkdownFiles(
   root: string,
   depth = 1,
 ): Promise<FileInfo[]> {
-  return listMarkdown(root, depth);
+  return (await scanMarkdownFiles(root, depth)).files;
 }
 
 export async function readTextFile(
   file: string,
   maxBytes = MAX_READ_BYTES,
 ): Promise<string | undefined> {
-  return readText(file, maxBytes);
+  return (await readTextFileDetailed(file, maxBytes)).text;
 }
+
+export const BASELINE_MAX_FILES = MAX_FILES;
+export const BASELINE_MAX_READ_BYTES = MAX_READ_BYTES;
 
 async function readJson(file: string): Promise<unknown> {
   const text = await readText(file);
@@ -503,31 +605,27 @@ export async function buildMemoryGraph(
     note: "派生视图，不作为独立权威",
   });
 
-  const latestBackup = await latestBackupDir(roots.backupRoot);
-  const backupChecks = latestBackup
-    ? {
-        l0: Boolean(await fileInfo(path.join(latestBackup, "global-entry", "AGENTS.md"))),
-        l1: Boolean(await fileInfo(path.join(latestBackup, "openchamber-memory", "global.json"))),
-        openmem: Boolean(
-          await fileInfo(path.join(latestBackup, "global-memory", "autopilot", "items.jsonl")),
-        ),
-        project: await pathExists(path.join(latestBackup, "project-memory")),
-        logic: await pathExists(path.join(latestBackup, "logic-chain")),
-      }
-    : undefined;
+  const rollbackText = await readText(
+    path.join(roots.opencodeDir, "scripts", "rollback-memory.sh"),
+  );
+  const backupStatus = await inspectBackup(roots.backupRoot, {
+    rollbackScript: rollbackText,
+  });
   sources.push({
     id: "backup:latest",
     layer: "Backup",
     label: "最新备份",
-    path: latestBackup,
+    path: backupStatus.latest?.dir,
     scope: "mixed",
     authority: "derived",
-    state: latestBackup
-      ? backupChecks && Object.values(backupChecks).every(Boolean)
+    state: backupStatus.snapshotPresent
+      ? backupStatus.latest?.complete === true
         ? "ready"
         : "partial"
       : "missing",
-    note: latestBackup ? path.basename(latestBackup) : "未找到 backup-* 目录",
+    note: backupStatus.latest
+      ? `${backupStatus.latest.name} · ${backupStatus.integrity} · ${backupStatus.freshness}`
+      : "未找到 backup-* 目录",
   });
 
   const layerSources = (layer: GraphLayer): GraphSource[] =>
@@ -635,35 +733,58 @@ export async function buildMemoryGraph(
     edge("promotion:confirm", "promotion:target", "promotion", "确认后晋升"),
   ];
 
-  const rollbackText = await readText(
-    path.join(roots.opencodeDir, "scripts", "rollback-memory.sh"),
-  );
-  const restore = {
-    l0: true,
-    l1: Boolean(rollbackText?.includes("restore_openchamber_memory")),
-    project: Boolean(rollbackText?.includes("restore_project_memory")),
-    openmem: Boolean(rollbackText?.match(/restore_openmem|OPENMEM_DATA_DIR/)),
-    logic: Boolean(rollbackText?.match(/restore_logic_chain|逻辑链图/)),
-  };
-  const backupDomains: GraphNode[] = [
-    backupNode("l0", "L0 规则", backupChecks?.l0, restore.l0),
-    backupNode("l1", "OpenChamber L1", backupChecks?.l1, restore.l1),
-    backupNode("openmem", "OpenMem 数据", backupChecks?.openmem, restore.openmem),
-    backupNode("project", "项目记忆", backupChecks?.project, restore.project),
-    backupNode("logic", "逻辑链图", backupChecks?.logic, restore.logic),
-  ];
+  const backupDomains: GraphNode[] = backupStatus.domains.map((domain) => ({
+    id: `backup:${domain.id}`,
+    view: "backup",
+    kind: "domain",
+    title: domain.label,
+    status:
+      domain.state === "present"
+        ? "ready"
+        : domain.state === "missing"
+          ? "missing"
+          : "unknown",
+    meta: {
+      backup:
+        domain.state === "present"
+          ? "yes"
+          : domain.state === "missing"
+            ? "no"
+            : "unknown",
+      integrity: domain.integrity,
+      freshness: domain.freshness,
+      restore: domain.restoreSupport,
+      present: domain.present.length,
+      required: domain.required.length,
+      missing: domain.missing.length,
+    },
+  }));
   const backupNodes: GraphNode[] = [
     {
       id: "backup:latest",
       view: "backup",
       kind: "snapshot",
-      title: latestBackup ? path.basename(latestBackup) : "未找到备份",
-      status: latestBackup ? "ready" : "missing",
+      title: backupStatus.latest?.name ?? "未找到备份",
+      status: backupStatus.snapshotPresent
+        ? backupStatus.latest?.complete === true
+          ? "ready"
+          : "partial"
+        : "missing",
       meta: {
-        path: latestBackup ?? "",
-        covered: backupChecks
-          ? Object.values(backupChecks).filter(Boolean).length
-          : 0,
+        path: backupStatus.latest?.dir ?? "",
+        covered: backupStatus.coverage.present,
+        required: backupStatus.coverage.required,
+        integrity: backupStatus.integrity,
+        freshness: backupStatus.freshness,
+        restore: backupStatus.restoreSupport,
+        manifest: backupStatus.manifestPresent ? "yes" : "no",
+        complete:
+          backupStatus.latest?.complete === true
+            ? "yes"
+            : backupStatus.latest?.complete === false
+              ? "no"
+              : "unknown",
+        latestComplete: backupStatus.latestComplete?.name ?? "missing",
       },
     },
     ...backupDomains,
@@ -680,6 +801,7 @@ export async function buildMemoryGraph(
       : undefined,
     sources,
     groups,
+    backup: backupStatus,
     views: {
       architecture: {
         nodes: architectureNodes,
@@ -728,13 +850,15 @@ export async function buildMemoryGraph(
         nodes: backupNodes,
         edges: backupEdges,
         summary: {
-          latest: latestBackup ? path.basename(latestBackup) : "missing",
-          covered: backupChecks
-            ? Object.values(backupChecks).filter(Boolean).length
-            : 0,
-          domains: 5,
-          restoreOpenmem: restore.openmem,
-          restoreLogic: restore.logic,
+          latest: backupStatus.latest?.name ?? "missing",
+          latestComplete: backupStatus.latestComplete?.name ?? "missing",
+          covered: backupStatus.coverage.present,
+          required: backupStatus.coverage.required,
+          domains: backupStatus.domains.length || 5,
+          integrity: backupStatus.integrity,
+          freshness: backupStatus.freshness,
+          restoreSupport: backupStatus.restoreSupport,
+          drill: backupStatus.restoreDrill?.result ?? "missing",
         },
       },
     },
@@ -870,45 +994,10 @@ function automationNode(
   return { id: `auto:${id}`, view: "automation", kind: "step", title, meta };
 }
 
-function backupNode(
-  id: string,
-  title: string,
-  backedUp: boolean | undefined,
-  restore: boolean,
-): GraphNode {
-  const state =
-    backedUp === undefined ? "unknown" : backedUp ? "ready" : "missing";
-  return {
-    id: `backup:${id}`,
-    view: "backup",
-    kind: "domain",
-    title,
-    status: state,
-    meta: {
-      backup: backedUp === undefined ? "unknown" : backedUp ? "yes" : "no",
-      restore: restore ? "automatic" : "missing",
-    },
-  };
-}
-
 function countBy(values: string[]): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const value of values) counts[value] = (counts[value] ?? 0) + 1;
   return counts;
-}
-
-async function latestBackupDir(root: string): Promise<string | undefined> {
-  try {
-    const entries = await readdir(root, { withFileTypes: true });
-    const dirs = entries
-      .filter((entry) => entry.isDirectory() && entry.name.startsWith("backup-"))
-      .map((entry) => entry.name)
-      .sort()
-      .reverse();
-    return dirs[0] ? path.join(root, dirs[0]) : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function parseTriggerMatrix(markdown: string): Array<{ signal: string; target: string }> {

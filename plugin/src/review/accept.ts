@@ -19,12 +19,17 @@ export interface AcceptReviewDeps {
   store: Store;
   config: AutoMemConfig;
   project?: string;
+  /** Authoritative project key from the review record/session owner. */
   projectKey?: string;
+  /** Current instance key; only used to reject a mismatched review. */
+  instanceProjectKey?: string;
 }
 
 export interface AcceptReviewResult {
   created: number;
   skipped: number;
+  /** Preserved candidates whose normalized key collided with different text. */
+  conflicts: number;
   sessionNotes: ReviewSessionNote[];
 }
 
@@ -49,7 +54,19 @@ export async function acceptReviewCandidates(
   deps: AcceptReviewDeps,
 ): Promise<AcceptReviewResult> {
   if (result.candidates.length === 0) {
-    return { created: 0, skipped: 0, sessionNotes: [] };
+    return { created: 0, skipped: 0, conflicts: 0, sessionNotes: [] };
+  }
+  if (
+    deps.projectKey !== undefined &&
+    deps.instanceProjectKey !== undefined &&
+    deps.projectKey !== deps.instanceProjectKey
+  ) {
+    return {
+      created: 0,
+      skipped: result.candidates.length,
+      conflicts: 0,
+      sessionNotes: [],
+    };
   }
 
   const [existing, queue, items] = await Promise.all([
@@ -57,7 +74,6 @@ export async function acceptReviewCandidates(
     deps.store.listQueue(),
     deps.store.listItems(),
   ]);
-  const keys = new Set(existing.map((hook) => hook.key));
   const sessionHooks = existing.filter(
     (hook) => hook.sessionID === input.sessionID,
   );
@@ -74,7 +90,9 @@ export async function acceptReviewCandidates(
   const now = new Date().toISOString();
   let created = 0;
   let skipped = 0;
+  let conflicts = 0;
   const sessionNotes: ReviewSessionNote[] = [];
+  const pending: Array<{ hook: HookRecord; candidate: (typeof result.candidates)[number] }> = [];
 
   for (const candidate of result.candidates) {
     const primary =
@@ -144,10 +162,6 @@ export async function acceptReviewCandidates(
     const key = `review|${input.sessionID}|${primary.messageID}|${sha16(
       normalizeForFingerprint(candidate.text),
     )}`;
-    if (keys.has(key)) {
-      skipped += 1;
-      continue;
-    }
 
     const hook: HookRecord = {
       id: newId("hook"),
@@ -166,6 +180,9 @@ export async function acceptReviewCandidates(
         messageID: primary.messageID,
         role: primary.kind === "user" ? "user" : "assistant",
         project: deps.project,
+        ...(Number.isFinite(input.sources[primary.messageID]?.userObservedAt)
+          ? { observedAt: input.sources[primary.messageID]?.userObservedAt }
+          : {}),
       },
       createdAt: now,
       updatedAt: now,
@@ -177,12 +194,38 @@ export async function acceptReviewCandidates(
       evidence: candidate.evidence,
       reviewConfidence: candidate.confidence,
     };
-    await deps.store.appendHook(hook);
-    keys.add(key);
+    pending.push({ hook, candidate });
     acceptedTexts.push(candidate.text);
     sessionHooks.push(hook);
-    created += 1;
   }
 
-  return { created, skipped, sessionNotes };
+  // Check-and-append inside one Store transaction: the cross-process file lock
+  // closes the list/append race. A normalized-key collision with different text
+  // is preserved as a session note instead of being silently dropped.
+  await deps.store.transaction(async () => {
+    const hooks = await deps.store.listHooks();
+    const byKey = new Map(hooks.map((hook) => [hook.key, hook]));
+    for (const { hook, candidate } of pending) {
+      const existing = byKey.get(hook.key);
+      if (existing) {
+        if (existing.text === hook.text) {
+          skipped += 1;
+          continue;
+        }
+        conflicts += 1;
+        sessionNotes.push({
+          type: candidate.type,
+          text: candidate.text,
+          evidence: candidate.evidence,
+          createdAt: now,
+        });
+        continue;
+      }
+      await deps.store.appendHook(hook);
+      byKey.set(hook.key, hook);
+      created += 1;
+    }
+  });
+
+  return { created, skipped, conflicts, sessionNotes };
 }

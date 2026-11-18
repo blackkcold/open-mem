@@ -13,7 +13,7 @@ import type {
   SourceRef,
 } from "./types.js";
 import { Store, newId } from "./store.js";
-import { autoThreshold } from "./config.js";
+import { autoThreshold, mergeConfig } from "./config.js";
 import { compact, lintText } from "./linter.js";
 import { computePriority } from "./priority.js";
 import {
@@ -25,15 +25,21 @@ import {
 import { admitAutoWrite, admitQueueItem } from "./capacity.js";
 import { rebuildAutoFiles } from "./rebuild.js";
 import { isKeepAliveText, isUserAuthored } from "./session/filters.js";
-import { reviewDecision } from "./review/decision.js";
+import { reviewDecision, reviewKind } from "./review/decision.js";
 import { classifyScope, sameScopeAndProject } from "./memory/scope.js";
+import { findWriteConflicts } from "./memory/write-guard.js";
 import { classifyRelation, isExactRelation, relationLabel } from "./relations.js";
 import { redactText } from "./redact.js";
+import { newChangeID, recordChange } from "./changes.js";
+import { isSuppressed, suppressionTextHash } from "./memory/suppression.js";
+import { isSourceRetired } from "./memory/lifecycle.js";
 
 export interface ConsolidationDeps {
   store: Store;
   decision: DecisionProvider;
   config: AutoMemConfig;
+  /** A deliberate, protected manual review may remain available while off. */
+  allowLegacyManual?: boolean;
   readMessages: (sessionID: string) => Promise<SessionMessage[]>;
   project?: string;
   projectKey?: string;
@@ -72,6 +78,17 @@ interface PreparedHook {
   index: number;
 }
 
+/**
+ * The pre-classification exact check runs before the model decides a kind.
+ * Where a deterministic kind already exists (a retried hook or a review
+ * candidate), pass it so identical text with a different kind is not dropped.
+ */
+function knownHookKind(hook: HookRecord): Item["kind"] | undefined {
+  if (hook.origin === "session-review") return reviewKind(hook.reviewType);
+  if (hook.decision && hook.decision.kind !== "ignore") return hook.decision.kind;
+  return undefined;
+}
+
 export async function runConsolidation(
   sessionID: string,
   deps: ConsolidationDeps,
@@ -84,7 +101,27 @@ export async function runConsolidation(
     shadowed: 0,
     skipped: 0,
   };
+  const modeAtStart = deps.config.automation.mode;
+  const revisionAtStart = deps.config.automation.revision;
+  const automationModeCurrent = async (): Promise<boolean> => {
+    if (modeAtStart === "off" && !deps.allowLegacyManual) return false;
+    if (
+      deps.config.automation.mode !== modeAtStart ||
+      deps.config.automation.revision !== revisionAtStart
+    ) return false;
+    const persisted = await deps.store.readConfig().catch(() => undefined);
+    if (!persisted) return false;
+    // A v0.5.0 config has no automation object/mode/revision. Normalize it so
+    // legacy manual consolidation is compared against the same defaults the
+    // in-memory config was merged with, instead of aborting on `undefined`.
+    const stored = mergeConfig(persisted).automation;
+    return stored.mode === modeAtStart &&
+      (stored.revision ?? 0) === (revisionAtStart ?? 0) &&
+      (modeAtStart !== "off" || deps.allowLegacyManual === true);
+  };
+  if (!await automationModeCurrent()) return result;
   const messages = await deps.readMessages(sessionID);
+  if (!await automationModeCurrent()) return result;
   const previous = await deps.store.readSession(sessionID);
   const lastID = messages[messages.length - 1]?.id;
   const users = messages.filter(isUserAuthored);
@@ -99,6 +136,7 @@ export async function runConsolidation(
     newUsers[0]?.id ?? previous?.lastTurnID ?? lastID ?? newId("turn");
 
   if (messages.length > 0) {
+    if (!await automationModeCurrent()) return result;
     result.captured = await captureHooks(deps, sessionID, newUsers, turnID);
     if (result.captured > 0) {
       deps.broadcast?.("hooks.updated", {
@@ -116,6 +154,7 @@ export async function runConsolidation(
     sessionID,
     Math.max(1, deps.config.turn?.maxCandidates ?? 12),
   );
+  if (!await automationModeCurrent()) return result;
 
   if (pending.length === 0) {
     if (messages.length > 0) {
@@ -161,6 +200,32 @@ export async function runConsolidation(
       result.skipped += 1;
       continue;
     }
+    if (await isSourceRetired(deps.store, hook.sessionID, hook.messageID, hook.source.observedAt)) {
+      await saveHook(hook, "ignored", { error: "retired_source" });
+      await deps.store.appendChangelog({
+        action: "retired_source_skipped",
+        sessionID,
+        messageID: hook.messageID,
+        origin: hook.origin ?? "turn",
+      });
+      result.skipped += 1;
+      continue;
+    }
+    // A stopped/reverted memory must not be re-learned from the same source.
+    // The key embeds session+message+text hash, so a new (correcting) message
+    // is still allowed to teach the opposite.
+    if (await isSuppressed(deps.store, hook.key, suppressionTextHash(hook.text))) {
+      await saveHook(hook, "ignored", { error: "suppressed_after_revert" });
+      await deps.store.appendChangelog({
+        action: "suppressed_after_revert",
+        hookID: hook.id,
+        sessionID,
+        messageID: hook.messageID,
+        origin: hook.origin ?? "turn",
+      });
+      result.skipped += 1;
+      continue;
+    }
     hook.status = "processing";
     hook.attempts = (hook.attempts ?? 0) + 1;
     hook.updatedAt = new Date().toISOString();
@@ -182,8 +247,8 @@ export async function runConsolidation(
       // version, date or negation used to be silently dropped at >= 0.92. Only
       // an exact relation with compatible values may skip classification.
       const relation = classifyRelation(
-        { text: hook.text },
-        { text: best.text, kind: best.kind },
+        { text: hook.text, kind: knownHookKind(hook), title: hook.title },
+        { text: best.text, kind: best.kind, title: best.title },
       );
       if (isExactRelation(relation)) {
         await saveHook(hook, "ignored", {
@@ -215,6 +280,7 @@ export async function runConsolidation(
   );
   const outcomes = await mapPool(prepared, parallel, async (entry) => {
     try {
+      if (!await automationModeCurrent()) return { entry, cancelled: true as const };
       const decision =
         entry.hook.decision && entry.hook.error?.startsWith("capacity:")
           ? entry.hook.decision
@@ -239,6 +305,14 @@ export async function runConsolidation(
   for (const outcome of outcomes) {
     const hook = outcome.entry.hook;
     try {
+    if ("cancelled" in outcome && outcome.cancelled) {
+      await saveHook(hook, "pending", {
+        attempts: Math.max(0, hook.attempts - 1),
+        error: undefined,
+      });
+      result.skipped += 1;
+      continue;
+    }
     const belongsToHook = (entry: { scope: Scope; projectKey?: string }): boolean => sameScopeAndProject(entry, hook);
     if (outcome.error || !outcome.decision) {
       await saveHook(hook, "failed", {
@@ -324,7 +398,7 @@ export async function runConsolidation(
         (item) => item.status === "auto" && item.kind === "rule",
       ).length,
     };
-    const autoAllowed = canAutoApply({
+    let autoAllowed = canAutoApply({
       config: deps.config,
       kind,
       lintOk: lint.ok,
@@ -333,6 +407,61 @@ export async function runConsolidation(
       autoCounts,
       origin: hook.origin,
     });
+    let relationGuardNote: string | undefined;
+    if (autoAllowed) {
+      const guard = findWriteConflicts(
+        {
+          id: hook.id,
+          title,
+          text: hook.text,
+          kind,
+          scope: hook.scope,
+          projectKey: hook.projectKey,
+        },
+        entriesFor(items.filter(belongsToHook), queue.filter(belongsToHook), []),
+      );
+      if (guard.unsafe) {
+        autoAllowed = false;
+        relationGuardNote = guard.unsafe;
+      }
+      const known = guard.conflicts.find(
+        (entry) => entry.relation === "exact" || entry.relation === "covered",
+      );
+      if (autoAllowed && known) {
+        await saveHook(hook, "ignored", {
+          decision: base,
+          error: `already known: ${known.title}`,
+        });
+        result.skipped += 1;
+        continue;
+      }
+      const hard = guard.conflicts.filter(
+        (entry) =>
+          entry.relation === "conflict" ||
+          entry.relation === "classification-mismatch",
+      );
+      if (hard.length > 0) {
+        autoAllowed = false;
+        const first = hard[0];
+        relationGuardNote =
+          first.relation === "classification-mismatch"
+            ? `classification mismatch: ${first.title}`
+            : `relation conflict: ${first.title} — ${first.reasons.join("; ")}`;
+        base.mergeAction = "keep_both";
+        if (first.relation === "conflict") {
+          base.conflict = Math.max(base.conflict ?? 0, 0.8);
+        }
+      } else if (
+        guard.conflicts.some(
+          (entry) =>
+            (entry.relation === "partial" || entry.relation === "related") &&
+            base.duplicate >= 0.2,
+        )
+      ) {
+        autoAllowed = false;
+        relationGuardNote = `partial duplicate: ${guard.conflicts[0]?.title ?? "existing entry"}`;
+      }
+    }
     let admission = autoAllowed
       ? await admitAutoWrite(deps.store, deps.config, kind)
       : undefined;
@@ -401,11 +530,82 @@ export async function runConsolidation(
         seenCount: 1,
         lastSeenAt: now,
         sources: [hook.source],
+        changeID: newChangeID(),
       };
       const written = await deps.store.transaction(async () => {
-      if (!await deps.store.ownsClaim(outcome.entry.reservationKey, outcome.entry.reservationToken)) return false;
+      if (!await automationModeCurrent()) return "mode-changed" as const;
+      if (!await deps.store.ownsClaim(outcome.entry.reservationKey, outcome.entry.reservationToken)) return "blocked" as const;
+      if (await isSourceRetired(deps.store, hook.sessionID, hook.messageID, hook.source.observedAt)) {
+        await saveHook(hook, "ignored", { error: "retired_source" });
+        await deps.store.appendChangelog({ action: "retired_source_skipped", sessionID, messageID: hook.messageID });
+        return "retired" as const;
+      }
+      const [freshItems, freshQueue] = await Promise.all([
+        deps.store.listItems(),
+        deps.store.listQueue(),
+      ]);
+      const freshGuard = findWriteConflicts(
+        {
+          id: hook.id,
+          title,
+          text: hook.text,
+          kind,
+          scope: hook.scope,
+          projectKey: hook.projectKey,
+        },
+        entriesFor(freshItems.filter(belongsToHook), freshQueue.filter(belongsToHook), []),
+      );
+      const freshHard = freshGuard.conflicts.find(
+        (entry) =>
+          entry.relation === "conflict" ||
+          entry.relation === "classification-mismatch",
+      );
+      const freshKnown = freshGuard.conflicts.find(
+        (entry) => entry.relation === "exact" || entry.relation === "covered",
+      );
+      if (freshKnown && !freshHard) {
+        await saveHook(hook, "ignored", {
+          decision: base,
+          error: `already known: ${freshKnown.title}`,
+        });
+        return "duplicate" as const;
+      }
+      const freshNear = freshGuard.conflicts.find(
+        (entry) =>
+          (entry.relation === "partial" || entry.relation === "related") &&
+          base.duplicate >= 0.2,
+      );
+      if (freshGuard.unsafe || freshHard || freshNear) {
+        if (freshHard) {
+          relationGuardNote =
+            freshHard.relation === "classification-mismatch"
+              ? `classification mismatch: ${freshHard.title}`
+              : `relation conflict: ${freshHard.title} — ${freshHard.reasons.join("; ")}`;
+          base.mergeAction = "keep_both";
+          if (freshHard.relation === "conflict") {
+            base.conflict = Math.max(base.conflict ?? 0, 0.8);
+          }
+        }
+        return "blocked" as const;
+      }
       admission = await admitAutoWrite(deps.store, deps.config, kind);
-      if (!admission.ok) return false;
+      if (!admission.ok) return "blocked" as const;
+      const budget = await deps.store.consumeWriteBudget({
+        sessionID,
+        dailyWrites: deps.config.automation.dailyWrites,
+        maxWritesPerSession: deps.config.automation.maxWritesPerSession,
+      });
+      if (!budget.ok) {
+        // Keep the hook retryable instead of dropping the candidate; capture
+        // and the remaining candidates keep running.
+        await saveHook(hook, "blocked", {
+          decision: base,
+          error: "capacity: write-budget",
+          attempts: Math.max(0, hook.attempts - 1),
+        });
+        await deps.store.appendChangelog({ action: "capture_blocked", hookID: hook.id, reason: "write-budget" });
+        return "budget-blocked" as const;
+      }
       if (kind === "rule") {
         await deps.store.appendAutoRule(hook.text, {
           id: item.id,
@@ -424,6 +624,18 @@ export async function runConsolidation(
         });
       }
       await deps.store.appendItem(item);
+      await recordChange(deps.store, {
+        kind: "add",
+        actor: "auto",
+        itemID: item.id,
+        item,
+        source: hook.source,
+        origin: hook.origin === "session-review" ? "session-review" : "turn",
+        reason: "auto",
+      });
+      await deps.store.updateAutomationState({
+        lastSuccess: { at: now, kind: item.kind, itemID: item.id, action: "add" },
+      });
       await deps.store.appendChangelog({
         action: "auto",
         itemID: item.id,
@@ -435,9 +647,25 @@ export async function runConsolidation(
         itemID: item.id,
       });
       await rebuildAutoFiles(deps.store);
-      return true;
+      return "written" as const;
       });
-      if (written) {
+      if (written === "duplicate") {
+        result.skipped += 1;
+        continue;
+      }
+      if (written === "retired") {
+        result.skipped += 1;
+        continue;
+      }
+      if (written === "mode-changed") {
+        result.skipped += 1;
+        continue;
+      }
+      if (written === "budget-blocked") {
+        result.skipped += 1;
+        continue;
+      }
+      if (written === "written") {
       items = [...items, item];
       result.auto += 1;
       autoWritten = true;
@@ -479,6 +707,7 @@ export async function runConsolidation(
     }
 
     const reason =
+      relationGuardNote ??
       relationNote ??
       (hook.origin === "session-review"
         ? `会话复盘 · ${hook.reviewType ?? "fact"}`
@@ -545,7 +774,13 @@ export async function runConsolidation(
       reviewID: hook.reviewID,
     };
     const queued = await deps.store.transaction(async () => {
+    if (!await automationModeCurrent()) return "mode-changed" as const;
     if (!await deps.store.ownsClaim(outcome.entry.reservationKey, outcome.entry.reservationToken)) return false;
+    if (await isSourceRetired(deps.store, hook.sessionID, hook.messageID, hook.source.observedAt)) {
+      await saveHook(hook, "ignored", { error: "retired_source" });
+      await deps.store.appendChangelog({ action: "retired_source_skipped", sessionID, messageID: hook.messageID });
+      return "retired" as const;
+    }
     const fresh = await admitQueueItem(deps.store, deps.config);
     if (!fresh.ok) {
       await saveHook(hook, "blocked", { decision: base, error: `capacity: ${fresh.reason}`, attempts: Math.max(0, hook.attempts - 1) });
@@ -563,8 +798,10 @@ export async function runConsolidation(
       decision: base,
       queueID: queueItem.id,
     });
-    return true;
+    return "queued" as const;
     });
+    if (queued === "retired") { result.skipped += 1; continue; }
+    if (queued === "mode-changed") { result.skipped += 1; continue; }
     if (!queued) { result.skipped += 1; continue; }
     queue = [...queue, queueItem];
     result.queued += 1;
@@ -746,6 +983,9 @@ export function extractCandidates(
         sessionID,
         messageID: message.id,
         role: "user",
+        ...(Number.isFinite(message.time?.created ?? message.time?.completed)
+          ? { observedAt: message.time?.created ?? message.time?.completed }
+          : {}),
       },
     });
   };

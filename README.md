@@ -117,10 +117,13 @@ Add the built plugin path to `~/.config/opencode/opencode.json`, then restart Op
 }
 ```
 
-It starts in **shadow mode** (`shadow: true`): turn candidates are observed instead of
-automatically written. Session review remains enabled and can call a model; review
-candidates go to the review queue, not Shadow. Disable model features explicitly if
-no cloud calls are wanted. Review the evidence before disabling Shadow.
+It starts with automation **off** (`automation.mode: "off"`): turn candidates are not
+written and automatic review does not run. Enable `shadow` (observe only) or
+`autonomous` explicitly through `POST /api/automation/mode`; a v0.5.0 config without
+`automation.mode` keeps the legacy shadow/manual lane. Session review remains
+available when explicitly enabled and can call a model; review candidates go to
+the review queue, not Shadow. Disable model features explicitly if no cloud calls
+are wanted. Review the evidence before enabling autonomous writes.
 
 Use `/memory-console` or the `console_url` tool action for a **60-second, single-use
 connection link** without the long-lived token. The browser removes the ticket
@@ -134,7 +137,7 @@ Work Status section.
 
 ```bash
 npm run package:extension
-# dist/openmem-console-extension-0.1.0.zip
+# dist/openmem-console-extension-0.6.0-<build>.zip
 ```
 
 Install that zip in **Settings → Extensions**, approve the local service, and
@@ -167,7 +170,7 @@ Requires OpenChamber 2.6.0+ on web/desktop. The OpenMem server still binds
 
 ## Status
 
-`v0.4.0` · run `npm run verify` for unit/API tests, three typechecks, builds,
+`v0.6.0` · run `npm run verify` for unit/API tests, three typechecks, builds,
 extension proxy tests, and whitespace validation. [Testing](docs/TESTING.md) separates
 current synthetic verification from historical isolated live-model results.
 Recovery history has a preview-and-confirm cleanup policy (at least 90 days and

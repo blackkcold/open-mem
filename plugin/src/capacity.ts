@@ -1,5 +1,6 @@
 import type { AutoMemConfig, ItemKind } from "./types.js";
 import type { Store } from "./store.js";
+import { MANAGED_HISTORY_LIMITS, reclaimForCapacity } from "./retention.js";
 
 export type CapacityLevel = "ok" | "warn" | "compact" | "freeze" | "block";
 
@@ -7,6 +8,8 @@ export interface CapacityStatus {
   level: CapacityLevel;
   ratio: number;
   reason: string;
+  /** Live protected-history pressure; admission reclaims once before blocking. */
+  historyAtCapacity: boolean;
   counts: {
     items: number;
     autoMemory: number;
@@ -15,23 +18,64 @@ export interface CapacityStatus {
     shadow: number;
     drafts: number;
     diskBytes: number;
+    changes: number;
+    changeJournals: number;
+    suppressions: number;
+    quarantine: number;
+    retiredSources: number;
+    globalCandidates: number;
+    migrationJournals: number;
+    checkpointBackups: number;
   };
 }
 
 export type Admission =
   | { ok: true }
-  | { ok: false; action: "queue" | "compact" | "block"; reason: string };
+  | {
+      ok: false;
+      action: "queue" | "compact" | "block";
+      reason: string;
+      /** Machine-readable cause; never claims a recovery that did not run. */
+      blockedReason?: string;
+      retryAt?: string;
+      reclaimedBytes?: number;
+      reclaimableBytes?: number;
+      protectedChanges?: number;
+      protectedJournals?: number;
+    };
 
 export async function capacityStatus(
   store: Store,
   config: AutoMemConfig,
 ): Promise<CapacityStatus> {
-  const [items, queue, shadow, drafts, diskBytes] = await Promise.all([
+  const [
+    items,
+    queue,
+    shadow,
+    drafts,
+    diskBytes,
+    changes,
+    changeJournals,
+    suppressions,
+    quarantine,
+    retiredSources,
+    globalCandidates,
+    migrationJournals,
+    checkpointBackups,
+  ] = await Promise.all([
     store.listItems(),
     store.listQueue(),
     store.listShadow(),
     store.listSkillDrafts(),
     store.dirSize(),
+    store.countJsonlRows(store.changesPath),
+    store.countFiles("change-journal"),
+    store.countJsonlRows(store.suppressionsPath),
+    store.countJsonlRows(store.extractQuarantinePath),
+    store.countJsonlRows(store.retiredSourcesPath),
+    store.countJsonlRows(store.globalCandidatesPath),
+    store.countFiles("migrations"),
+    store.countDirectories("backup", "checkpoint-"),
   ]);
   const active = items.filter((item) => item.status !== "archived");
   const autoMemory = items.filter(
@@ -61,6 +105,8 @@ export async function capacityStatus(
     level,
     ratio: Math.round(ratio * 1000) / 1000,
     reason: reasonFor(level),
+    historyAtCapacity: changes >= MANAGED_HISTORY_LIMITS.changes ||
+      changeJournals >= MANAGED_HISTORY_LIMITS.changes,
     counts: {
       items: active.length,
       autoMemory,
@@ -69,6 +115,14 @@ export async function capacityStatus(
       shadow: shadow.length,
       drafts: drafts.length,
       diskBytes,
+      changes,
+      changeJournals,
+      suppressions,
+      quarantine,
+      retiredSources,
+      globalCandidates,
+      migrationJournals,
+      checkpointBackups,
     },
   };
 }
@@ -78,22 +132,62 @@ export async function admitAutoWrite(
   config: AutoMemConfig,
   kind: ItemKind,
 ): Promise<Admission> {
-  const status = await capacityStatus(store, config);
+  let status = await capacityStatus(store, config);
+  // Freeze/block or a protected-history cap gets one bounded safe reclaim
+  // before it stops a real write. The reclaim shares the maintenance
+  // lease/gate, so a request never scans the whole data directory repeatedly.
+  let reclaim: Awaited<ReturnType<typeof reclaimForCapacity>> | undefined;
+  if ((status.level === "freeze" || status.level === "block" || status.historyAtCapacity) &&
+      !store.inTransaction) {
+    try {
+      reclaim = await reclaimForCapacity(store);
+    } catch {
+      reclaim = undefined;
+    }
+    if (reclaim && reclaim.reclaimedBytes > 0) status = await capacityStatus(store, config);
+  }
+  const lastRetention = reclaim?.skipped
+    ? (await store.readState()).automation?.retention
+    : undefined;
+  const gate = (action: "queue" | "compact" | "block", reason: string, blockedReason: string): Admission => ({
+    ok: false,
+    action,
+    reason,
+    blockedReason,
+    retryAt: reclaim?.retryAt ?? new Date(Date.now() + 15 * 60_000).toISOString(),
+    ...(reclaim && !reclaim.skipped
+      ? {
+          reclaimedBytes: reclaim.reclaimedBytes,
+          reclaimableBytes: reclaim.remainingReclaimableBytes,
+          protectedChanges: reclaim.protectedChanges,
+          protectedJournals: reclaim.protectedJournals,
+        }
+      : lastRetention
+        ? {
+            reclaimableBytes: lastRetention.remainingReclaimableBytes,
+            protectedChanges: lastRetention.protected.changes,
+            protectedJournals: lastRetention.protected.journals,
+          }
+        : {}),
+  });
   if (status.level === "block") {
-    return { ok: false, action: "block", reason: "数据目录已满，写入被拒绝" };
+    return gate("block", "数据目录已满，写入被拒绝", "capacity-block");
   }
   if (status.level === "freeze") {
-    return { ok: false, action: "queue", reason: "容量达到 95%，自动写已冻结" };
+    return gate("queue", "容量达到 95%，自动写已冻结", "capacity-freeze");
   }
   if (status.level === "compact") {
-    return { ok: false, action: "compact", reason: "容量达到 85%，需要先压缩" };
+    return gate("compact", "容量达到 85%，需要先压缩", "capacity-compact");
+  }
+  if (status.historyAtCapacity) {
+    return gate("queue", "受保护变更历史已到上限，已暂停新的自动学习；停止/撤销仍可用", "history-protected-capacity");
   }
   if (kind === "rule") {
     if (status.counts.autoRules >= config.caps.autoRules) {
-      return { ok: false, action: "queue", reason: "AUTO_RULES 已达硬上限" };
+      return { ok: false, action: "queue", reason: "AUTO_RULES 已达硬上限", blockedReason: "auto-rules-cap" };
     }
   } else if (status.counts.autoMemory >= config.caps.autoMemory) {
-    return { ok: false, action: "queue", reason: "AUTO_MEMORY 已达硬上限" };
+    return { ok: false, action: "queue", reason: "AUTO_MEMORY 已达硬上限", blockedReason: "auto-memory-cap" };
   }
   return { ok: true };
 }

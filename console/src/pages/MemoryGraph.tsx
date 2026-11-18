@@ -534,53 +534,211 @@ function AutomationView({ data }: { data: MemoryGraphData }) {
   );
 }
 
+const INTEGRITY_LABEL: Record<string, string> = {
+  verified: "已校验",
+  partial: "结构已知",
+  corrupt: "损坏",
+  unknown: "未知",
+};
+const FRESHNESS_LABEL: Record<string, string> = {
+  fresh: "新鲜",
+  stale: "过期",
+  unknown: "未知",
+};
+const RESTORE_LABEL: Record<string, string> = {
+  automatic: "自动",
+  manual: "手动",
+  none: "无",
+  unknown: "未演练 / 未知",
+};
+const DOMAIN_STATE_LABEL: Record<string, string> = {
+  present: "已备份",
+  missing: "缺失",
+  unknown: "未知",
+};
+
+function integrityTone(value: string): string {
+  if (value === "verified") return "success";
+  if (value === "corrupt") return "error";
+  return "warning";
+}
+
+function freshnessTone(value: string): string {
+  return value === "fresh" ? "success" : "warning";
+}
+
+function restoreTone(value: string): string {
+  if (value === "automatic") return "success";
+  if (value === "manual") return "info";
+  if (value === "none") return "error";
+  return "warning";
+}
+
+function domainStateTone(value: string): string {
+  if (value === "present") return "success";
+  if (value === "missing") return "warning";
+  return "info";
+}
+
 function BackupView({ data }: { data: MemoryGraphData }) {
+  const status = data.backup;
   const nodes = data.views.backup.nodes;
-  const snapshot = nodes.find((node) => node.id === "backup:latest");
-  const domains = nodes.filter((node) => node.kind === "domain");
-  const missingRestore = domains.filter((node) => node.meta?.restore === "missing");
+  const fallbackDomains = nodes
+    .filter((node) => node.kind === "domain")
+    .map((node) => ({
+      id: String(node.id),
+      label: node.title,
+      state:
+        node.status === "ready"
+          ? "present"
+          : node.status === "missing"
+            ? "missing"
+            : "unknown",
+      integrity: String(node.meta?.integrity ?? "unknown"),
+      freshness: String(node.meta?.freshness ?? "unknown"),
+      restoreSupport: String(node.meta?.restore ?? "unknown"),
+      present: [] as string[],
+      required: [] as string[],
+      missing: [] as string[],
+      notes: [] as string[],
+    }));
+  const domains = status?.domains ?? fallbackDomains;
+  const latest = status?.latest;
+  const latestComplete = status?.latestComplete;
+  const coverage = status?.coverage ?? {
+    required: 5,
+    present: 0,
+    missing: [],
+    unknown: [],
+  };
+  const drill = status?.restoreDrill;
+  const incomplete = latest !== undefined && latest.complete !== true;
   return (
     <div className="graph-grid">
       <section className="panel">
         <div className="panel-head">
           <h2>最新备份</h2>
-          <span className={`badge ${toneClass(String(snapshot?.status ?? "missing"))}`}>
-            {stateLabel(asState(String(snapshot?.status ?? "missing")))}
+          <span
+            className={`badge ${!status?.snapshotPresent ? "warning" : latest?.complete === true ? "success" : "warning"}`}
+          >
+            {!status?.snapshotPresent
+              ? "未找到备份"
+              : latest?.complete === true
+                ? "结构完整"
+                : "结构不完整"}
           </span>
         </div>
-        <p className="source-path mono">{String(snapshot?.meta?.path ?? "未找到 backup-* 目录")}</p>
+        <p className="source-path mono">
+          {latest?.dir ?? "未找到 backup-* 目录"}
+        </p>
         <div className="chips">
-          <span className="chip">覆盖 {String(snapshot?.meta?.covered ?? 0)} / 5 个域</span>
-          <span className="chip">snapshot {String(data.views.backup.summary.latest ?? "missing")}</span>
+          <span className="chip">
+            覆盖 {coverage.present} / {coverage.required} 个域
+          </span>
+          <span className={`chip`}>
+            完整性 {INTEGRITY_LABEL[status?.integrity ?? "unknown"]}
+          </span>
+          <span className="chip">
+            新鲜度 {FRESHNESS_LABEL[status?.freshness ?? "unknown"]}
+          </span>
+          <span className="chip">
+            恢复能力 {RESTORE_LABEL[status?.restoreSupport ?? "unknown"]}
+          </span>
+          <span className="chip">
+            演练{" "}
+            {status?.drillStatus === "passed"
+              ? "通过"
+              : status?.drillStatus === "failed"
+                ? "失败"
+                : status?.drillStatus === "invalid"
+                  ? "记录无效"
+                  : "未演练"}
+          </span>
         </div>
-        {missingRestore.length > 0 ? (
-          <div className="banner warning">
-            有 {missingRestore.length} 个域没有自动恢复路径：{missingRestore.map((node) => node.title).join("、")}。
-            备份存在不等于可恢复，请先在隔离目录演练。
+        {incomplete ? (
+          <div className="banner warning" role="status">
+            最新快照结构不完整。
+            {latestComplete
+              ? ` 最近结构完整快照：${latestComplete.name}。`
+              : " 没有更早的结构完整快照。"}
+            结构完整不等于可恢复。
           </div>
         ) : null}
-        <a className="btn ghost" href="#health">在健康页查看撤销与清理</a>
+        {status && status.snapshotPresent && !status.manifestPresent ? (
+          <div className="banner warning" role="status">
+            没有 manifest，完整性未知；备份存在不等于可恢复。
+          </div>
+        ) : null}
+        {status && status.snapshotPresent && status.drillStatus === "missing" ? (
+          <div className="banner warning" role="status">
+            未演练恢复；恢复能力显示为未知，不显示“已验证”。
+          </div>
+        ) : null}
+        {status && status.drillStatus === "invalid" ? (
+          <div className="banner warning" role="status">
+            演练记录无法解析或属于其他快照；恢复能力按未知处理。
+          </div>
+        ) : null}
+        {coverage.missing.length > 0 ? (
+          <p className="muted small">缺失：{coverage.missing.join("、")}</p>
+        ) : null}
+        {coverage.unknown.length > 0 ? (
+          <p className="muted small">未知：{coverage.unknown.join("、")}</p>
+        ) : null}
+        <a className="btn ghost" href="#health">
+          在健康页查看撤销与清理
+        </a>
       </section>
 
       <section className="panel">
         <div className="panel-head">
           <h2>覆盖矩阵</h2>
-          <span className="meta">备份 / 自动恢复</span>
+          <span className="meta">存在 / 完整性 / 新鲜度 / 恢复</span>
         </div>
         <div className="table-wrap">
           <table aria-label="备份与恢复覆盖">
             <thead>
-              <tr><th>域</th><th>状态</th><th>备份</th><th>自动恢复</th></tr>
+              <tr>
+                <th>域</th>
+                <th>存在</th>
+                <th>完整性</th>
+                <th>新鲜度</th>
+                <th>恢复能力</th>
+              </tr>
             </thead>
             <tbody>
-              {domains.map((node) => (
-                <tr key={node.id}>
-                  <td>{node.title}</td>
-                  <td><span className={`badge ${toneClass(String(node.status))}`}>{stateLabel(asState(String(node.status)))}</span></td>
-                  <td>{String(node.meta?.backup ?? "unknown")}</td>
+              {domains.map((domain) => (
+                <tr key={domain.id}>
                   <td>
-                    <span className={`badge ${node.meta?.restore === "automatic" ? "success" : "warning"}`}>
-                      {node.meta?.restore === "automatic" ? "自动" : "缺失 / 手动"}
+                    <div>{domain.label}</div>
+                    {domain.notes.length > 0 ? (
+                      <div className="muted small">
+                        {domain.notes.slice(0, 2).join("；")}
+                      </div>
+                    ) : null}
+                  </td>
+                  <td>
+                    <span
+                      className={`badge ${domainStateTone(domain.state)}`}
+                    >
+                      {DOMAIN_STATE_LABEL[domain.state] ?? "未知"}
+                    </span>
+                  </td>
+                  <td>
+                    <span className={`badge ${integrityTone(domain.integrity)}`}>
+                      {INTEGRITY_LABEL[domain.integrity] ?? "未知"}
+                    </span>
+                  </td>
+                  <td>
+                    <span className={`badge ${freshnessTone(domain.freshness)}`}>
+                      {FRESHNESS_LABEL[domain.freshness] ?? "未知"}
+                    </span>
+                  </td>
+                  <td>
+                    <span
+                      className={`badge ${restoreTone(domain.restoreSupport)}`}
+                    >
+                      {RESTORE_LABEL[domain.restoreSupport] ?? "未演练 / 未知"}
                     </span>
                   </td>
                 </tr>
@@ -588,6 +746,16 @@ function BackupView({ data }: { data: MemoryGraphData }) {
             </tbody>
           </table>
         </div>
+        {status?.notes.length ? (
+          <details className="muted small">
+            <summary>状态说明</summary>
+            <ul>
+              {status.notes.slice(0, 8).map((note) => (
+                <li key={note}>{note}</li>
+              ))}
+            </ul>
+          </details>
+        ) : null}
       </section>
     </div>
   );

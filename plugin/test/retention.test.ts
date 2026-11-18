@@ -169,4 +169,25 @@ describe("90-day retention with explicit preview", () => {
       expect((await store.listItems()).some((item) => item.id === "item_24")).toBe(true);
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
+  it("keeps a stopped item so restore use is never time limited", async () => {
+    const { dir, store } = await fixture();
+    try {
+      const rows: Item[] = Array.from({ length: 21 }, (_, i) => ({
+        id: `stopped-${i}`,
+        title: "历史",
+        text: "历史内容",
+        scope: "global",
+        kind: "fact",
+        status: "archived",
+        source: {},
+        createdAt: daysAgo(200),
+        updatedAt: daysAgo(120 + i),
+      }));
+      // `recent()` keeps the newest 20, so index 20 (oldest) is the row at risk.
+      rows[20] = { ...rows[20], supersededBy: "deactivate" };
+      await store.replaceItems(rows);
+      const preview = await previewRetention(store, now);
+      expect(preview.pruneItems).toBe(0);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
 });

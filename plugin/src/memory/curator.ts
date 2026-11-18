@@ -5,6 +5,8 @@ import type { Store } from "../store.js";
 import { newId } from "../store.js";
 import { classifyRelation, isExactRelation } from "../relations.js";
 import { rebuildAutoFiles } from "../rebuild.js";
+import { newChangeID, recordChange } from "../changes.js";
+import type { ChangeKind } from "../types.js";
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -78,6 +80,7 @@ export async function runCurator(
   try {
     const items = await store.listItems();
     const changed = new Map<string, Item>();
+    const changeKinds = new Map<string, { kind: ChangeKind; reason: string }>();
     let expired = 0;
 
     for (const item of items) {
@@ -92,6 +95,7 @@ export async function runCurator(
       const at = Date.parse(item.expiresAt);
       if (!Number.isFinite(at) || at > now) continue;
       changed.set(item.id, { ...item, status: "archived", updatedAt: nowISO });
+      changeKinds.set(item.id, { kind: "expire", reason: "ttl expired" });
       expired += 1;
     }
 
@@ -142,12 +146,14 @@ export async function runCurator(
         canonical.lastSeenAt = nowISO;
         canonical.updatedAt = nowISO;
         changed.set(canonical.id, canonical);
+        changeKinds.set(canonical.id, { kind: "update", reason: `merged ${other.id}` });
         changed.set(other.id, {
           ...other,
           status: "archived",
           supersededBy: canonical.id,
           updatedAt: nowISO,
         });
+        changeKinds.set(other.id, { kind: "merge", reason: `duplicate of ${canonical.id}` });
         merged += 1;
       }
     }
@@ -164,6 +170,11 @@ export async function runCurator(
       const curatorDir = path.join(store.dataDir, "curator");
       await mkdir(curatorDir, { recursive: true });
       journalPath = path.join(curatorDir, `${id}.json`);
+      // Stamp the change id before the maintenance snapshot so journal.after
+      // and the stored row stay byte-identical for undoMaintenance.
+      for (const [itemID, item] of changed) {
+        changed.set(itemID, { ...item, changeID: newChangeID() });
+      }
       const journal: CuratorJournal = {
         id,
         createdAt: nowISO,
@@ -174,6 +185,21 @@ export async function runCurator(
         journalPath,
         `${JSON.stringify(journal, null, 2)}\n`,
       );
+      for (const [itemID, item] of changed) {
+        const meta = changeKinds.get(itemID);
+        const before = items.find((entry) => entry.id === itemID);
+        if (!meta || !before) continue;
+        await recordChange(store, {
+          kind: meta.kind,
+          actor: "curator",
+          itemID,
+          item,
+          before,
+          source: before.source,
+          origin: "curator",
+          reason: meta.reason,
+        });
+      }
       await rebuildAutoFiles(store);
       await store.appendChangelog({
         action: "curator",

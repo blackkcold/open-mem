@@ -125,8 +125,17 @@ describe("memory graph", () => {
       expect(graph.views.routing.summary.routes).toBe(1);
       expect(graph.views.routing.edges.some((edge) => edge.relation === "matches")).toBe(true);
       expect(graph.views.automation.summary.hooks).toBe(1);
-      expect(graph.views.backup.summary.restoreOpenmem).toBe(false);
-      expect(graph.views.backup.summary.restoreLogic).toBe(false);
+      expect(graph.backup?.snapshotPresent).toBe(true);
+      expect(
+        graph.backup?.domains.find((domain) => domain.id === "l0")?.restoreSupport,
+      ).toBe("unknown");
+      expect(
+        graph.backup?.domains.find((domain) => domain.id === "project")?.state,
+      ).toBe("missing");
+      expect(graph.views.backup.summary.restoreSupport).toBe("unknown");
+      expect(graph.views.backup.summary.drill).toBe("missing");
+      expect(graph.views.backup.summary.integrity).toBe("unknown");
+      expect(graph.views.backup.summary.latestComplete).toBe("missing");
       expect(
         graph.views.backup.nodes.find((node) => node.id === "backup:openmem")?.meta?.backup,
       ).toBe("yes");

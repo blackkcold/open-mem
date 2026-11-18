@@ -1,5 +1,10 @@
 import { lintText } from "../linter.js";
-import { negationMarkers, qualifierMarkers } from "../relations.js";
+import {
+  negationClauses,
+  negationMarkers,
+  qualifierMarkers,
+  sameNegationObject,
+} from "../relations.js";
 import type { RewriteInput, RewriteOutput, RewriteValidation } from "./types.js";
 
 const IDENTIFIER_RE =
@@ -79,6 +84,21 @@ export function validateRewrite(
     for (const marker of outputQualifiers) {
       if (!sourceQualifiers.has(marker)) {
         errors.push(`输出新增关键限定「${marker}」；请确认后再写入`);
+      }
+    }
+
+    // A shared marker is not a shared ban. Compare the object each negation
+    // governs, so "不要 nohup" -> "不要 screen" cannot pass by keeping "不要".
+    const sourceClauses = negationClauses(source);
+    const outputClauses = negationClauses(text);
+    for (const clause of sourceClauses) {
+      if (!outputClauses.some((kept) => sameNegationObject(kept.object, clause.object))) {
+        errors.push(`输出丢失否定子句「${clause.marker} ${clause.object}」；请保留或改为保留两条`);
+      }
+    }
+    for (const clause of outputClauses) {
+      if (!sourceClauses.some((known) => sameNegationObject(known.object, clause.object))) {
+        errors.push(`输出新增否定子句「${clause.marker} ${clause.object}」；请确认后再写入`);
       }
     }
   }

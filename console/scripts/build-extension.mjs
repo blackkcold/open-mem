@@ -1,10 +1,15 @@
 import { build } from "esbuild";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const consoleRoot = path.resolve(here, "..");
 const extensionRoot = path.resolve(consoleRoot, "..", "extension");
+const pkg = JSON.parse(
+  readFileSync(path.join(consoleRoot, "package.json"), "utf8"),
+);
+const buildTime = process.env.BUILD_TIME ?? new Date().toISOString();
 
 const common = {
   bundle: true,
@@ -14,6 +19,8 @@ const common = {
   legalComments: "none",
   define: {
     "process.env.NODE_ENV": '"production"',
+    __APP_VERSION__: JSON.stringify(pkg.version),
+    __BUILD_TIME__: JSON.stringify(buildTime),
   },
 };
 

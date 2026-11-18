@@ -50,6 +50,77 @@ describe("console recovery", () => {
  * Structural source/style checks only. These do not render React, do not open a
  * portal, and do not prove anything about a real browser or visual layout.
  */
+describe("relation acknowledgement source structure (not a DOM/visual test)", () => {
+  const queue = source("../../console/src/pages/Queue.tsx");
+
+  it("retries once with the reported relation ids and versions", () => {
+    expect(queue).toContain("RELATION_ACK_REQUIRED");
+    expect(queue).toContain("acknowledgedRelations");
+    expect(queue).toContain("存在需要确认的关系");
+    expect(queue).toContain("仍然写入");
+    expect(queue).toContain('cancelLabel: "取消"');
+    expect(queue).toContain("danger: true");
+    expect(queue).toContain("version: entry.version");
+    expect(queue).toContain("RELATION_ACK_CANCELLED");
+    expect(queue).toContain("restoreFocusWhenEnabled(trigger)");
+  });
+
+  it("shows the target, relation and reasons before asking for confirmation", () => {
+    expect(queue).toContain("relationTitle(entry.relation)");
+    expect(queue).toContain("entry.reasons.join");
+    expect(queue).toContain("我已核对以上关系，仍然写入。");
+  });
+});
+
+describe("queue load state source structure (not a DOM/visual test)", () => {
+  const queue = source("../../console/src/pages/Queue.tsx");
+  const styles = source("../../console/src/styles.css");
+
+  it("uses the load state machine and never renders a failure as an empty queue", () => {
+    expect(queue).toContain("queueLoadModel");
+    expect(queue).toContain("showEmptyQueue");
+    expect(queue).toContain("showFilteredEmpty");
+    expect(queue).toContain("load.canRetry");
+    expect(queue).toContain("baselineBanner");
+    expect(queue).toContain('aria-live="polite"');
+    expect(queue).toContain('role="alert"');
+    expect(queue).toContain('role="status"');
+    expect(queue).toContain("aria-label={`存在冲突或分类不一致");
+    expect(queue).toContain("filterPending = filterKey !== loadedFilter && !queueError");
+    expect(queue).toContain("busy || load.writesBlocked || batchPreview.eligible.length === 0");
+  });
+
+  it("defines the warning banner tone used by baseline and stale states", () => {
+    expect(cssRule(styles, ".banner.warning")).toContain("var(--warning)");
+  });
+
+  it("keeps narrow screens scrollable and touch targets usable", () => {
+    expect(cssRule(styles, ".table-wrap")).toContain("overflow-x: auto");
+    expect(cssRule(styles, ".panel")).toContain("overflow: hidden");
+    expect(styles).toMatch(
+      /@media \(max-width: 560px\)[\s\S]*?\.btn, \.input, \.select, \.nav \{ min-height: 44px; \}/,
+    );
+    expect(styles).toMatch(
+      /@media \(max-width: 900px\)[\s\S]*?\.queue-layout, \.skills-layout, \.map-layout, \.settings \{ grid-template-columns: 1fr; \}/,
+    );
+  });
+});
+
+describe("coverage summary source structure (not a DOM/visual test)", () => {
+  const queue = source("../../console/src/pages/Queue.tsx");
+
+  it("renders conflict and coverage as separate chips from the summary", () => {
+    expect(queue).toContain("coverageSummary");
+    expect(queue).toContain("conflictCount");
+    expect(queue).toContain("mismatchCount");
+    expect(queue).toContain("coveredCount");
+    expect(queue).toContain("存在冲突");
+    expect(queue).toContain("存在覆盖");
+    expect(queue).toContain("summary?.relation ?? coverage?.[0]?.relation");
+    expect(queue).not.toContain("coverage[0].relation");
+  });
+});
+
 describe("confirmation dialog source structure (not a DOM/visual test)", () => {
   const styles = source("../../console/src/styles.css");
   const confirm = source("../../console/src/extension/confirm.tsx");

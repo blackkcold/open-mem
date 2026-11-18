@@ -6,6 +6,8 @@ import { Store } from "../src/store.js";
 import { DEFAULT_CONFIG, mergeConfig } from "../src/config.js";
 import { runConsolidation } from "../src/consolidate.js";
 import { applyQueueDecision } from "../src/actions.js";
+import { normalizeForFingerprint } from "../src/fingerprint.js";
+import { sha16 } from "../src/util/text.js";
 import { acceptReviewCandidates } from "../src/review/accept.js";
 import type {
   DecisionProvider,
@@ -133,10 +135,13 @@ describe("session review integration", () => {
       const config = mergeConfig(DEFAULT_CONFIG, { shadow: false });
       await store.appendHook(reviewHook());
 
+      // Review hooks are the deliberate manual lane: drain them while the
+      // automation mode is off without enabling the autonomous extract lane.
       const result = await runConsolidation("s1", {
         store,
         decision: autoReady,
         config,
+        allowLegacyManual: true,
         readMessages: async () => messages,
       });
 
@@ -174,6 +179,7 @@ describe("session review integration", () => {
         store,
         decision: autoReady,
         config,
+        allowLegacyManual: true,
         readMessages: async () => messages,
       });
       expect(await store.readAutoRules()).not.toContain("nohup");
@@ -271,6 +277,9 @@ describe("session review integration", () => {
         store,
         decision: autoReady,
         config,
+        // Legacy manual lane: the shadow flag still governs routing, while the
+        // review lane remains available with automation mode off.
+        allowLegacyManual: true,
         readMessages: async () => messages,
       });
       expect(result.shadowed).toBe(0);
@@ -320,6 +329,8 @@ describe("session review integration", () => {
       const originless: QueueItem = {
         ...item,
         id: "q_review_gate_2",
+        title: "构建失败先看日志",
+        text: "构建失败时先看日志",
         origin: undefined,
         reviewID: "review_x",
       };
@@ -417,6 +428,149 @@ describe("session review integration", () => {
       });
       expect(accepted.created).toBe(0);
       expect(accepted.skipped).toBe(2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a review accepted by a different instance project", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-review-int-"));
+    try {
+      const store = new Store(dir);
+      await store.init();
+      const text = "本项目统一使用 pnpm";
+      const input: ReviewInput = {
+        sessionID: "s1",
+        items: [],
+        chars: 0,
+        hash: "auth",
+        truncated: false,
+        userCount: 1,
+        toolCount: 0,
+        rawToolChars: 0,
+        sources: { m1: { user: text, tools: [] } },
+      };
+      const result: ReviewRunResult = {
+        summary: [],
+        openQuestions: [],
+        model: "test",
+        candidates: [{
+          type: "preference",
+          text,
+          scope: "project",
+          confidence: 0.9,
+          evidence: [{ messageID: "m1", quote: text, kind: "user" }],
+        }],
+      };
+      const accepted = await acceptReviewCandidates(input, result, "review-auth", {
+        store,
+        config: DEFAULT_CONFIG,
+        projectKey: "A",
+        instanceProjectKey: "B",
+      });
+      expect(accepted.created).toBe(0);
+      expect(accepted.skipped).toBe(1);
+      expect(await store.listHooks()).toHaveLength(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("appends one hook when two Store instances accept the same result concurrently", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-review-int-"));
+    try {
+      const first = new Store(dir);
+      const second = new Store(dir);
+      await first.init();
+      await second.init();
+      const text = "以后先给结论";
+      const input: ReviewInput = {
+        sessionID: "s1",
+        items: [],
+        chars: 0,
+        hash: "concurrent",
+        truncated: false,
+        userCount: 1,
+        toolCount: 0,
+        rawToolChars: 0,
+        sources: { m1: { user: text, tools: [] } },
+      };
+      const result: ReviewRunResult = {
+        summary: [],
+        openQuestions: [],
+        model: "test",
+        candidates: [{
+          type: "preference",
+          text,
+          scope: "global",
+          confidence: 0.9,
+          evidence: [{ messageID: "m1", quote: text, kind: "user" }],
+        }],
+      };
+      const [a, b] = await Promise.all([
+        acceptReviewCandidates(input, result, "r1", { store: first, config: DEFAULT_CONFIG }),
+        acceptReviewCandidates(input, result, "r2", { store: second, config: DEFAULT_CONFIG }),
+      ]);
+      expect(a.created + b.created).toBe(1);
+      expect(await first.listHooks()).toHaveLength(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a normalized-key collision with different text", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-review-int-"));
+    try {
+      const base = new Store(dir);
+      await base.init();
+      const original = "用 pnpm，不要用 npm";
+      const variant = "用 pnpm 不要用 npm";
+      const key = `review|s1|m1|${sha16(normalizeForFingerprint(original))}`;
+      await base.appendHook(reviewHook({
+        key,
+        text: original,
+        evidence: [{ messageID: "m1", quote: original, kind: "user" }],
+      }));
+      let reads = 0;
+      class PreReadEmptyStore extends Store {
+        override async listHooks(): Promise<HookRecord[]> {
+          reads += 1;
+          if (reads === 1) return [];
+          return super.listHooks();
+        }
+      }
+      const store = new PreReadEmptyStore(dir);
+      await store.init();
+      const input: ReviewInput = {
+        sessionID: "s1",
+        items: [],
+        chars: 0,
+        hash: "collision",
+        truncated: false,
+        userCount: 1,
+        toolCount: 0,
+        rawToolChars: 0,
+        sources: { m1: { user: variant, tools: [] } },
+      };
+      const result: ReviewRunResult = {
+        summary: [],
+        openQuestions: [],
+        model: "test",
+        candidates: [{
+          type: "preference",
+          text: variant,
+          scope: "global",
+          confidence: 0.9,
+          evidence: [{ messageID: "m1", quote: variant, kind: "user" }],
+        }],
+      };
+      const accepted = await acceptReviewCandidates(input, result, "r3", {
+        store,
+        config: DEFAULT_CONFIG,
+      });
+      expect(accepted.conflicts).toBe(1);
+      expect(accepted.sessionNotes.map((note) => note.text)).toContain(variant);
+      expect(await store.listHooks()).toHaveLength(1);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

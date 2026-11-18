@@ -6,7 +6,15 @@ import { Store } from "../src/store.js";
 import { mergeConfig } from "../src/config.js";
 import { parseReview, ReviewFormatError } from "../src/review/parse.js";
 import { validateReviewCandidates } from "../src/review/validate.js";
-import { buildReviewPrompt, ReviewCacheError, ReviewProvider } from "../src/review/provider.js";
+import {
+  buildReviewPrompt,
+  ReviewBudgetError,
+  ReviewCacheError,
+  ReviewEmptyResponseError,
+  ReviewProvider,
+  ReviewRequestError,
+  ReviewRetryAfterError,
+} from "../src/review/provider.js";
 import type { ReviewInput } from "../src/review/input.js";
 import type { ReviewCandidate } from "../src/types.js";
 
@@ -865,6 +873,231 @@ describe("ReviewProvider", () => {
       } finally {
         await rm(dir, { recursive: true, force: true });
       }
+    }
+  });
+});
+
+describe("ReviewProvider transport/retry/budget", () => {
+  async function providerFor(
+    options: {
+      generate?: Parameters<typeof ReviewProvider>[0]["generate"];
+      fetchImpl?: typeof fetch;
+      sleep?: (ms: number) => Promise<void>;
+      now?: () => number;
+      review?: Record<string, unknown>;
+      maxRequestsPerHour?: number;
+    } = {},
+  ) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openmem-review-p02-"));
+    const store = new Store(dir);
+    await store.init();
+    const provider = new ReviewProvider({
+      store,
+      config: mergeConfig({
+        rewrite: { endpoint: "https://ollama.com" },
+        review: { timeoutMs: 5000, ...options.review },
+      }),
+      key: "test-key",
+      fetchImpl: options.fetchImpl ?? (vi.fn() as unknown as typeof fetch),
+      ...(options.generate ? { generate: options.generate } : {}),
+      ...(options.sleep ? { sleep: options.sleep } : {}),
+      ...(options.now ? { now: options.now } : {}),
+      ...(options.maxRequestsPerHour !== undefined
+        ? { maxRequestsPerHour: options.maxRequestsPerHour }
+        : {}),
+    });
+    return { provider, store, dir };
+  }
+
+  const input = () => inputWith({ m1: { user: "以后回复都用中文", tools: [] } });
+
+  it("uses generate for opencode transport and never calls /api/chat", async () => {
+    const generate = vi.fn(async () => ({ text: JSON.stringify(validPayload) }));
+    const fetchImpl = vi.fn();
+    const { provider, dir } = await providerFor({
+      generate,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      review: { transport: "opencode" },
+    });
+    try {
+      const result = await provider.review(input());
+      expect(result.candidates).toHaveLength(1);
+      expect(generate).toHaveBeenCalledTimes(1);
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(result.usage).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails with a config error when generate is missing", async () => {
+    const fetchImpl = vi.fn();
+    const { provider, dir } = await providerFor({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      review: { transport: "opencode" },
+    });
+    try {
+      await expect(provider.review(input())).rejects.toMatchObject({ kind: "config" });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("sleeps a short Retry-After and retries once", async () => {
+    const now = 1_000_000;
+    const sleep = vi.fn(async () => undefined);
+    let calls = 0;
+    const fetchImpl = vi.fn<typeof fetch>(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response("", { status: 429, headers: { "retry-after": "5" } });
+      }
+      return modelReply(validPayload);
+    });
+    const { provider, dir } = await providerFor({
+      fetchImpl,
+      sleep,
+      now: () => now,
+    });
+    try {
+      const result = await provider.review(input());
+      expect(result.candidates).toHaveLength(1);
+      expect(sleep).toHaveBeenCalledWith(5000);
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("defers a far Retry-After without sleeping or resending early", async () => {
+    const now = 1_000_000;
+    const sleep = vi.fn(async () => undefined);
+    const fetchImpl = vi.fn<typeof fetch>(
+      async () => new Response("", { status: 429, headers: { "retry-after": "120" } }),
+    );
+    const { provider, dir } = await providerFor({
+      fetchImpl,
+      sleep,
+      now: () => now,
+    });
+    try {
+      await expect(provider.review(input())).rejects.toMatchObject({
+        kind: "retry-after",
+        retryAt: now + 120_000,
+        requestsMade: 1,
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("defers a far HTTP-date Retry-After", async () => {
+    const now = 1_000_000;
+    const sleep = vi.fn(async () => undefined);
+    const fetchImpl = vi.fn<typeof fetch>(
+      async () =>
+        new Response("", {
+          status: 429,
+          headers: { "retry-after": new Date(now + 120_000).toUTCString() },
+        }),
+    );
+    const { provider, dir } = await providerFor({ fetchImpl, sleep, now: () => now });
+    try {
+      await expect(provider.review(input())).rejects.toBeInstanceOf(ReviewRetryAfterError);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the bounded default only for a missing or invalid Retry-After", async () => {
+    const sleep = vi.fn(async () => undefined);
+    let calls = 0;
+    const fetchImpl = vi.fn<typeof fetch>(async () => {
+      calls += 1;
+      return calls === 1
+        ? new Response("", { status: 429, headers: { "retry-after": "not-a-date" } })
+        : modelReply(validPayload);
+    });
+    const { provider, dir } = await providerFor({ fetchImpl, sleep });
+    try {
+      await provider.review(input());
+      expect(sleep).toHaveBeenCalledWith(1000);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retry a permanent 4xx", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response("", { status: 401 }));
+    const { provider, dir } = await providerFor({ fetchImpl });
+    try {
+      await expect(provider.review(input())).rejects.toMatchObject({ kind: "http", httpStatus: 401 });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs one empty reply then raises a typed empty error", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn<typeof fetch>(async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ message: { content: "" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const { provider, dir } = await providerFor({ fetchImpl });
+    try {
+      await expect(provider.review(input())).rejects.toBeInstanceOf(ReviewEmptyResponseError);
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports requestsMade when a retry is denied by the request budget", async () => {
+    const sleep = vi.fn(async () => undefined);
+    const now = 1_000_000;
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response("", { status: 500 }));
+    const { provider, dir } = await providerFor({
+      fetchImpl,
+      sleep,
+      now: () => now,
+      maxRequestsPerHour: 1,
+      review: { maxRequestsPerHour: 1 },
+    });
+    try {
+      await expect(provider.review(input())).rejects.toMatchObject({
+        kind: "budget",
+        requestsMade: 1,
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports requestsMade=0 when the budget is already exhausted", async () => {
+    const now = 1_000_000;
+    const fetchImpl = vi.fn<typeof fetch>(async () => modelReply(validPayload));
+    const { provider, store, dir } = await providerFor({
+      fetchImpl,
+      now: () => now,
+      maxRequestsPerHour: 1,
+      review: { maxRequestsPerHour: 1 },
+    });
+    try {
+      expect(await store.takeModelSlot("review", 1, now)).toBe(true);
+      await expect(provider.review(input())).rejects.toBeInstanceOf(ReviewBudgetError);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

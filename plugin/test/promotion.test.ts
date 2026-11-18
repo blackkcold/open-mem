@@ -115,7 +115,7 @@ describe("canPromote", () => {
           existing: [item({ text: "回复先给结论", projectKey: "A" })],
         },
       ),
-    ).toEqual({ ok: false, reason: "duplicate of item_existing" });
+    ).toMatchObject({ ok: false, reason: "duplicate of item_existing" });
   });
 
   it("does not silently drop a same-text entry with a different kind", () => {
@@ -129,6 +129,9 @@ describe("canPromote", () => {
           existing: [item({ text: "回复先给结论", projectKey: "A" })],
         },
       ),
-    ).toEqual({ ok: false, reason: "classification mismatch with item_existing" });
+    ).toMatchObject({
+      ok: false,
+      reason: "classification mismatch with item_existing",
+    });
   });
 });

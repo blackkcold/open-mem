@@ -4,14 +4,32 @@ import type { ReviewInput } from "./input.js";
 import { parseReview, ReviewFormatError } from "./parse.js";
 import { modelHeaders } from "../util/endpoint.js";
 
+export type ReviewGenerate = (
+  input: { model: { providerID: string; id: string; variant?: string }; prompt: string },
+  options?: { signal?: AbortSignal },
+) => Promise<{ text: string }>;
+
 export interface ReviewProviderOptions {
   store: Store;
   config: AutoMemConfig;
   key?: string;
   fetchImpl?: typeof fetch;
   now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  generate?: ReviewGenerate;
+  maxRequestsPerHour?: number;
   log?: (message: string, error?: unknown) => void;
 }
+
+export type ReviewFailureKind =
+  | "transport"
+  | "http"
+  | "empty"
+  | "format"
+  | "budget"
+  | "config"
+  | "cache"
+  | "retry-after";
 
 interface CacheEntry {
   at: number;
@@ -26,23 +44,62 @@ interface CacheFile {
 const MAX_CACHE_ENTRIES = 200;
 const CIRCUIT_FAILURES = 3;
 const CIRCUIT_MS = 10 * 60 * 1000;
+const HOUR = 60 * 60 * 1000;
+const MAX_INLINE_WAIT = 30_000;
+const DEFAULT_RETRY_MS = 1_000;
 // Bump once when prompt semantics change; never include the volatile known
 // list in this key or every queue mutation would force a paid call.
 const REVIEW_PROMPT_VERSION = 2;
 
 export class ReviewRequestError extends Error {
+  readonly kind: ReviewFailureKind;
+  readonly httpStatus?: number;
+  readonly retryAfterMs?: number;
+  /** Already-dispatched requests; 0 proves nothing was sent. */
+  readonly requestsMade?: number;
   constructor(
     message: string,
     /**
-     * True for a content failure, false for a transport/provider failure
-     * (network, HTTP status, circuit open). The orchestrator uses this only to
-     * label the review record as a transport failure; every failed run
-     * consumes the same bounded retry budget, so this does not gate retries.
+     * True for a content failure, false for a transport/provider failure.
+     * Kept only as a compatibility label; retries are decided by `kind`.
      */
     readonly countsAsAttempt = false,
+    kind: ReviewFailureKind = countsAsAttempt ? "format" : "transport",
+    details: { httpStatus?: number; retryAfterMs?: number; requestsMade?: number } = {},
   ) {
     super(message);
     this.name = "ReviewRequestError";
+    this.kind = kind;
+    if (details.httpStatus !== undefined) this.httpStatus = details.httpStatus;
+    if (details.retryAfterMs !== undefined) this.retryAfterMs = details.retryAfterMs;
+    if (details.requestsMade !== undefined) this.requestsMade = details.requestsMade;
+  }
+}
+
+export class ReviewEmptyResponseError extends ReviewRequestError {
+  constructor(message = "复盘模型返回为空") {
+    super(message, true, "empty");
+    this.name = "ReviewEmptyResponseError";
+  }
+}
+
+export class ReviewBudgetError extends ReviewRequestError {
+  readonly retryAt?: number;
+  constructor(message: string, readonly requestsMade: number, retryAt?: number) {
+    super(message, false, "budget", { requestsMade });
+    this.name = "ReviewBudgetError";
+    if (retryAt !== undefined) this.retryAt = retryAt;
+  }
+}
+
+export class ReviewRetryAfterError extends ReviewRequestError {
+  constructor(
+    message: string,
+    readonly retryAt: number,
+    readonly requestsMade: number,
+  ) {
+    super(message, false, "retry-after", { requestsMade });
+    this.name = "ReviewRetryAfterError";
   }
 }
 
@@ -52,6 +109,8 @@ export class ReviewRequestError extends Error {
  * later persist cannot silently overwrite the damaged file.
  */
 export class ReviewCacheError extends Error {
+  readonly kind = "cache" as const;
+  readonly requestsMade = 0;
   constructor(message: string) {
     super(message);
     this.name = "ReviewCacheError";
@@ -70,10 +129,12 @@ export class ReviewProvider {
   private loading?: Promise<void>;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(private readonly options: ReviewProviderOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? Date.now;
+    this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
   async review(input: ReviewInput): Promise<ReviewRunResult> {
@@ -91,15 +152,31 @@ export class ReviewProvider {
     }
 
     const prompt = buildReviewPrompt(input, this.options.config.review.maxCandidates);
+    const tracker: RequestTracker = { made: 0 };
     let usage: { inputTokens: number; outputTokens: number } | undefined;
     let raw: string;
     try {
-      const first = await this.request(prompt);
+      const first = await this.request(prompt, tracker);
       raw = first.raw;
       usage = first.usage;
     } catch (error: unknown) {
-      this.recordFailure();
-      throw asRequestError(error, false);
+      throw this.failure(error);
+    }
+
+    if (!raw.trim()) {
+      if (this.options.config.review.repairAttempts < 1) {
+        throw new ReviewEmptyResponseError();
+      }
+      this.options.log?.("review output empty, repairing");
+      const repaired = await this.request(
+        buildRepairPrompt(prompt, "", ["模型返回为空"]),
+        tracker,
+      ).catch((error: unknown) => {
+        throw this.failure(error);
+      });
+      usage = sumUsage(usage, repaired.usage);
+      if (!repaired.raw.trim()) throw new ReviewEmptyResponseError();
+      raw = repaired.raw;
     }
 
     let parsed;
@@ -111,13 +188,14 @@ export class ReviewProvider {
       }
       const message = error instanceof Error ? error.message : String(error);
       this.options.log?.("review output invalid, repairing", error);
-      const repaired = await this.request(buildRepairPrompt(prompt, raw, [message])).catch(
-        (repairError: unknown) => {
-          this.recordFailure();
-          throw asRequestError(repairError, false);
-        },
-      );
+      const repaired = await this.request(
+        buildRepairPrompt(prompt, raw, [message]),
+        tracker,
+      ).catch((repairError: unknown) => {
+        throw this.failure(repairError);
+      });
       usage = sumUsage(usage, repaired.usage);
+      if (!repaired.raw.trim()) throw new ReviewEmptyResponseError();
       try {
         parsed = parseReview(repaired.raw);
       } catch (repairError: unknown) {
@@ -148,7 +226,117 @@ export class ReviewProvider {
     };
   }
 
+  private failure(error: unknown): unknown {
+    // Budget and far Retry-After are scheduling signals, not endpoint health.
+    if (error instanceof ReviewBudgetError || error instanceof ReviewRetryAfterError) {
+      return error;
+    }
+    this.recordFailure();
+    return asRequestError(error, false);
+  }
+
+  private effectiveMaxRequests(): number {
+    const review = this.options.config.review;
+    return (
+      this.options.maxRequestsPerHour ??
+      review.maxRequestsPerHour ??
+      Math.max(review.maxPerHour, review.maxPerHour * (1 + review.repairAttempts) * 2)
+    );
+  }
+
+  private async reserveRequest(tracker: RequestTracker): Promise<void> {
+    const max = this.effectiveMaxRequests();
+    const reservation = await this.options.store.reserveModelRequest("review", max, this.now(), {
+      purpose: "review",
+      dailyLimit: this.options.config.automation.dailyModelCalls,
+    });
+    if (!reservation.ok) {
+      throw new ReviewBudgetError(
+        "复盘请求预算已用尽，稍后可重试",
+        tracker.made,
+        reservation.retryAt,
+      );
+    }
+    tracker.made += 1;
+  }
+
   private async request(
+    prompt: string,
+    tracker: RequestTracker,
+  ): Promise<{ raw: string; usage?: { inputTokens: number; outputTokens: number } }> {
+    let lastError: unknown;
+    // A transport that cannot dispatch is a configuration failure, not a
+    // request attempt. Check before reserving a request slot.
+    if (this.options.config.review.transport === "opencode" && !this.options.generate) {
+      throw new ReviewRequestError(
+        "当前 OpenCode 版本没有 generate.text",
+        false,
+        "config",
+        { requestsMade: 0 },
+      );
+    }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await this.reserveRequest(tracker);
+      try {
+        return await this.dispatch(prompt);
+      } catch (error: unknown) {
+        lastError = error;
+        const retry = classifyRetry(error, this.now());
+        if (retry.retryable) {
+          if (retry.waitMs > MAX_INLINE_WAIT) {
+            throw new ReviewRetryAfterError(
+              retry.message,
+              this.now() + retry.waitMs,
+              tracker.made,
+            );
+          }
+          if (attempt === 0) {
+            await this.sleep(retry.waitMs);
+            continue;
+          }
+        }
+        throw toRequestError(error);
+      }
+    }
+    throw toRequestError(lastError);
+  }
+
+  private async dispatch(
+    prompt: string,
+  ): Promise<{ raw: string; usage?: { inputTokens: number; outputTokens: number } }> {
+    if (this.options.config.review.transport === "opencode") {
+      return this.generate(prompt);
+    }
+    return this.ollama(prompt);
+  }
+
+  private async generate(
+    prompt: string,
+  ): Promise<{ raw: string }> {
+    if (!this.options.generate) {
+      throw new ReviewRequestError(
+        "当前 OpenCode 版本没有 generate.text",
+        false,
+        "config",
+        { requestsMade: 0 },
+      );
+    }
+    const result = await this.options.generate(
+      { model: this.options.config.review.model, prompt },
+      { signal: AbortSignal.timeout(this.options.config.review.timeoutMs) },
+    );
+    if (!isRecord(result) || typeof result.text !== "string") {
+      throw new ReviewRequestError(
+        "generate.text 返回形状不受支持",
+        false,
+        "config",
+        { requestsMade: 1 },
+      );
+    }
+    return { raw: result.text };
+  }
+
+  private async ollama(
     prompt: string,
   ): Promise<{ raw: string; usage?: { inputTokens: number; outputTokens: number } }> {
     const { config } = this.options;
@@ -167,46 +355,32 @@ export class ReviewProvider {
         num_predict: this.options.config.review.maxOutputTokens,
       },
     });
-
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        if (!await this.options.store.takeModelSlot("review", config.review.maxPerHour, this.now())) {
-          throw new ReviewRequestError("复盘请求预算已用尽，稍后可重试", false);
-        }
-        const response = await this.fetchImpl(`${endpoint}/api/chat`, {
-          method: "POST",
-          redirect: "error",
-          headers,
-          body,
-          signal: AbortSignal.timeout(config.review.timeoutMs),
-        });
-        if (!response.ok) {
-          const error = new Error(`review HTTP ${response.status}`);
-          (error as Error & { retryable?: boolean }).retryable = response.status >= 500;
-          throw error;
-        }
-        const data: unknown = await response.json().catch(() => undefined);
-        const content =
-          isRecord(data) && isRecord(data.message) && typeof data.message.content === "string"
-            ? data.message.content
-            : "";
-        if (!content.trim()) throw new Error("复盘模型返回为空");
-        const usage =
-          isRecord(data) && (numberValue(data.prompt_eval_count) || numberValue(data.eval_count))
-            ? {
-                inputTokens: numberValue(data.prompt_eval_count) ?? 0,
-                outputTokens: numberValue(data.eval_count) ?? 0,
-              }
-            : undefined;
-        return { raw: content, usage };
-      } catch (error: unknown) {
-        lastError = error;
-        if (attempt === 0 && isRetryable(error)) continue;
-        break;
-      }
+    const response = await this.fetchImpl(`${endpoint}/api/chat`, {
+      method: "POST",
+      redirect: "error",
+      headers,
+      body,
+      signal: AbortSignal.timeout(config.review.timeoutMs),
+    });
+    if (!response.ok) {
+      throw new HttpStatusError(
+        response.status,
+        parseRetryAfter(response.headers.get("retry-after"), this.now()),
+      );
     }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    const data: unknown = await response.json().catch(() => undefined);
+    const content =
+      isRecord(data) && isRecord(data.message) && typeof data.message.content === "string"
+        ? data.message.content
+        : "";
+    const usage =
+      isRecord(data) && (numberValue(data.prompt_eval_count) || numberValue(data.eval_count))
+        ? {
+            inputTokens: numberValue(data.prompt_eval_count) ?? 0,
+            outputTokens: numberValue(data.eval_count) ?? 0,
+          }
+        : undefined;
+    return usage ? { raw: content, usage } : { raw: content };
   }
 
   private recordFailure(): void {
@@ -339,17 +513,86 @@ export function buildRepairPrompt(original: string, raw: string, errors: string[
 }
 
 function asRequestError(error: unknown, countsAsAttempt: boolean): ReviewRequestError {
+  if (error instanceof ReviewRequestError) return error;
   const message = error instanceof Error ? error.message : String(error);
-  return new ReviewRequestError(message, countsAsAttempt);
+  return new ReviewRequestError(message, countsAsAttempt, countsAsAttempt ? "format" : "transport");
 }
 
-function isRetryable(error: unknown): boolean {  if (error instanceof ReviewFormatError) return false;
-  const name = error instanceof Error ? error.name : "";
-  if (name === "TimeoutError" || name === "AbortError") return true;
-  const retryable = (error as { retryable?: boolean } | undefined)?.retryable;
-  if (typeof retryable === "boolean") return retryable;
+interface RequestTracker {
+  made: number;
+}
+
+class HttpStatusError extends Error {
+  constructor(readonly status: number, readonly retryAfterMs?: number) {
+    super(`review HTTP ${status}`);
+    this.name = "HttpStatusError";
+  }
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+export function parseRetryAfter(value: string | null, now: number): number | undefined {
+  if (value === null) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  const date = Date.parse(trimmed);
+  if (!Number.isFinite(date)) return undefined;
+  return Math.max(0, date - now);
+}
+
+function classifyRetry(
+  error: unknown,
+  now: number,
+): { retryable: boolean; waitMs: number; message: string } {
   const message = error instanceof Error ? error.message : String(error);
-  return /network|fetch failed|ECONN|ETIMEDOUT|socket/i.test(message);
+  if (error instanceof HttpStatusError) {
+    if (!isRetryableStatus(error.status)) {
+      return { retryable: false, waitMs: 0, message };
+    }
+    const wait = error.retryAfterMs;
+    return {
+      retryable: true,
+      waitMs: wait === undefined ? DEFAULT_RETRY_MS : Math.min(Math.max(wait, 0), Number.MAX_SAFE_INTEGER),
+      message,
+    };
+  }
+  const name = error instanceof Error ? error.name : "";
+  const cause = (error as { cause?: unknown } | undefined)?.cause;
+  const causeText = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+  if (/redirect/i.test(message) || /redirect/i.test(causeText)) {
+    return { retryable: false, waitMs: 0, message };
+  }
+  if (name === "TimeoutError" || name === "AbortError") {
+    return { retryable: true, waitMs: DEFAULT_RETRY_MS, message };
+  }
+  if (/rate.?limit|429|too many requests/i.test(message)) {
+    return { retryable: true, waitMs: DEFAULT_RETRY_MS, message };
+  }
+  if (/network|fetch failed|ECONN|ETIMEDOUT|socket/i.test(message)) {
+    return { retryable: true, waitMs: DEFAULT_RETRY_MS, message };
+  }
+  return { retryable: false, waitMs: 0, message };
+}
+
+function toRequestError(error: unknown): ReviewRequestError {
+  if (error instanceof ReviewRequestError) return error;
+  if (error instanceof HttpStatusError) {
+    return new ReviewRequestError(
+      `review HTTP ${error.status}`,
+      false,
+      "http",
+      {
+        httpStatus: error.status,
+        ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+      },
+    );
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return new ReviewRequestError(message, false, "transport");
 }
 
 function sumUsage(

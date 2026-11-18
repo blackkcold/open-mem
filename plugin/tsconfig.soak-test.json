@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "..",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": [
+    "test/soak.test.ts",
+    "test/migration-core.test.ts",
+    "../scripts/soak-core.d.mts"
+  ]
+}
